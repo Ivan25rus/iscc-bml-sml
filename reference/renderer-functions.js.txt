@@ -1,0 +1,1112 @@
+// Merge reference; do not replace the application renderer.
+
+function logChunkDiagnostic(panel,entry,detail) {
+  if(!detail) {panel._diagnosticSignature='';return;}
+  const record={kind:'entry-status',id:entry?.id || '',symbol:entry?.symbol || '',phase:entry?.phase || '',
+    reason:entry?.reason || '',readError:entry?._readError || '',detail,
+    accounts:entry?.accounts || {},lanePhases:entry?.lanePhases || {},
+    hasOpenPositions:entry?.hasOpenPositions,positionsConfirmed:entry?.positionsConfirmed,
+    lifecycleDeferred:entry?.lifecycleDeferred,positionLifecycle:entry?.positionLifecycle};
+  // Timing snapshots change on each refresh; log actual state changes only.
+  record.accounts=Object.fromEntries(Object.entries(record.accounts).map(([account,row])=>[account,
+    Object.fromEntries(['filledVolume','targetVolume','pendingVolume','freeVolume','entryStatus','entryReason',
+      'laneStopReason','commonStopUncertain','stopCheckRejected','riskRepairRequired','sl','tp']
+      .filter(field=>row?.[field]!==undefined).map(field=>[field,row[field]]))]));
+  const signature=JSON.stringify(record);
+  if(panel._diagnosticSignature===signature)return;
+  panel._diagnosticSignature=signature;
+  ipcRenderer.send?.('level-order:entry-diagnostic',record);
+}
+const levelStageLabels={placing:'Отправляется',placed:'Лимитка поставлена',waiting:'Ждёт цены',opened:'Позиция открыта','partial-waiting':'Лимитка · есть отказ','partial-opened':'Открыта · есть отказ',mixed:'Счета: разное состояние',closing:'Закрывается',cancelling:'Отменяется',unknown:'Результат неизвестен',closed:'Закрыта'};
+
+function syncChunkPercentField(input,entry,draft,defaultPercent=20) {
+  const percent=entry?.chunkPercent==null ? NaN : Number(entry.chunkPercent);
+  const hybrid=entry?.executionPolicy==='hybrid-market-limit-v1';
+  const hasPercent=Number.isFinite(percent) && (hybrid ? percent>0 : percent>=2) && percent<=100;
+  const legacy=!!entry && entry.phase!=='arming' && !hasPercent;
+  const wasLegacy=input.dataset.legacyPercent==='true';
+  if(legacy) {
+    if(!wasLegacy)draft=input.value || draft;
+    if(input.value!=='')input.value='';
+    if(input.placeholder!=='—')input.placeholder='—';
+    if(input.dataset.legacyPercent!=='true')input.dataset.legacyPercent='true';
+    const volume=Number(entry.chunkVolume);
+    const title=Number.isFinite(volume) && volume>0
+      ? `Старый набор: часть ${volume} лота; процент не сохранён.`
+      : 'Старый набор: процент части не сохранён.';
+    if(input.title!==title)input.title=title;
+    if(input.classList.contains('input--error'))input.classList.remove('input--error');
+    return draft;
+  }
+  if(input.dataset.legacyPercent!=='false')input.dataset.legacyPercent='false';
+  if(input.placeholder!=='%')input.placeholder='%';
+  const title='Доля общего объёма основного счёта. Лоты округляются вниз по шагу брокера; последний остаток — отдельно.';
+  if(input.title!==title)input.title=title;
+  if(hasPercent) {if(input.value!==String(percent))input.value=String(percent);}
+  else if(wasLegacy) {
+    const valid=value=>Number.isFinite(Number(value)) && (hybrid ? Number(value)>0 : Number(value)>=2) && Number(value)<=100;
+    input.value=valid(draft) ? String(draft) : valid(defaultPercent) ? String(defaultPercent) : '20';
+  }
+  return input.value;
+}
+
+function createLevelOrderBody(row, key, $pointSize) {
+  const setChanged = (target, property, value) => { if (target[property] !== value) target[property] = value; };
+  const defaults = resolveLevelOrderDefaults(levelOrderCfg, row.ticker);
+  const stopMode = row.stopMode ?? defaults.stopMode;
+  const defaultRisk = orderCalc.defaultRiskUsd({symbol:row.ticker,
+    instrumentType:row.instrumentType || detectInstrumentType(row.ticker)});
+  const saved = uiState.get(key) || {
+    level:row.level != null ? String(row.level) : '',
+    risk:row.riskUsd != null ? String(row.riskUsd) : String(defaultRisk ?? ''),
+    stopOffsetPts:String(row.stopOffsetPts ?? defaults.stopOffsetPts ?? ''),
+    maxLot:String(row.maxLot ?? defaults.maxLot ?? 0),
+    takeProfitPts:String(row.takeProfitPts ?? defaults.takeProfitPts ?? ''),
+    pointSize:String(row.pointSize ?? ''),
+    ...(row.followNearestLT && !row.chunkEntryId ? indexCardDrafts.get(indexSymbol(row.ticker)) : {})
+  };
+  let tracksLevel = row.followNearestLT || normalizeLevelPlaceholder(saved.level) === NEAREST_TRACKED_LEVEL_PLACEHOLDER;
+  let trackedPreview = trackedLevelPreviews.get(trackedTickerKey(row.ticker));
+  const allowsMarketEntry = isLiveIndexCard(row) && tracksLevel;
+  let marketGroups = [], marketReadyAt = 0, marketWarming = false;
+  if ($pointSize) $pointSize.value = saved.pointSize || '';
+
+  const line = el('div','quad-line level-order-line');
+  line.style.cssText = 'display:grid;grid-template-columns:repeat(5,1fr);align-items:center;gap:8px';
+  const $level = inputNumber('Level','level');
+  $level.type = 'text';
+  $level.readOnly = !!row.followNearestLT;
+  $level.value = tracksLevel ? saved.displayedLevel || '' : saved.level;
+  if (tracksLevel) $level.dataset.trackedTicker = row.ticker;
+  const $risk = inputNumber('Risk $','risk');
+  const $stopOffset = inputNumber(stopMode === 'entry' ? 'SL от входа' : 'Stop off','sl');
+  $stopOffset.title = stopMode === 'entry'
+    ? 'Расстояние от цены входа до SL в шагах цены. Для USTEC 1600 = 16 пунктов индекса.'
+    : 'Отступ SL от уровня в шагах цены.';
+  $stopOffset.setAttribute('aria-label',stopMode === 'entry' ? 'SL от входа' : 'Стоп от уровня');
+  const $maxLot = inputNumber('Max lot','qty');
+  const $tp = inputNumber('TP pts','tp');
+  $risk.value = saved.risk;
+  $stopOffset.value = saved.stopOffsetPts;
+  $maxLot.value = saved.maxLot;
+  $tp.value = saved.takeProfitPts;
+  line.append($level,$risk,$stopOffset,$maxLot,$tp);
+
+  const marketButtons = [];
+  for (const [action,label,style] of [['MB','BML','bl'],['MS','SML','sl']]) {
+    const button = btn(label,style,async () => {
+      const existing=chunkEntriesByKey.get(key);
+      if(existing && existing.side===(action==='MB'?'buy':'sell')) {
+        await continueChunkEntry(key);return;
+      }
+      if (cardStates.has(key) || chunkCardLocked(key)) return;
+      const value = validateMarket(action);
+      if (value.valid) await armChunkEntry(action,row,value,row.instrumentType || detectInstrumentType(row.ticker));
+    });
+    button.dataset.kind = action;marketButtons.push(button);
+  }
+
+  const chunkPanel = el('div','level-chunk-panel');
+  const chunkProgress = el('div','level-chunk-progress');
+  chunkProgress.setAttribute('role','status');chunkProgress.setAttribute('aria-live','polite');
+  const chunkAccounts = el('div','level-chunk-accounts');
+  chunkAccounts.setAttribute('aria-label','Объём набора по счетам');
+  const chunkDetail = el('div','level-chunk-reason');
+  chunkDetail.setAttribute('role','status');
+  const chunkActions = el('div','level-chunk-actions');
+  const $chunkStop = btn('Снять ожидание','',()=>{
+    const entry=chunkEntriesByKey.get(key);
+    if(entry && chunkTerminalPhases.has(entry.phase) && !chunkStopOvertakesContinue(entry))releaseChunkEntry(key);
+    else stopChunkEntry(key);
+  });
+  $chunkStop.title = 'Остановить ненабранный объём. Открытые позиции и их SL сохраняются.';
+  chunkActions.append($chunkStop);
+  chunkPanel.append(chunkProgress,chunkAccounts,chunkDetail,chunkActions);
+  let marketPreview = {valid:false,reason:''};
+
+  function entryPrice() { return _normNum($level.value); }
+  function prepareMarketEntry() {
+    if (!allowsMarketEntry || cardStates.has(key) || chunkCardLocked(key) || marketWarming || Date.now()-marketReadyAt<10000) return;
+    marketWarming=true;
+    ipcRenderer.invoke('mt5-vps:prepare-entry').then(result=>{
+      if (!result?.ok) throw Error(result?.reason || 'Нет связи MT5');
+      marketGroups=result.groups || [];marketReadyAt=Date.now();
+    }).catch(()=>{marketReadyAt=Date.now();})
+      .finally(()=>{marketWarming=false;if(cardByKey(key)?.contains($level))body.validate();});
+  }
+  function validateMarket(action) {
+    const level=_normNum($level.value),center=entryPrice(),info=instrumentInfoFor(row.ticker,row);
+    const risk=_normNum($risk.value),stopOffsetPts=_normNum($stopOffset.value),maxLot=_normNum($maxLot.value),takeProfitPts=_normNum($tp.value);
+    const specifications=info?.provider==='mt5-vps' && [info.tickSize,info.quantityStep,info.contractSize,info.maxQty].every(isPos);
+    if (allowsMarketEntry && specifications && isPos(level)) prepareMarketEntry();
+    const check=validateTrackedEntry({groups:marketGroups,symbol:row.ticker,level,entryPrice:center});
+    const locked=cardStates.has(key) || chunkCardLocked(key);
+    const reason=!allowsMarketEntry ? 'BML/SML доступны для уровня LT' : locked ? 'Вход уже создан'
+      : !specifications ? 'Ожидание спецификации MT5'
+      : !check.ok ? check.reason : !isPos(risk) || !isSL(stopOffsetPts) || !Number.isFinite(maxLot) || maxLot<0
+        || ($tp.value!=='' && !isPos(takeProfitPts)) ? 'Проверь риск, стоп, лот и тейк' : '';
+    const plans={};
+    for (const kind of ['MB','MS']) {
+      plans[kind]=reason ? {ok:false,reason} : calculateMarketZoneTradePlan({
+        action:kind,ticker:row.ticker,instrumentType:row.instrumentType || detectInstrumentType(row.ticker),
+        level,entryPrice:center,maxOffset:check.maxOffset,zoneMultiplier:1,
+        entryMode:'side-zone',chunkPercent:resolveMarketChunkPercent(levelOrderCfg,row.ticker),
+        riskUsd:risk,stopOffsetPts,stopMode,maxLot,takeProfitPts:$tp.value==='' ? null : takeProfitPts,
+        minLot:info?.quantityStep,minQty:info?.minQty ?? info?.quantityStep,maxQty:info?.maxQty,
+        tickSize:info?.tickSize,lot:info?.contractSize,orderCalculator:orderCalc
+      });
+    }
+    for (const button of marketButtons) {
+      const plan=plans[button.dataset.kind];
+      setChanged(button,'disabled',!plan.ok);
+      setChanged(button,'title',plan.ok ? 'Набор по '+plan.chunkPercent+'% с лимиткой на остаток; ожидание с другой стороны уровня · '
+        +(stopMode==='entry' ? 'Общий SL от средней '+stopOffsetPts : 'SL '+plan.stopPrice)+' · '+plan.totalQty+' лота' : plan.reason);
+    }
+    const selected=action ? plans[action] : Object.values(plans).find(plan=>plan.ok);
+    marketPreview={valid:!!selected?.ok,reason:reason || selected?.reason || Object.values(plans).map(plan=>plan.reason).filter(Boolean).join(' · '),
+      plan:selected,check};
+    return {valid:!!selected?.ok,type:'levelOrder',level,entryPrice:selected?.referencePrice ?? center,risk,stopOffsetPts,stopMode,maxLot,
+      minLot:info?.quantityStep,takeProfitPts:$tp.value==='' ? null : takeProfitPts,pointSize:null,tickSize:info?.tickSize,
+      chunkPercent:selected?.chunkPercent ?? resolveMarketChunkPercent(levelOrderCfg,row.ticker),entryMode:'side-zone',zoneMultiplier:1};
+  }
+  function persist() {
+    uiState.set(key,{
+      level:tracksLevel ? NEAREST_TRACKED_LEVEL_PLACEHOLDER : $level.value,
+      displayedLevel:tracksLevel ? $level.value : undefined,risk:$risk.value,stopOffsetPts:$stopOffset.value,
+      maxLot:$maxLot.value,takeProfitPts:$tp.value,pointSize:$pointSize?.value || '',
+      zoneMultiplier:1,
+      manualEntry:false,stopExpanded:false,entryMode:'side-zone'
+    });
+    if(allowsMarketEntry && !chunkCardLocked(key) && !cardStates.has(key))indexCardDrafts.set(indexSymbol(row.ticker),uiState.get(key));
+  }
+  const body = {
+    type:'levelOrder',line,
+    chunkRow:allowsMarketEntry ? chunkPanel : undefined,
+    setButtons(buttons) {
+      this._btns=buttons;
+      if (allowsMarketEntry) {
+        buttons.style.gridTemplateColumns='repeat(2,1fr)';
+        buttons.append(...marketButtons);
+      }
+    },
+    setNote(note) {this._note=note;note.classList.add('card__note--quiet');note.hidden=true;},
+    updateChunks() {
+      const entry=chunkEntriesByKey.get(key),locked=!!entry,card=cardByKey(key);
+      if (entry && entry.phase!=='arming' && chunkPanel.dataset.entryId!==entry.id) {
+        chunkPanel.dataset.entryId=entry.id;
+        if(entry.level!=null)$level.value=String(entry.level);
+        if(entry.riskUsd!=null)$risk.value=String(entry.riskUsd);
+        if(entry.stopOffsetPts!=null)$stopOffset.value=String(entry.stopOffsetPts);
+        persist();
+      }
+      const accounts=chunkAccountText(entry);
+      const pendingLimit=entry?.children?.some(child=>child.type==='limit' && child.state==='pending');
+      const laneFailed=Object.entries(entry?.lanePhases || {}).some(([account,value])=>value==='unknown'
+        || value==='stopped' && !entry.accounts?.[account]?.userStopped && !!entry.accounts?.[account]?.laneStopReason);
+      const detail=entry ? (laneFailed || entry._readError || ['stopped','paused','unknown'].includes(entry.phase)) ? chunkReason(entry) : ''
+        : chunkEntryErrorsByKey.get(key) || '';
+      const lifecycleChecking=entry?._readErrorKind==='checking';
+      const failed=laneFailed || !!entry?._readError && !lifecycleChecking || entry?.phase==='unknown' || !!detail && !entry
+        || entry?.phase==='stopped' && !!detail && !/stopped by user|Further entry stopped; positions retained|fully closed|fully confirmed|target confirmed|cancelled before admission/i.test(entry.reason || '');
+      const caption=failed ? 'Ошибка' : lifecycleChecking || entry?._armUnconfirmed || entry?.reconciliation?.status==='checking' ? 'Проверка'
+        : entry?.phase==='paused' ? 'Пауза'
+        : entry?.reason==='Hybrid target confirmed with a common stop on every account' ? 'Набор завершён'
+        : entry?.phase==='stopped' ? 'Набор остановлен'
+        : entry?.phase==='completed' ? 'Набор завершён'
+        : entry?._armUnconfirmed || entry?.reconciliation?.status==='checking' ? 'Проверка'
+        : pendingLimit ? 'Лимитка' : entry?.phase==='armed' ? 'Ожидание' : entry ? 'Набор' : '';
+      logChunkDiagnostic(chunkPanel,entry,detail);
+      setChanged(chunkProgress,'textContent',caption);
+      setChanged(chunkPanel,'hidden',!entry && !detail);
+      setChanged(chunkAccounts,'textContent',accounts);
+      setChanged(chunkProgress,'title',caption);
+      setChanged(chunkDetail,'textContent','');
+      setChanged(chunkDetail,'title','');
+      setChanged(chunkProgress.dataset,'phase',entry?.phase || '');
+      setChanged(chunkProgress.dataset,'error',String(failed));
+      setChanged(chunkActions.style,'visibility',locked ? 'visible' : 'hidden');
+      const hasFills=Object.values(entry?.accounts || {}).some(account=>Number(account.filledVolume)>0);
+      const canContinue=chunkContinueAccounts(entry).length>0;
+      setChanged($chunkStop,'textContent',entry?._armUnconfirmed ? 'Снять неподтверждённый вход'
+        : entry?.phase==='arming' ? 'Отменить вход'
+        : entry && chunkTerminalPhases.has(entry.phase) && !chunkStopOvertakesContinue(entry) ? 'Вернуться к входу'
+        : ['zone','boundary','side-zone'].includes(entry?.entryMode) && !hasFills ? 'Снять ожидание' : 'Остановить вход');
+      setChanged($chunkStop,'disabled',!locked || chunkEntryStopBusy.has(key) || chunkEntryBusy.has(key) && !chunkStopOvertakesContinue(entry));
+      setChanged($chunkStop,'hidden',!!entry && chunkTerminalPhases.has(entry.phase) && !chunkStopOvertakesContinue(entry) && !unfilledEntryCanReset(entry));
+      setChanged(chunkActions,'hidden',!locked);
+      setChanged(chunkActions.style,'visibility',locked && (!$chunkStop.hidden || canContinue) ? 'visible' : 'hidden');
+      card?.classList.toggle('card--chunk-open',locked);
+      const wasLocked=chunkPanel.dataset.locked==='true';
+      if (card && locked) {
+        // A recovered card can set the panel marker before it enters the DOM.
+        // Enforce ownership on its actual controls even when that marker exists.
+        card.querySelectorAll('input,select,.btns button').forEach(control=>setChanged(control,'disabled',true));
+        for(const button of marketButtons) {
+          const matching=entry.side===(button.dataset.kind==='MB'?'buy':'sell');
+          setChanged(button,'textContent',(matching && canContinue?'Добрать ':'')+(button.dataset.kind==='MB'?'BML':'SML'));
+          setChanged(button,'disabled',!matching || !canContinue || chunkEntryBusy.has(key) || chunkEntryStopBusy.has(key));
+          setChanged(button,'title','Продолжить прежний набор до исходного объёма только на недобравших счетах; сначала сверить позиции и лимитки');
+          if(matching && canContinue)chunkActions.append(button);
+          else this._btns?.append(button);
+        }
+        const close=card.querySelector('.card__close');if(close)setChanged(close.style,'display','none');
+        const stage=card.querySelector('.card__stage');if(stage){setChanged(stage.style,'display','none');setChanged(stage,'title',chunkProgress.title);}
+        setChanged(card,'onclick',null);setChanged(card.style,'cursor','');
+      } else if(card && !cardStates.has(key) && !locked && wasLocked) {
+        for(const button of marketButtons) {
+          setChanged(button,'textContent',button.dataset.kind==='MB'?'BML':'SML');
+          this._btns?.append(button);
+        }
+        card.querySelectorAll('input,select').forEach(control=>setChanged(control,'disabled',false));
+        const close=card.querySelector('.card__close');if(close)setChanged(close.style,'display','');
+        const stage=card.querySelector('.card__stage');if(stage)setChanged(stage.style,'display','none');
+      }
+      const circle=card?.querySelector('.card__status');
+      const closeControl=chunkCloseControl.state(entry,{busy:chunkEntryBusy.has(key),stopping:chunkEntryStopBusy.has(key),
+        closeUnknown:chunkCloseUnknown.has(entry?.id)});
+      if(circle && locked && closeControl.visible) {
+        const {disabled,checking}=closeControl,entryId=entry.id;
+        circle.style.display='inline-block';circle.className='card__status card__status--executing';circle.textContent='';
+        circle.style.cursor=disabled?'wait':'pointer';circle.style.opacity=disabled?'.45':'1';
+        circle.title=disabled?'Закрытие временно недоступно: проверяем состояние набора'
+          :checking?'Проверить состояние и закрыть весь набор БМЛ/СМЛ на всех связанных счетах'
+          :'Закрыть весь набор БМЛ/СМЛ на всех связанных счетах';
+        circle.setAttribute('role','button');circle.setAttribute('aria-label',circle.title);
+        circle.setAttribute('aria-disabled',String(disabled));circle.tabIndex=disabled?-1:0;
+        circle.onclick=event=>{event?.stopPropagation?.();if(!disabled)closeChunkPosition(key,entryId);};
+        circle.onkeydown=event=>{if(!disabled && ['Enter',' '].includes(event.key)){event.preventDefault();event.stopPropagation();closeChunkPosition(key,entryId);}};
+      } else if(circle && (locked || wasLocked)) {
+        circle.style.display='none';circle.onclick=null;circle.onkeydown=null;circle.style.opacity='';
+        circle.style.cursor='';circle.title='';
+        circle.removeAttribute('role');circle.removeAttribute('aria-label');circle.removeAttribute('aria-disabled');circle.removeAttribute('tabindex');
+      }
+      setChanged(chunkPanel.dataset,'locked',String(locked));
+    },
+    validate(actionForValidation) {
+      if (['MB','MS'].includes(actionForValidation)) return validateMarket(actionForValidation);
+      if (allowsMarketEntry) validateMarket();
+      if (cardStates.has(key) || chunkCardLocked(key)) {
+        line.querySelectorAll('input').forEach(input=>{if(input.classList.contains('input--error'))input.classList.remove('input--error');});
+        this._btns?.querySelectorAll('button').forEach(button=>setChanged(button,'disabled',true));
+        if(this._note){setChanged(this._note,'textContent','');setChanged(this._note.style,'visibility','hidden');}
+        this.updateChunks();persist();return {valid:false,type:'levelOrder'};
+      }
+      const level=_normNum($level.value),levelPlaceholder=tracksLevel ? NEAREST_TRACKED_LEVEL_PLACEHOLDER : normalizeLevelPlaceholder($level.value);
+      const risk=_normNum($risk.value),stopOffsetPts=_normNum($stopOffset.value),maxLot=_normNum($maxLot.value),takeProfitPts=_normNum($tp.value);
+      const pointSize=_normNum($pointSize?.value),info=instrumentInfoFor(row.ticker,row);
+      const pointSizeOk=!$pointSize || $pointSize.value==='' || isPos(pointSize);
+      const tick=pointSizeOk && isPos(pointSize) ? pointSize : tickSize(row);
+      const tickOk=isPos(tick),minLot=Number(defaults.minLot),minLotOk=isPos(minLot);
+      const tpOk=$tp.value==='' || isPos(takeProfitPts),maxLotOk=Number.isFinite(maxLot) && maxLot>=0;
+      const levelOk=isPos(level) || levelPlaceholder===NEAREST_TRACKED_LEVEL_PLACEHOLDER;
+      const trackedReady=!tracksLevel || trackedPreview?.result?.ok===true && Date.now()-trackedPreview.receivedAt<5000;
+      const preparation=executionPreparations.get(indexSymbol(row.ticker));
+      const executionReady=!tracksLevel || info?.provider!=='mt5-vps' || preparation?.phase==='ready' && Date.now()-preparation.at<3000;
+      const buyPriceSource=normalizePriceSource(defaults.buyPriceSource,'bid'),sellPriceSource=normalizePriceSource(defaults.sellPriceSource,'bid');
+      const quotes={LB:resolveQuotePrice({bid:info?.bid,ask:info?.ask,source:buyPriceSource}),
+        LS:resolveQuotePrice({bid:info?.bid,ask:info?.ask,source:sellPriceSource})};
+      const fresh=info?.provider!=='mt5-vps' || Number(info.quoteUpdatedAt)>0 && Date.now()-info.quoteUpdatedAt>=0 && Date.now()-info.quoteUpdatedAt<1000;
+      const common=executionReady && trackedReady && levelOk && isPos(risk) && isSL(stopOffsetPts) && maxLotOk && minLotOk && tpOk && pointSizeOk && tickOk;
+      const quoteOk=action=>fresh && quotes[action]?.ok===true;
+      const requested=['LB','LS'].includes(actionForValidation) ? actionForValidation : '';
+      const valid=common && (requested ? quoteOk(requested) : quoteOk('LB') && quoteOk('LS'));
+      const reason=!trackedReady ? trackedLevelReason() : !executionReady ? 'MT5: подготовка соединения'
+        : !levelOk ? 'Level > 0 or nearestTrackedLevel' : !isPos(risk) ? 'Risk $ > 0' : !isSL(stopOffsetPts) ? 'Stop offset pts > 0'
+        : !maxLotOk ? 'Max lot >= 0' : !minLotOk ? 'Min lot > 0' : !tpOk ? 'TP pts > 0 or blank'
+        : !pointSizeOk ? 'Point price > 0 or blank' : !tickOk ? 'Tick size required' : !fresh ? 'Котировка MT5 устарела'
+        : !quoteOk(requested || 'LB') ? quotes[requested || 'LB']?.reason : !quoteOk('LS') ? quotes.LS.reason : '';
+      line.classList.toggle('card--invalid',!valid && !marketPreview.valid);
+      for(const [input,bad] of [[$level,!levelOk || !trackedReady && !marketPreview.valid],[$risk,!isPos(risk)],
+        [$stopOffset,!isSL(stopOffsetPts)],[$maxLot,!maxLotOk],[$tp,!tpOk],[$pointSize,!pointSizeOk]]) {
+        input?.classList.toggle('input--error',!!bad);
+      }
+      this._btns?.querySelectorAll('[data-kind="LB"],[data-kind="LS"]').forEach(button=>{
+        setChanged(button,'disabled',!(common && quoteOk(button.dataset.kind)));
+        setChanged(button,'title',reason || '');
+      });
+      if(this._note) {
+        setChanged(this._note,'textContent','');
+        setChanged(this._note,'title',reason || '');
+      }
+      this.updateChunks();persist();
+      return {valid,type:'levelOrder',level:levelPlaceholder || level,risk,stopOffsetPts,stopMode,maxLot,minLot,
+        takeProfitPts:$tp.value==='' ? null : takeProfitPts,buyPriceSource,sellPriceSource,
+        pointSize:$pointSize && $pointSize.value!=='' ? pointSize : null,tickSize:tick};
+    }
+  };
+  function trackedLevelReason() {
+    if(!trackedPreview)return 'Ожидание уровня LT';
+    if(Date.now()-trackedPreview.receivedAt>=5000)return 'Данные уровня LT устарели';
+    if(trackedPreview.result?.ok)return '';
+    if(trackedPreview.result?.unavailable || trackedPreview.result?.source?.unavailable)return 'Ожидание свежей котировки MT5';
+    return trackedPreview.result?.source?.candidates?.some(candidate=>Number(candidate.nearestLevel)>0)
+      ? 'Уровень LT вне допустимого люфта' : 'Нет активного уровня LT';
+  }
+  $level._applyTrackedLevelPreview=preview=>{
+    if(!tracksLevel || cardStates.has(key) || chunkCardLocked(key))return;
+    trackedPreview=preview;
+    const result=preview?.result;
+    const nearest=(result?.source?.candidates || []).filter(candidate=>Number(candidate.nearestLevel)>0 && Number.isFinite(Number(candidate.distance)))
+      .sort((a,b)=>Number(a.distance)-Number(b.distance))[0]?.nearestLevel;
+    const numeric=Number(result?.ok ? result.level : result?.source?.nearestLevel ?? nearest);
+    if(Number.isFinite(numeric) && numeric>0)setChanged($level,'value',String(numeric));
+    else if(result && !(result.unavailable || result.source?.unavailable))setChanged($level,'value','');
+    setChanged($level,'placeholder','Уровень LT');
+    setChanged($level,'title',trackedLevelReason() || 'Ближайший уровень LT: переключается автоматически.');
+    body.validate();
+  };
+  $level.addEventListener('input',()=>{
+    if(row.followNearestLT){$level._applyTrackedLevelPreview(trackedLevelPreviews.get(trackedTickerKey(row.ticker)));return;}
+    tracksLevel=normalizeLevelPlaceholder($level.value)===NEAREST_TRACKED_LEVEL_PLACEHOLDER;
+    if(tracksLevel){$level.dataset.trackedTicker=row.ticker;$level._applyTrackedLevelPreview(trackedLevelPreviews.get(trackedTickerKey(row.ticker)));requestTrackedLevelPreview(row.ticker);}
+    else {delete $level.dataset.trackedTicker;$level.placeholder='Level';$level.title='Ручной уровень';}
+  });
+  for(const input of [$level,$risk,$stopOffset,$maxLot,$tp,$pointSize].filter(Boolean)) {
+    input.addEventListener('input',()=>{indexCardEdits.set(key,++indexCardEditRevision);markTouched(row.ticker);persist();body.validate();});
+  }
+  if(tracksLevel){$level._applyTrackedLevelPreview(trackedPreview);requestTrackedLevelPreview(row.ticker);}
+  return body;
+}
+
+function paintChunkEntry(key) {
+  const card=cardByKey(key);
+  card?._updateChunks?.();
+  card?._validate?.();
+}
+
+function chunkStopOvertakesContinue(entry) {
+  return entry?.controlContract==='entry-stop-priority-v1' && (chunkEntryContinueIds.get(entry.id)?.size || 0)>0;
+}
+
+function releaseChunkEntry(key) {
+  const entry=chunkEntriesByKey.get(key);
+  if(!entry || chunkEntryBusy.has(key) || chunkEntryStopBusy.has(key) || !(entry.positionLifecycle==='closed' || unfilledEntryCanReset(entry)))return false;
+  dismissedChunkEntries.add(entry.id);
+  chunkCloseControl.forget(entry.id);chunkCloseUnknown.delete(entry.id);
+  chunkEntriesByKey.delete(key);
+  const row=state.rows.find(item=>rowKey(item)===key);
+  if(row){row.chunkEntryId=undefined;delete row.recoveringChunkHistory;}
+  if(compactIdleIndexCards())render();else paintChunkEntry(key);
+  return true;
+}
+
+async function armChunkEntry(action,row,value,instrumentType) {
+  const key=rowKey(row);
+  if (!value.valid || chunkCardLocked(key) || cardStates.has(key)) return;
+  const requestId=`chunks_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+  chunkEntryErrorsByKey.delete(key);
+  const local={id:requestId,symbol:row.ticker,side:['BS','MB'].includes(action) ? 'buy' : 'sell',entryMode:value.entryMode,
+    trigger:value.entryPrice,level:value.level,zoneMultiplier:value.zoneMultiplier,phase:'arming',accounts:{}};
+  chunkEntriesByKey.set(key,local);row.chunkEntryId=requestId;
+  paintChunkEntry(key);
+  try {
+    const result=await ipcRenderer.invoke('level-order:arm-chunks',{
+      ticker:row.ticker,provider:row.provider,instrumentType,action,level:value.level,entryPrice:value.entryPrice,
+      riskUsd:value.risk,stopOffsetPts:value.stopOffsetPts,stopMode:value.stopMode,maxLot:value.maxLot,
+      minLot:value.minLot,takeProfitPts:value.takeProfitPts,buyPriceSource:value.buyPriceSource,
+      sellPriceSource:value.sellPriceSource,pointSize:value.pointSize,tickSize:value.tickSize,
+      chunkPercent:value.chunkPercent,
+      entryMode:value.entryMode,zoneMultiplier:value.zoneMultiplier,
+      requestId,strategyId:requestId,clickAt:Date.now()
+    });
+    // A stop may have been confirmed before this arm reply arrived, or a poll
+    // may already have recovered a newer parent. Never restore the old launch
+    // or overwrite a stop that is still awaiting its own confirmation.
+    if(dismissedChunkEntries.has(requestId) || chunkEntriesByKey.get(key)!==local || local._stopRequested)return;
+    if(result?.entry?.id) {
+      chunkEntriesByKey.set(key,result.entry);
+      row.chunkEntryId=result.entry.id;
+    } else if(result?.status==='rejected' && !Object.hasOwn(result,'entry') && chunkEntriesByKey.get(key)===local) {
+      // A definite refusal before admission owns no parent or broker tickets.
+      // Release only this local placeholder; an unknown reply or a parent
+      // recovered concurrently must keep its existing safety lock.
+      const reason=['Broker quote is stale','Broker quote is stale; entry is paused'].includes(result.reason)
+        ? 'Котировка брокера устарела. Дождись свежей цены и нажми БМЛ/СМЛ повторно.'
+        : chunkReason({reason:result.reason || 'Проверь параметры и повтори.'});
+      chunkEntryErrorsByKey.set(key,'Вход не запущен. '+reason);
+      chunkEntriesByKey.delete(key);row.chunkEntryId=undefined;
+    } else {
+      local.phase='unknown';
+      local.reason=result?.reason || 'Нет подтверждения запуска. Повторная команда не отправляется.';
+    }
+  } catch(error) {
+    if(chunkEntriesByKey.get(key)===local && !local._stopRequested) {
+      local.phase='unknown';local.reason=`Нет подтверждения запуска: ${error?.message || error}. Повторная команда не отправляется.`;
+    }
+  } finally {paintChunkEntry(key);}
+}
+
+async function stopChunkEntry(key) {
+  const entry=chunkEntriesByKey.get(key);
+  if(!entry || chunkEntryStopBusy.has(key) || (chunkTerminalPhases.has(entry.phase) || chunkEntryBusy.has(key)) && !chunkStopOvertakesContinue(entry))return;
+  entry._stopRequested=true;
+  chunkEntryStopVersions.set(entry.id,(chunkEntryStopVersions.get(entry.id) || 0)+1);
+  chunkEntryStopBusy.add(key);paintChunkEntry(key);
+  let release=false;
+  const unconfirmed=reason=>{
+    const current=chunkEntriesByKey.get(key);
+    if(current?.id!==entry.id)return;
+    current._readError=reason;
+    if(current.phase==='arming')current._armUnconfirmed=true;
+    current.phase='unknown';current._stopUnconfirmed=true;
+  };
+  try {
+    const result=await ipcRenderer.invoke('level-order:stop-chunks',{entryId:entry.id,
+      ...(entry.controlContract==='entry-stop-priority-v1' ? {cancelContinueIds:[...(chunkEntryContinueIds.get(entry.id) || [])]} : {})});
+    if(result?.entry?.id===entry.id && chunkEntriesByKey.get(key)?.id===entry.id) {
+      chunkEntriesByKey.set(key,result.entry);
+      release=unfilledEntryCanReset(result.entry);
+    }
+    else {unconfirmed(result?.reason || 'Остановка пока не подтверждена. Состояния счетов ещё уточняются.');}
+  } catch(error) {unconfirmed(`Остановка пока не подтверждена: ${error?.message || error}`);}
+  finally {chunkEntryStopBusy.delete(key);if(!release || !releaseChunkEntry(key))paintChunkEntry(key);}
+}
+
+function chunkContinueAccounts(entry) {
+  if(!entry || !['independent-v4','independent-v5'].includes(entry.accountExecution) || entry._armUnconfirmed || entry._stopUnconfirmed
+    || entry.protectionPending || entry.closurePending || entry.positionLifecycle==='closed'
+    || !Object.values(entry.accounts || {}).some(row=>Number(row.filledVolume)>0))return [];
+  return Object.entries(entry.accounts || {}).filter(([account,row])=>
+    Number(row.targetVolume)-Number(row.filledVolume)>1e-8 &&
+    (entry.lanePhases?.[account]!=='stopped' || row.userStopped===true || !!row.laneStopReason) &&
+    !row.commonStopUncertain && !row.riskRepairRequired && !row.stopCheckRejected &&
+    entry.lanePhases?.[account]!=='completed').map(([account])=>account);
+}
+
+async function continueChunkEntry(key) {
+  const entry=chunkEntriesByKey.get(key),accounts=chunkContinueAccounts(entry);
+  if(!accounts.length || chunkEntryBusy.has(key) || chunkEntryStopBusy.has(key))return;
+  const stopVersion=chunkEntryStopVersions.get(entry.id) || 0;
+  const attempts=accounts.map(account=>({account,requestId:`continue_${Date.now()}_${Math.random().toString(36).slice(2,10)}_${account}`}));
+  const ids=new Set(attempts.map(row=>row.requestId));chunkEntryContinueIds.set(entry.id,ids);
+  chunkEntryBusy.add(key);paintChunkEntry(key);
+  try {
+    await Promise.allSettled(attempts.map(async({account,requestId})=>{
+      try {
+        const result=await ipcRenderer.invoke('level-order:continue-chunks',{entryId:entry.id,account,requestId});
+        if((chunkEntryStopVersions.get(entry.id) || 0)!==stopVersion || chunkEntriesByKey.get(key)?.id!==entry.id)return;
+        if(result?.entry?.id===entry.id) {
+          const current=chunkEntriesByKey.get(key);
+          if(!current || Number(result.entry.updatedAt || 0)>=Number(current.updatedAt || 0))chunkEntriesByKey.set(key,result.entry);
+        } else toast('Счёт '+account+': '+(result?.reason || 'Подтверждение добора пока не получено; сверяем состояние'));
+      } catch(error) {if((chunkEntryStopVersions.get(entry.id) || 0)===stopVersion)toast('Счёт '+account+': подтверждение добора пока не получено');}
+      finally {ids.delete(requestId);}
+    }));
+  } catch(error) {toast('Подтверждение добора пока не получено: '+(error?.message || error));}
+  finally {chunkEntryContinueIds.delete(entry.id);chunkEntryBusy.delete(key);if(!releaseChunkEntry(key))paintChunkEntry(key);}
+}
+
+async function closeChunkPosition(key,expectedEntryId) {
+  const entry=chunkEntriesByKey.get(key);
+  if(!entry || expectedEntryId && entry.id!==expectedEntryId)return;
+  const control=chunkCloseControl.state(entry,{busy:chunkEntryBusy.has(key),stopping:chunkEntryStopBusy.has(key),
+    closeUnknown:chunkCloseUnknown.has(entry.id)});
+  // Retained display evidence permits only the existing fresh backend check.
+  // The backend still proves ownership, current positions and command safety.
+  if(!control.visible || control.disabled)return;
+  const clickAt=Date.now();
+  chunkEntryBusy.add(key);paintChunkEntry(key);
+  try {
+    const result=await ipcRenderer.invoke('level-order:close-chunks',{entryId:entry.id,symbol:entry.symbol,clickAt});
+    if(chunkEntriesByKey.get(key)?.id!==entry.id)return;
+    if(result?.entry?.id===entry.id)chunkEntriesByKey.set(key,result.entry);
+    const current=chunkEntriesByKey.get(key);
+    if(result?.status==='ok' && result.entry?.hasOpenPositions===false) {
+      current.positionLifecycle='closed';releaseChunkEntryAfterClose(key);
+      toast('Весь набор закрыт на связанных счетах.');
+    } else {
+      const reason=result?.reason || 'Закрытие всех частей пока не подтверждено. Проверь состояние счетов.';
+      if(result?.status!=='rejected'){chunkCloseUnknown.add(entry.id);current.phase='unknown';current._readError=reason;}
+      toast(reason);
+    }
+  } catch(error) {
+    const current=chunkEntriesByKey.get(key);
+    if(current?.id!==entry.id)return;
+    chunkCloseUnknown.add(entry.id);
+    current.phase='unknown';current._readError='Нет подтверждения закрытия: '+(error?.message || error)+'. Повтор не отправляется.';
+    toast(current._readError);
+  } finally {chunkEntryBusy.delete(key);paintChunkEntry(key);}
+}
+
+function releaseChunkEntryAfterClose(key) {
+  // releaseChunkEntry checks the busy guard; clear it only after a definite
+  // complete result, never because a close was merely submitted.
+  chunkEntryBusy.delete(key);
+  releaseChunkEntry(key);
+}
+
+let chunkEntriesRefreshing=false;
+let chunkEntriesQueued=null;
+
+async function refreshChunkEntries(eventResult,controlVersions) {
+  if(chunkEntriesRefreshing) {
+    if(!eventResult)return;
+    return new Promise(resolve=>{
+      const waiters=chunkEntriesQueued?.waiters || [];
+      waiters.push(resolve);chunkEntriesQueued={result:eventResult,waiters,versions:new Map(chunkEntryStopVersions)};
+    });
+  }
+  chunkEntriesRefreshing=true;
+  const stopVersions=controlVersions || new Map(chunkEntryStopVersions),startingEntries=new Map(chunkEntriesByKey);
+  try {
+    const result=eventResult || await ipcRenderer.invoke('level-order:chunk-entries');
+    if(result?.status!=='ok' || !Array.isArray(result.entries))throw Error(result?.reason || 'Нет свежего статуса VPS');
+    let structureChanged=false;
+    for(const entry of result.entries) {
+      if(!entry?.id || !entry.symbol || !entry.phase)continue;
+      if(dismissedChunkEntries.has(entry.id))continue;
+      let key=[...chunkEntriesByKey].find(([,item])=>item.id===entry.id)?.[0];
+      if((chunkEntryStopVersions.get(entry.id) || 0)!==(stopVersions.get(entry.id) || 0))continue;
+      if(key && !chunkSnapshotCanReplace(entry,chunkEntriesByKey.get(key)))continue;
+      if(entry.positionLifecycle==='closed' || unfilledEntryCanReset(entry)) {
+        if(key){chunkEntriesByKey.set(key,entry);if(releaseChunkEntry(key))structureChanged=true;}
+        else dismissedChunkEntries.add(entry.id);
+        continue;
+      }
+      if(!key) {
+        // Reattach only live entries, never arm or replay one after startup.
+        if(chunkTerminalPhases.has(entry.phase) && entry.hasOpenPositions!==true)continue;
+        let row=state.rows.find(item=>item.chunkEntryId===entry.id);
+        if(!row)row=state.rows.find(item=>isLiveIndexCard(item) && indexSymbol(item.ticker)===indexSymbol(entry.symbol)
+          && item.cardType==='levelOrder' && !cardStates.has(rowKey(item)) && !chunkCardLocked(rowKey(item)));
+        if(!row) {
+          row={ticker:entry.symbol,provider:'mt5-vps',instrumentType:detectInstrumentType(entry.symbol),cardType:'levelOrder',
+            cardSource:'lt-chunks',event:`chunks:${entry.id}`,time:entry.createdAt || Date.now(),price:entry.trigger,
+            level:entry.level,followNearestLT:true,riskUsd:entry.riskUsd,stopMode:entry.stopMode || 'entry',
+            stopOffsetPts:entry.stopOffsetPts,takeProfitPts:entry.takeProfitPts};
+          state.rows.push(row);
+        }
+        key=rowKey(row);row.chunkEntryId=entry.id;
+        if((entry.phase==='unknown' || chunkTerminalPhases.has(entry.phase))
+          && (entry.lifecycleDeferred===true || entry.positionsConfirmed===false || entry.hasOpenPositions!==true))
+          row.recoveringChunkHistory=true;
+        const saved=uiState.get(key) || {};
+        uiState.set(key,{...saved,level:NEAREST_TRACKED_LEVEL_PLACEHOLDER,displayedLevel:String(entry.level || ''),
+          fixedLevel:String(entry.level || ''),risk:String(entry.riskUsd || saved.risk || ''),
+          stopOffsetPts:String(entry.stopOffsetPts ?? saved.stopOffsetPts ?? row.stopOffsetPts ?? ''),
+          maxLot:String(saved.maxLot ?? 0),takeProfitPts:String(entry.takeProfitPts ?? saved.takeProfitPts ?? ''),
+          pointSize:saved.pointSize || '',manualEntry:false,stopExpanded:true,entryMode:entry.entryMode,
+          zoneMultiplier:entry.zoneMultiplier,chunkPercent:String(entry.chunkPercent ?? saved.chunkPercent ?? 20),stopTrigger:String(entry.trigger || '')});
+        chunkEntriesByKey.set(key,entry);
+        structureChanged=true;
+      } else {
+        chunkEntriesByKey.set(key,entry);
+        const row=state.rows.find(item=>rowKey(item)===key);
+        if(row?.recoveringChunkHistory && (entry.positionsConfirmed===true && entry.hasOpenPositions===true
+          || ['armed','running','sending','paused'].includes(entry.phase))) {
+          delete row.recoveringChunkHistory;structureChanged=true;
+        }
+      }
+      paintChunkEntry(key);
+    }
+    // Publish the complete recovery batch at once. Directly appending each
+    // historical parent exposes duplicate cards before the lifecycle poll.
+    if(structureChanged)render();
+  } catch(error) {
+    for(const [key,entry] of chunkEntriesByKey) {
+      if(entry!==startingEntries.get(key) || (chunkEntryStopVersions.get(entry.id) || 0)!==(stopVersions.get(entry.id) || 0))continue;
+      entry._readError='Нет свежего статуса VPS; повторная команда не отправляется.';
+      entry._readErrorKind='connection';
+      paintChunkEntry(key);
+    }
+  } finally {
+    chunkEntriesRefreshing=false;
+    const queued=chunkEntriesQueued;chunkEntriesQueued=null;
+    if(queued)try {await refreshChunkEntries(queued.result,queued.versions);}
+    finally {queued.waiters.forEach(resolve=>resolve());}
+  }
+}
+
+async function watchChunkEntryEvents() {
+  let revision=0;
+  while(!window.closed) {
+    try {
+      const result=await ipcRenderer.invoke('level-order:chunk-events',revision);
+      chunkEventsActive=result?.supported===true;
+      if(chunkEventsActive) {
+        if(!Number.isSafeInteger(result.revision) || result.revision<0 || !Array.isArray(result.entries))throw Error('Некорректный статус набора');
+        await refreshChunkEntries(result);
+        revision=result.revision;
+        continue;
+      }
+    } catch {chunkEventsActive=false;}
+    await new Promise(resolve=>setTimeout(resolve,2000));
+  }
+}
+watchChunkEntryEvents();
+
+// Заявка поставлена в очередь адаптером (ждём подтверждение из DWX)
+ipcRenderer.on('execution:pending', (_evt, rec) => {
+  const reqId = rec?.reqId;
+  if (!reqId) return;
+
+  let key = pendingByReqId.get(reqId);
+  if (!key) key = findKeyByTicker(rec?.order?.symbol || rec?.order?.ticker);
+  const levelGroup = registerLevelOrderChild(rec, key);
+  if (levelGroup) key = levelGroup.key;
+  if (!key) return;
+
+  pendingByReqId.set(reqId, key);
+  retryCounts.set(reqId, 0);
+  const card = cardByKey(key);
+  if (rec.pendingId) {
+    pendingIdByReqId.set(reqId, rec.pendingId);
+    if (card) card.dataset.pendingId = rec.pendingId;
+  } else {
+    pendingIdByReqId.delete(reqId);
+    if (card) delete card.dataset.pendingId;
+  }
+  if (card) {
+    card.dataset.reqId = levelGroup ? levelGroup.parentRequestId : reqId;
+    const rb = card.querySelector('.retry-btn');
+    if (rb) rb.textContent = '0';
+  }
+  if (!levelGroup && (cardStates.get(key) !== 'pending-exec' || rec?.order?.side)) {
+    setCardState(key, 'pending');
+  }
+  if (!levelGroup && card && rec?.order) {
+    const ui = uiState.get(key) || {};
+    if (rec.order.qty != null) {
+      ui.qty = String(rec.order.qty);
+      const $q = card.querySelector('input.qty');
+      if ($q) $q.value = ui.qty;
+    }
+    if (rec.order.price != null) {
+      ui.price = String(rec.order.price);
+      const $p = card.querySelector('input.pr');
+      if ($p) $p.value = ui.price;
+    }
+    if (rec.order.sl != null) {
+      ui.sl = String(rec.order.sl);
+      const $s = card.querySelector('input.sl');
+      if ($s) $s.value = ui.sl;
+    }
+    if (rec.order.tp != null) {
+      ui.tp = String(rec.order.tp);
+      const $t = card.querySelector('input.tp');
+      if ($t) $t.value = ui.tp;
+    }
+    uiState.set(key, ui);
+  }
+  toast(`… ${rec.order.symbol}: queued`);
+});
+
+ipcRenderer.on('execution:retry', (_evt, rec) => {
+  let key = pendingByReqId.get(rec.reqId);
+  const levelGroup = findLevelOrderGroupByReqId(rec.reqId) || findLevelOrderGroupByPendingId(rec.pendingId);
+  if (levelGroup) key = levelGroup.key;
+  if (!key) return;
+  retryCounts.set(rec.reqId, rec.count);
+  const card = cardByKey(key);
+  if (card) {
+    const rb = card.querySelector('.retry-btn');
+    if (rb) rb.textContent = String(rec.count);
+  }
+});
+
+ipcRenderer.on('execution:retry-stopped', (_evt, rec) => {
+  const levelGroup = findLevelOrderGroupByReqId(rec.reqId)
+    || findLevelOrderGroupByPendingId(rec.pendingId)
+    || levelOrderGroups.get(rec.parentRequestId || rec.reqId);
+  let key = pendingByReqId.get(rec.reqId);
+  if (levelGroup) key = levelGroup.key;
+  if (!key) return;
+  if (levelGroup) {
+    const parentReqId = levelGroup.parentRequestId;
+    clearLevelOrderGroup(parentReqId);
+    pendingByReqId.delete(parentReqId);
+    pendingIdByReqId.delete(parentReqId);
+    retryCounts.delete(parentReqId);
+    const card = cardByKey(key);
+    if (card) {
+      delete card.dataset.reqId;
+      delete card.dataset.pendingId;
+      const rb = card.querySelector('.retry-btn');
+      if (rb) {
+        rb.textContent = '0';
+        rb.style.display = 'none';
+      }
+    }
+    setCardState(key, null);
+    render();
+    return;
+  }
+  pendingByReqId.delete(rec.reqId);
+  retryCounts.delete(rec.reqId);
+  const card = cardByKey(key);
+  if (card) {
+    delete card.dataset.reqId;
+    const rb = card.querySelector('.retry-btn');
+    if (rb) {
+      rb.textContent = '0';
+      rb.style.display = 'none';
+    }
+  }
+  setCardState(key, null);
+  render();
+});
+
+ipcRenderer.on('orders:remove', (_evt, filter) => {
+  if (!filter || typeof filter !== 'object') return;
+  const {producingLineId} = filter;
+  if (producingLineId == null) return;
+  const targetId = String(producingLineId);
+  if (!targetId) return;
+  const matches = state.rows.filter(row => String(row.producingLineId || '') === targetId);
+  if (matches.length === 0) return;
+  const keysToRemove = new Set(matches.map(row => rowKey(row)));
+  const nextRows = [];
+  const removed = [];
+  for (const row of state.rows) {
+    const key = rowKey(row);
+    if (keysToRemove.has(key)) {
+      removed.push({row, key});
+    } else {
+      nextRows.push(row);
+    }
+  }
+  if (removed.length === 0) return;
+  state.rows = nextRows;
+  removed.forEach(({row, key}) => {
+    uiState.delete(key);
+    cardStates.delete(key);
+    clearPendingByKey(key);
+    userTouchedByTicker.delete(row.ticker);
+    forgetInstrument(row.ticker, row.provider);
+  });
+  render();
+});
+
+// Обновлённая логика получения ивента
+ipcRenderer.on('orders:new', (_evt, row) => {
+  if (isLiveIndexCard(row)) row = {...row,ticker:indexSymbol(row.ticker)};
+  if (reuseIndexLevelCard(row)) return;
+  // ищем существующую карточку по ТИКЕРУ
+  const isLevelOrderRow = row.cardType === 'levelOrder';
+  let idx;
+  if (row.instrumentType === 'OPT') {
+    idx = state.rows.findIndex(r => rowKey(r) === rowKey(row));
+  } else if (isLevelOrderRow) {
+    idx = state.rows.findIndex(r => {
+      if (r.cardType !== 'levelOrder' || r.ticker !== row.ticker) return false;
+      return !isTerminalCardState(cardStates.get(rowKey(r)));
+    });
+  } else {
+    idx = state.rows.findIndex(r => r.ticker === row.ticker);
+  }
+
+  if (idx === -1) {
+    // карточки нет — добавляем новую
+    state.rows.push(row);
+    if (state.rows.length > 500) state.rows.splice(0,state.rows.length-500);
+    render();
+    if (!registerAttachedOptionRow(row)) scheduleInstantExecution(row);
+    return;
+  }
+  // карточка для тикера уже есть
+  const oldRow = state.rows[idx];
+  const oldKey = rowKey(oldRow);
+  const st = cardStates.get(oldKey);
+  if (isTerminalCardState(st)) {
+    handleClosedCard({row, idx, oldRow, oldKey});
+    return;
+  }
+
+  const touched = isTouched(row.ticker);
+
+  if (touched) {
+    // Keep the user's fields, focus and place in the queue.
+    return;
+  }
+
+  // Update the existing queue slot without promoting the card.
+  const newRow = {...oldRow, ...row};
+  const newKey = rowKey(newRow);
+
+  // подменяем строку
+  state.rows[idx] = newRow;
+
+  // мигрируем ключи в ui/pending и подтягиваем авто-поля из ивента
+  migrateKey(oldKey, newKey, {
+    preserveUi: false,
+    nextUiPatch: (prevUi) => {
+      const patch = {};
+      if (row.qty != null) patch.qty = String(row.qty);
+      if (row.price != null) patch.price = String(row.price);
+      if (row.sl != null) patch.sl = String(row.sl);
+      if (row.tp != null) patch.tp = String(row.tp);
+      if (row.cardType === 'levelOrder') {
+        if (row.level != null) patch.level = String(row.level);
+        if (row.riskUsd != null) patch.risk = String(row.riskUsd);
+        if (row.stopOffsetPts != null) patch.stopOffsetPts = String(row.stopOffsetPts);
+        if (row.maxLot != null) patch.maxLot = String(row.maxLot);
+        if (row.takeProfitPts != null) patch.takeProfitPts = String(row.takeProfitPts);
+        if (row.pointSize != null) patch.pointSize = String(row.pointSize);
+      }
+      return patch;
+    }
+  });
+
+  const updated = state.rows[idx];
+
+  if (state.rows.length > 500) state.rows.length = 500;
+  render();
+  registerAttachedOptionRow(updated);
+});
+
+// Результат исполнения: закрыть или подсветить карточку
+ipcRenderer.on('execution:result', (_evt, rec) => {
+  const reqId = rec?.order?.meta?.requestId || rec?.reqId;
+  if (!reqId) return;
+  const levelGroup = registerLevelOrderChild(rec) || findLevelOrderGroupByPendingId(rec?.pendingId || rec?.cid);
+  const key = levelGroup?.key || pendingByReqId.get(reqId);
+  if (!key) return;
+
+  pendingByReqId.delete(reqId);
+  pendingIdByReqId.delete(reqId);
+  retryCounts.delete(reqId);
+  const card = cardByKey(key);
+  if (card) {
+    delete card.dataset.reqId;
+    delete card.dataset.pendingId;
+    const rb = card.querySelector('.retry-btn');
+    if (rb) rb.textContent = '0';
+  }
+
+  const ok = rec.status === 'ok' || rec.status === 'simulated';
+  if (levelGroup) {
+    if (ok) {
+      levelGroup.placedReqIds.add(reqId);
+      if (rec.providerOrderId) registerLevelOrderTicket(levelGroup, rec.providerOrderId, key);
+      if (levelOrderAllPlaced(levelGroup)) {
+        setCardState(key, levelOrderAllOpened(levelGroup) ? 'executing' : 'pending-exec');
+        const cardEl = cardByKey(key);
+        if (cardEl) {
+          delete cardEl.dataset.reqId;
+          delete cardEl.dataset.pendingId;
+        }
+        toast(`✔ ${rec.order?.symbol || ''}: level order group placed`);
+        render();
+      }
+      return;
+    }
+    if (rec.status === 'unknown' || rec.partial === true) {
+      setCardState(key, 'pending-exec');
+      if (card) card.title = rec.reason || 'Execution state unknown';
+      toast(`... ${rec.order?.symbol || ''}: execution state unknown`);
+      render();
+      return;
+    }
+    setCardState(key, null);
+    render();
+    shakeCard(key);
+    if (card) card.title = rec.reason || 'Rejected';
+    toast(`✖ ${rec.order?.symbol || ''}: ${rec.reason || 'Rejected'}`);
+    return;
+  }
+
+  if (ok) {
+    const st = cardStates.get(key);
+    if (st !== 'executing' && st !== 'profit' && st !== 'loss') {
+      setCardState(key, 'placed');
+    }
+    if (rec.providerOrderId) ticketToKey.set(String(rec.providerOrderId), key);
+    const providerOrderId = String(rec.providerOrderId || '');
+    if (providerOrderId) {
+      const row = state.rows.find(r => rowKey(r) === key);
+      const symbol = rec.order?.symbol || rec.order?.ticker || row?.ticker || row?.symbol || '';
+      const openedAt = Date.now();
+      placedOrderByKey.set(key, {
+        provider: rec.provider || (row && row.provider) || '',
+        ticket: providerOrderId,
+        symbol: symbol,
+        strategyCommand: row?.strategyCommand,
+        name: rec.order?.name || row?.name,
+        payoff: rec.payoff || rec.raw?.payoff,
+        valuation: rec.valuation || rec.raw?.valuation,
+        openedAt
+      });
+      if (row && (rec.payoff || rec.raw?.payoff)) row.payoff = rec.payoff || rec.raw.payoff;
+      if (row && (rec.valuation || rec.raw?.valuation)) row.valuation = rec.valuation || rec.raw.valuation;
+      if (row && row.instrumentType === 'OPT') row.openedAt = row.openedAt || openedAt;
+    }
+    toast(`✔ ${rec.order.symbol} ${rec.order.side} ${rec.order.qty} — placed`);
+    render();
+  } else if (rec.status === 'unknown' || rec.partial === true) {
+    setCardState(key, 'pending');
+    if (card) card.title = rec.reason || 'Execution state unknown';
+    toast(`... ${rec.order?.symbol || ''}: execution state unknown`);
+    render();
+  } else {
+    setCardState(key, null);
+    render();
+    shakeCard(key);
+    if (card) card.title = rec.reason || 'Rejected';
+    toast(`✖ ${rec.order?.symbol || ''}: ${rec.reason || 'Rejected'}`);
+  }
+});
+
+ipcRenderer.on('position:opened', (_evt, rec) => {
+  const ticket = String(rec.ticket);
+  let levelGroup = levelOrderGroups.get(levelOrderTicketToGroup.get(ticket));
+  let key = levelGroup?.key || ticketToKey.get(ticket);
+  if (!levelGroup && rec.origOrder?.meta?.parentRequestId) {
+    const groupByMeta = findLevelOrderGroupByReqId(rec.origOrder.meta.requestId)
+      || findOrRegisterLevelOrderGroupFromMeta(rec.origOrder.meta, key || pendingByReqId.get(rec.origOrder.meta.parentRequestId));
+    if (groupByMeta) {
+      levelGroup = groupByMeta;
+      key = key || groupByMeta.key;
+      registerLevelOrderTicket(levelGroup, ticket, key);
+    }
+  }
+  if (!key) {
+    const meta = rec.origOrder?.meta || {};
+    const reqId = meta.requestId;
+    if (reqId) {
+      const fallbackKey = meta.parentRequestId ? pendingByReqId.get(meta.parentRequestId) : null;
+      const groupByReq = findLevelOrderGroupByReqId(reqId) || findOrRegisterLevelOrderGroupFromMeta(meta, fallbackKey);
+      if (groupByReq) levelGroup = groupByReq;
+      key = groupByReq?.key || pendingByReqId.get(reqId);
+      if (key) {
+        ticketToKey.set(ticket, key);
+        if (levelGroup) registerLevelOrderTicket(levelGroup, ticket, key);
+      }
+    }
+  }
+  if (!key) return;
+  if (levelGroup) {
+    levelGroup.openedTickets.add(ticket);
+    registerLevelOrderTicket(levelGroup, ticket, key);
+    markRowOpened(key);
+    const row=appState.rows.find(r=>rowKey(r)===key);
+    if (levelOrderAllOpened(levelGroup) && !isLiveIndexCard(row)) {
+      placedOrderByKey.delete(key);
+      setCardState(key, 'executing');
+      render();
+    }
+    return;
+  }
+  placedOrderByKey.delete(key);
+  markRowOpened(key);
+  setCardState(key, 'executing');
+  render();
+});
+
+ipcRenderer.on('level-order:account-status',(_evt,rec={})=>{
+  const group=levelOrderGroups.get(rec.parentRequestId),key=group?.key || pendingByReqId.get(rec.parentRequestId);
+  if (!key || levelOrderControlBusy.has(key) || ['placing','placed','closed'].includes(levelOrderStages.get(key))) return;
+  setLevelStage(key,['opened','waiting','unknown','partial-opened','partial-waiting'].includes(rec.phase) ? rec.phase : 'mixed',rec.accounts,rec.reasons);
+  setCardState(key,cardStates.get(key));
+});
+ipcRenderer.on('level-order:group-completed',(_evt,rec={})=>{
+  const group=levelOrderGroups.get(rec.parentRequestId),key=group?.key;
+  const row=appState.rows.find(r=>rowKey(r)===key);
+  if (!group || !rec.accountsConfirmed || !isLiveIndexCard(row) || levelOrderControlBusy.has(key)) return;
+  // Every accepted ticket has a broker-confirmed exit; other accounts either
+  // exited too or definitively rejected the opening. Clear only
+  // this captured group; new clicks still run the ordinary LT and safety gates.
+  clearLevelOrderGroup(rec.parentRequestId);
+  pendingByReqId.delete(rec.parentRequestId);pendingIdByReqId.delete(rec.parentRequestId);retryCounts.delete(rec.parentRequestId);
+  if (levelOrderGroupsByKey(key).length) return;
+  placedOrderByKey.delete(key);instantExecutedKeys.delete(key);levelOrderStages.delete(key);levelOrderAccountDetails.delete(key);levelOrderAccountReasons.delete(key);
+  const card=cardByKey(key);
+  if (card) {delete card.dataset.reqId;delete card.dataset.pendingId;}
+  setCardState(key,null);render();
+});
+ipcRenderer.on('level-order:positions-ready', (_evt, rec = {}) => {
+  const parentRequestId = rec.parentRequestId || rec.requestId;
+  const group = levelOrderGroups.get(parentRequestId);
+  let key = group?.key || pendingByReqId.get(parentRequestId);
+  if ((!key || !cardByKey(key)) && rec.symbol && (!parentRequestId || group)) {
+    const liveKey = findKeyByTicker(rec.symbol);
+    if (liveKey) {
+      if (group) group.key = liveKey;
+      key = liveKey;
+    }
+  }
+  if (!key) return;
+  const readyRow=appState.rows.find(r=>rowKey(r)===key);
+  if (isLiveIndexCard(readyRow) && !rec.accountsConfirmed) return;
+  if (isLiveIndexCard(readyRow)) setLevelStage(key,'opened');
+  if (group) {
+    group.lifecycleReady = true;
+    group.foundQty = Number(rec.foundQty);
+    group.expectedQty = Number(rec.expectedQty);
+    for (const cid of rec.foundCids || []) {
+      const normalizedCid = String(cid || '').trim();
+      if (!normalizedCid) continue;
+      levelOrderPendingToGroup.set(normalizedCid, parentRequestId);
+      group.foundCids.add(normalizedCid);
+    }
+    for (const ticket of rec.foundTickets || []) {
+      const normalizedTicket = String(ticket || '').trim();
+      if (!normalizedTicket) continue;
+      group.tickets.add(normalizedTicket);
+      group.openedTickets.add(normalizedTicket);
+      levelOrderTicketToGroup.set(normalizedTicket, parentRequestId);
+      ticketToKey.set(normalizedTicket, key);
+    }
+  }
+  setCardState(key, 'executing');
+  render();
+});
+
+ipcRenderer.on('position:closed', (_evt, rec) => {
+  const ticket = String(rec.ticket);
+  const levelGroup = levelOrderGroups.get(levelOrderTicketToGroup.get(ticket));
+  const key = levelGroup?.key || ticketToKey.get(ticket);
+  if (!key) return;
+  const currentRow=appState.rows.find(r=>rowKey(r)===key);
+  if (levelGroup && isLiveIndexCard(currentRow)) return; // Main group monitor confirms every captured account.
+  if (levelGroup) {
+    levelGroup.closedTickets.add(ticket);
+    if (typeof rec.profit === 'number') levelGroup.profitByTicket.set(ticket, rec.profit);
+    else levelGroup.profitByTicket.delete(ticket);
+    markRowClosed(key);
+    if (levelOrderAllClosed(levelGroup)) {
+      const tickets = Array.from(levelGroup.tickets);
+      const pnlComplete = tickets.length > 0 && tickets.every(groupTicket => levelGroup.profitByTicket.has(groupTicket));
+      const totalProfit = pnlComplete
+        ? tickets.reduce((sum, groupTicket) => sum + levelGroup.profitByTicket.get(groupTicket), 0)
+        : null;
+      setCardState(key, pnlComplete ? (totalProfit >= 0 ? 'profit' : 'loss') : 'closed');
+      render();
+    }
+    return;
+  }
+  markRowClosed(key);
+  if (typeof rec.profit === 'number') {
+    setCardState(key, rec.profit >= 0 ? 'profit' : 'loss');
+  } else {
+    setCardState(key, 'closed');
+  }
+  render();
+});
+
+ipcRenderer.on('order:cancelled', (_evt, rec) => {
+  const ticket = String(rec.ticket);
+  const levelGroup = levelOrderGroups.get(levelOrderTicketToGroup.get(ticket));
+  const key = levelGroup?.key || ticketToKey.get(ticket);
+  if (key) {
+    const row = state.rows.find(r => rowKey(r) === key);
+    ticketToKey.delete(ticket);
+    if (levelGroup || row?.cardType === 'levelOrder' || levelOrderGroupsByKey(key).length > 0) {
+      if (levelGroup) levelGroup.tickets.delete(ticket);
+      levelOrderTicketToGroup.delete(ticket);
+      return;
+    }
+    placedOrderByKey.delete(key);
+    removeRowByKey(key);
+  }
+});
+
+// ======= UI events =======
+$filter.addEventListener('input', () => {
+  state.filter = $filter.value || '';
+  render();
+});
+$settingsBtn.addEventListener('click', () => {
+  $settingsPanel.style.display = 'flex';
+  loadSettingsSections();
+});
+let settingsSaveInProgress = false;

@@ -1,0 +1,254 @@
+const path = require('path');
+const settings = require('../settings');
+const loadConfig = require('../../config/load');
+const { MT5VPSAdapter } = require('./client');
+const { CommandJournal } = require('./commandJournal');
+const events = require('../events');
+const {followers}=require('./sizing');
+settings.register('mt5-vps', path.join(__dirname,'config/mt5-vps.json'), path.join(__dirname,'config/mt5-vps-settings-descriptor.json'));
+settings.onApply('mt5-vps', ({ changedPaths }) => ({restartRequiredPaths:changedPaths}));
+function readConfig() { return loadConfig('../services/mt5-vps/config/mt5-vps.json'); }
+function initService(api) {
+  let adapter;
+  const accountAdapters = new Map();
+  let closing = false, watching = false;
+  const {app, ipcMain, powerSaveBlocker} = require('electron');
+  const runtimeActivity=require('./runtimeActivity').createRuntimeActivity(powerSaveBlocker);
+  const tunnelRecovery=require('./tunnelRecovery').createTunnelRecovery(app.getPath('userData'));
+  api.mt5VPS = {
+    getAdapter() {
+      // macOS safeStorage can cache an unusable key for this process when
+      // decryption happens before Electron is ready. LT starts with services.
+      if (app.isReady?.() === false) throw Error('ISCC запускается; подключение MT5 ожидает готовности приложения');
+      if (!adapter) {
+        const connection = new MT5VPSAdapter(readConfig());
+        connection.commandJournal = new CommandJournal(path.join(app.getPath('userData'), 'mt5-command-journal.json'), {asyncWrites:true});
+        connection.commandJournal.prepareEntryPlans?.();
+        connection.events = events;
+        connection.quoteLogFile = path.join(app.getPath('userData'),'logs','mt5-quote-stream.jsonl');
+        connection.on('quote:updated', snapshot => {
+          const symbol = snapshot.symbol === connection.config.spxSymbol ? 'SPX500' : 'USTEC';
+          api.instrumentInfo?.ingest?.({provider:'mt5-vps',symbol},snapshot);
+        });
+        connection.on('quote:stale',() => {
+          for (const symbol of ['SPX500','USTEC']) api.instrumentInfo?.ingest?.({provider:'mt5-vps',symbol},{});
+        });
+        adapter = connection;
+        runtimeActivity.start(connection.config.enabled);
+      }
+      api.execution?.wireAdapter?.(adapter, 'mt5-vps');
+      return adapter;
+    }
+  };
+  function forAccount(account) {
+    const primary = api.mt5VPS.getAdapter();
+    if (!account || String(account)===String(primary.config.account)) return primary;
+    if (!followers(primary.config).some(row=>row.account===String(account)) && !primary.remoteAccounts?.includes(String(account))) throw Error('Счёт не настроен');
+    if (!accountAdapters.has(String(account))) {
+      const connection = new MT5VPSAdapter({...primary.config, account:String(account),routePrefix:`/accounts/${account}`,mirrorAccount:null,followers:[]});
+      connection.quoteLogFile=primary.quoteLogFile;
+      connection.commandJournal = new CommandJournal(path.join(app.getPath('userData'),`mt5-command-journal-${account}.json`), {asyncWrites:true});
+      connection.connectionRestarting=primary.connectionRestarting===true;
+      accountAdapters.set(String(account),connection);
+    }
+    return accountAdapters.get(String(account));
+  }
+  function acceptManagement(state) {
+    const primary = api.mt5VPS.getAdapter();
+    primary.remoteAccounts = Object.keys(state.accountStates).filter(value=>value!==String(primary.config.account));
+    for (const [account,health] of Object.entries(state.accountStates)) {
+      const connection = forAccount(account);
+      if (health.connected) connection.acceptManagementState(health,connection===primary ? state : health);
+      else connection.managementSnapshot = null;
+    }
+    primary.managementStateView=state;primary.managementStateAt=Date.now();
+  }
+  const warmthTimer = require('timers').setInterval(async () => {
+    if (closing || watching || !adapter?.config.enabled) return;
+    watching = true;
+    try {
+      // Discover positions even with the dialog closed. This GET never arms or
+      // resends a command and never subscribes followers to price streams.
+      {
+        const state = await adapter.maintainManagementSnapshot();
+        if (closing) return;
+        if (state) acceptManagement(state);
+      }
+      await Promise.all([adapter,...accountAdapters.values()].map(connection=>connection.maintainExecutionWarmth()));
+    } catch { /* Existing UI status and VPS checks handle a disconnected terminal. */ }
+    finally { watching = false; }
+  },1000);
+  warmthTimer.unref?.();
+  app.once('before-quit',() => { closing=true; runtimeActivity.stop(); require('timers').clearInterval(warmthTimer); adapter?.close(); for (const connection of accountAdapters.values()) connection.close(); });
+  require('../brokerage/brokerageAdapters')['mt5-vps'] = () => api.mt5VPS.getAdapter();
+  const enrollment=require('./accountEnrollment').createAccountEnrollment({
+    getAdapter:()=>api.mt5VPS.getAdapter(),isTradingBusy:()=>Boolean(api.execution?.isTradingBusy?.())
+      || [...accountAdapters.values()].some(connection=>connection.inFlight.size || connection.connectionRestarting)
+  });
+  ipcMain.handle('mt5-vps:account-catalog',()=>enrollment.run('catalog'));
+  ipcMain.handle('mt5-vps:account-discovery',()=>enrollment.run('discover'));
+  ipcMain.handle('mt5-vps:account-register',(_evt,payload)=>enrollment.run('register',payload));
+  ipcMain?.handle?.('mt5-vps:status', async () => {
+    const config = readConfig();
+    if (!config.enabled) return { connected:false,message:'MT5 VPS: выключено' };
+    let connection;
+    try {
+      connection = api.mt5VPS.getAdapter();
+      const state=await connection.managementState({maxAgeMs:2000});
+      acceptManagement(state);
+      const primary=state.accountStates?.[String(config.account)];
+      if(!primary?.connected)throw Error(primary?.reason || 'Нет связи с основным счётом');
+      const copies=followers(config).filter(row=>row.enabled);
+      for(const row of copies)if(!state.accountStates?.[row.account]?.connected)
+        throw Error(state.accountStates?.[row.account]?.reason || 'Нет связи со счётом '+row.account);
+      connection.lastStatus={connected:true,message:`MT5 VPS · ${config.account}`,at:Date.now(),
+        build:primary.build,clientBuild:require('./buildInfo').readBuildInfo()};
+      if(connection.capabilities.includes('quote-stream'))connection.ensureQuoteStream();
+      if (copies.length) connection.lastStatus.message += ' · счета '+copies.map(row=>`${row.account} ×${row.multiplier}`).join(', ');
+      const deadline=require('./timeExit').timeExitConfig(config);
+      if (deadline.enabled) connection.lastStatus.message += ` · закрытие ${deadline.time} NY`;
+      const risk = api.riskManager?.snapshot?.().config;
+      if (risk?.enabled && risk.providers?.['mt5-vps']?.enabled) await connection.listOpenOrders();
+    } catch (error) { return {connected:false,message:error.message,canRecoverConnection:await tunnelRecovery.available(config)}; }
+    return {...connection.lastStatus,canRecoverConnection:await tunnelRecovery.available(config)};
+  });
+  let reconnecting;
+  ipcMain.handle('mt5-vps:reconnect',async () => {
+    if (reconnecting) return reconnecting;
+    if (enrollment.busy) return {status:'rejected',reason:'Дождись завершения добавления счёта'};
+    let primary;
+    try {primary=api.mt5VPS.getAdapter();} catch(error) {return {status:'rejected',reason:error.message};}
+    if (api.execution?.isTradingBusy?.() || [primary,...accountAdapters.values()].some(connection=>connection.inFlight.size)) return {status:'rejected',reason:'Дождись завершения отправленной торговой команды'};
+    for (const connection of [primary,...accountAdapters.values()]) connection.connectionRestarting=true;
+    reconnecting=(async()=>{
+      try {
+        await tunnelRecovery.reconnect(primary.config);
+        const deadline=Date.now()+15000;let lastError;
+        do {
+          try {
+            await primary.health();
+            await Promise.all(followers(primary.config).filter(row=>row.enabled).map(row=>forAccount(row.account).health()));
+            return {status:'ok',message:'Связь восстановлена · все включённые счета готовы'};
+          } catch(error) {lastError=error;await new Promise(resolve=>setTimeout(resolve,500));}
+        } while(Date.now()<deadline);
+        throw lastError;
+      } catch(error) {return {status:'rejected',reason:error?.message || 'Нет связи с VPS. Проверь интернет и доступ к Связке ключей'};}
+      finally {for(const connection of [primary,...accountAdapters.values()]) connection.connectionRestarting=false;reconnecting=null;}
+    })();
+    return reconnecting;
+  });
+  ipcMain.handle('mt5-vps:trade-settings',async()=>{
+    try {
+      const primary=api.mt5VPS.getAdapter(),config=readConfig();
+      const state=await primary.managementState({maxAgeMs:2000});
+      acceptManagement(state);
+      const health=state.accountStates?.[String(config.account)];
+      if(!health?.connected)throw Error(health?.reason || 'Нет связи с основным счётом');
+      // Settings need capabilities/account ids, not ticket histories,
+      // reconciliation, command journals or a management execution lease.
+      return {status:'ok',account:config.account,accounts:[config.account,...primary.remoteAccounts],
+        followers:followers(config),timeExit:require('./timeExit').timeExitConfig(config),capabilities:health.capabilities || []};
+    } catch(error){return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('mt5-vps:orders', async (_evt, account) => {
+    try {
+      const connection = forAccount(account);
+      const primary = api.mt5VPS.getAdapter();
+      const identifiers = connection.commandJournal.records.filter(x=>x.result.status==='unknown').slice(-20).map(x=>x.id);
+      const state = identifiers.length
+        ? await primary.request(`/management?receipts=${encodeURIComponent(identifiers.join(','))}&receiptAccount=${encodeURIComponent(connection.config.account)}`)
+        : await primary.managementState({maxAgeMs:1000});
+      acceptManagement(state);
+      const health = state.accountStates[String(connection.config.account)];
+      if (!health?.connected) throw Error(health?.reason || 'Нет связи с выбранным счётом');
+      connection.managementLeaseUntil = Date.now()+10000;
+      connection.maintainExecutionWarmth().catch(()=>{});
+      await connection.commandJournal.reconcile(async id => connection.validateCommandReceipt(id,state.receipts[id]));
+      const parentCommands=primary.commandJournal.records.filter(command=>['entry-protection','entry-close'].includes(command.operation));
+      if(connection!==primary) {
+        const pendingParents=new Set(parentCommands.filter(command=>command.result?.status==='unknown').slice(-20).map(command=>command.id));
+        await primary.commandJournal.reconcile(async id=>pendingParents.has(id)
+          ? primary.validateCommandReceipt(id,(await primary.request(`/receipt?id=${encodeURIComponent(id)}`)).result) : null);
+      }
+      const config = readConfig();
+      const rules=(health.rules || []).map(rule=>({...rule,executionResults:Object.fromEntries(Object.entries(state.accountStates).flatMap(([account,accountState])=>{
+        const id=account===String(health.account) ? rule.id : rule.id+':'+account;
+        const matched=(accountState.rules || []).find(candidate=>candidate.id===id);
+        return matched?.result?.timings ? [[account,matched.result]] : [];
+      }))}));
+      return {status:'ok',account:health.account,accounts:[config.account,...primary.remoteAccounts],followers:followers(config),timeExit:require('./timeExit').timeExitConfig(config),timeRules:health.timeRules || [],capabilities:health.capabilities || [],orders:health.orders,rules,
+        alerts:state.alerts || [],accountStates:state.accountStates,checkedAt:health.checkedAt,
+        commands:[...new Map([...connection.commandJournal.records,...parentCommands].map(command=>[command.id,command])).values()]
+          .sort((a,b)=>(b.at || 0)-(a.at || 0)).slice(0,100)};
+    } catch (error) { return {status:'rejected',reason:error.message}; }
+  });
+  ipcMain.handle('mt5-vps:prepare-entry',async () => {
+    try {
+      const connection=api.mt5VPS.getAdapter();
+      if (!connection.config.enabled) throw Error('MT5 VPS выключено');
+      connection.managementLeaseUntil=Date.now()+20000;
+      // Local LT configuration is available even while a network read waits.
+      // Warming is an optimization; its result never grants entry authority.
+      Promise.resolve().then(()=>connection.warmExecutionConnection()).catch(()=>{
+        connection.recordQuoteStream?.('preparation','background-warm-failed');
+      });
+      return {ok:true,groups:api.levelTrack?.snapshot?.().config.groups || []};
+    } catch(error) {return {ok:false,reason:error.message};}
+  });
+  ipcMain.handle('mt5-vps:save-followers',async (_evt,rows)=>{
+    try {
+      if(enrollment.busy)throw Error('Дождись завершения добавления счёта');
+      const primary=api.mt5VPS.getAdapter(), config=readConfig();
+      const next=followers({...config,followers:rows});
+      const health=await primary.health();
+      if (!health.capabilities?.includes('scaled-accounts')) throw Error('Обновите приёмник VPS');
+      if (next.some(row=>!health.linkedAccounts?.includes(row.account))) throw Error('Сначала подключите отдельный терминал и зарегистрируйте счёт на VPS');
+      const changed={...config,followers:next,mirrorAccount:Number(next.find(row=>row.enabled)?.account || 0)};
+      if (!settings.writeConfig('mt5-vps',changed)) throw Error('Не удалось сохранить настройки');
+      primary.config.followers=next; primary.config.mirrorAccount=changed.mirrorAccount;
+      return {status:'ok',followers:next};
+    } catch (error) {return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('mt5-vps:save-time-exit',async (_evt,value)=>{
+    try {
+      const primary=api.mt5VPS.getAdapter(),config=readConfig();
+      const timeExit=require('./timeExit').timeExitConfig({timeExit:value});
+      if (timeExit.enabled) {
+        const state=await primary.managementState({maxAgeMs:0});
+        for (const account of [String(config.account),...followers(config).filter(x=>x.enabled).map(x=>x.account)]) {
+          const health=state.accountStates?.[account];
+          if (!health?.connected || !health.capabilities?.includes('time-exit')) throw Error('Обновите и подключите приёмник на каждом счёте');
+        }
+        require('./timeExit').deadlineForNewTrade({timeExit});
+      }
+      if (!settings.writeConfig('mt5-vps',{...config,timeExit})) throw Error('Не удалось сохранить время закрытия');
+      primary.config.timeExit=timeExit;
+      return {status:'ok',timeExit};
+    } catch(error) {return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('mt5-vps:manage', async (_evt, payload = {}) => {
+    if(enrollment.busy)return {status:'rejected',reason:'Дождись завершения добавления счёта'};
+    const connection = forAccount(payload.account);
+    if (payload.action === 'entry-close' && payload.target?.entryPlan) {
+      return api.mt5VPS.getAdapter().closeEntryPosition({id:payload.target.entryPlan.id,symbol:payload.target.symbol}, {
+        clickAt:payload.target.clickAt
+      });
+    }
+    if (payload.action === 'entry-protection' || payload.action === 'modify' && payload.target?.entryPlan) {
+      return api.mt5VPS.getAdapter().modifyEntryProtection(payload.target, payload.changes || {}, {
+        account:String(connection.config.account),operation:payload.operation || 'modify'
+      });
+    }
+    if (payload.action === 'cancel' && payload.target?.__isPosition === false) {
+      return connection.cancelPendingOrder(payload.target.ticket, payload.target.symbol,payload.target.singleAccount,payload.target.clickAt);
+    }
+    if (payload.action === 'close' && payload.target?.__isPosition === true) {
+      return connection.closePosition(payload.target, 'manual MT5 management', payload.volume,payload.percent);
+    }
+    if (payload.action === 'modify' && payload.target) return connection.modifyOrder(payload.target, payload.changes || {});
+    if (payload.action === 'schedule-close' && payload.target?.__isPosition) return connection.schedulePartialClose(payload.target,payload.volume,payload.targetPrice,payload.comparison,payload.percent);
+    if (payload.action === 'cancel-close' && payload.target) return connection.cancelScheduledClose(payload.target,payload.ruleId);
+    return {status:'rejected',reason:'Неизвестная команда управления MT5'};
+  });
+}
+module.exports = { initService, readConfig };

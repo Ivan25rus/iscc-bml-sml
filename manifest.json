@@ -1,0 +1,439 @@
+{
+  "schema": 1,
+  "kind": "iscc-bml-sml",
+  "version": "0.2.0",
+  "files": {
+    ".gitattributes": {
+      "sha256": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
+      "size": 19
+    },
+    ".gitignore": {
+      "sha256": "70793b5dea246f02e1a8e9bcea63a69878a987f6c137a695b962a73b0b027e85",
+      "size": 233
+    },
+    "AGENTS.md": {
+      "sha256": "363efc95b3e64b1204998c3260654cd02fe86251fb5b66c4c5e3eed7e4ac2ea7",
+      "size": 3641
+    },
+    "BUILD-INFO.json": {
+      "sha256": "bd0944e151f08413d5827e40588a9fff0d32fbd0a9ffa002fb6d55be02eaa3a8",
+      "size": 704
+    },
+    "CLAUDE.md": {
+      "sha256": "cfd58d189e3f3caf31b56dde4369fd03daa2c06e46859499aaf31f94dfb61320",
+      "size": 236
+    },
+    "FEATURES.md": {
+      "sha256": "387f3ceb2b2d99ea4de4aef9d289a078e57b998be1dba64abd9dcca968d35066",
+      "size": 4303
+    },
+    "INSTALL.md": {
+      "sha256": "4c7c4e49c98f9c7ddad309431d6567a2ac89b64319a6c9c77b299ea0c1e01ef2",
+      "size": 5493
+    },
+    "INTEGRATION.md": {
+      "sha256": "9f98d1d14f412611fd2583a2207ba4f3ba4913b8fc2497fcaba66db299f57866",
+      "size": 5293
+    },
+    "PUBLISH.md": {
+      "sha256": "3ef919344262bb1dead83079834a90878e311d4cac150302e63718c6386f2bc2",
+      "size": 1583
+    },
+    "README.md": {
+      "sha256": "b70dc95602b22b8790167b526f0badd2faf5bd6c836958fbcbb8bb7c09a97a34",
+      "size": 9018
+    },
+    "SETUP.html": {
+      "sha256": "def0d19cdbc4a40361ce48797382c18e6e669819bf7adb117554c43c1717291c",
+      "size": 5291
+    },
+    "SOURCE-HASHES.json": {
+      "sha256": "b22d5aacab0d13e75a3336409ed4b8662e072683e4fe6cc47adc6b34b2b46e6f",
+      "size": 9217
+    },
+    "SOURCE_MAP.md": {
+      "sha256": "035692ff2443a71854ab6e69928ea3deb148ecfa3486ecd898f408de94452fa9",
+      "size": 3582
+    },
+    "ci/README.md": {
+      "sha256": "d48451e1fa2a978733e15762ab9818fd16073a03f15c66c214b78ca7632818a0",
+      "size": 1132
+    },
+    "ci/check.yml.example": {
+      "sha256": "d7b1f6e4a105bd6ca81a735a97c80e8040774d2ee8ba6933453e34bc028021d2",
+      "size": 866
+    },
+    "config.example.json": {
+      "sha256": "981d56c54adbf4cbbfdac8369e00d6987a68f91bea0422713e053854ca9073f0",
+      "size": 182
+    },
+    "index.html": {
+      "sha256": "def0d19cdbc4a40361ce48797382c18e6e669819bf7adb117554c43c1717291c",
+      "size": 5291
+    },
+    "module/index.js": {
+      "sha256": "00308cf32be83d14d3d68ac700f6e1f63bbf440ee52e000a27fada21a12196bb",
+      "size": 1537
+    },
+    "module/renderer.js": {
+      "sha256": "bba12869fd8024cc757c6f1ee7d82b795a7000fdbd0fad16bb1a54e1d6a4eabd",
+      "size": 434
+    },
+    "package.json": {
+      "sha256": "1077406af7fcbdbd95a21554720b6fb2b46a97d8551727c0bb8a5982a365b444",
+      "size": 183
+    },
+    "payload/src/app/services/brokerage/comps/base.js": {
+      "sha256": "f1a6f31ef9f521dfa85a4e96ce179f8362875571af8b78798cc3f97015748c38",
+      "size": 1975
+    },
+    "payload/src/app/services/durableFile.js": {
+      "sha256": "286da230beb440cedd56b76632e6801eee25bab1e0a5f593bff8d3e6b8c2aced",
+      "size": 1044
+    },
+    "payload/src/app/services/journalWriter.js": {
+      "sha256": "2f60a86548d1a3072da9d8edd3be4b264fc2169a6d5fbdad36e57c95a845106a",
+      "size": 3429
+    },
+    "payload/src/app/services/levelOrder/chunkAdmission.js": {
+      "sha256": "8077d286e7619c0b8976bcd3ee3f7650a660e21e42f73ec2b827ce3db0255337",
+      "size": 6059
+    },
+    "payload/src/app/services/levelOrder/config/level-order-settings-descriptor.json": {
+      "sha256": "62c121786a19722acb4ba9a5aa070f9c2f596084b7fff65d39af00d87788a440",
+      "size": 3972
+    },
+    "payload/src/app/services/levelOrder/manualEntry.js": {
+      "sha256": "5324eb60d8b555a255f141076867a3132d375cfc47c07c72b25fb729bce0e725",
+      "size": 1173
+    },
+    "payload/src/app/services/levelOrder/marketZone.js": {
+      "sha256": "8f65b4cc74a5b943bafcbf950b61c6f1585d14b4d41d0095fef2be680c86bf21",
+      "size": 7089
+    },
+    "payload/src/app/services/levelOrder/strategy.js": {
+      "sha256": "eb41f602418da21ca7c717d5a71eebca3969081b8f233e0496826de1c948c383",
+      "size": 10065
+    },
+    "payload/src/app/services/mt5-vps/accountEnrollment.js": {
+      "sha256": "33a08d4422d94c3c8bdf4e5e4c20784927408a75e5fe2ff486a902f1e5540bf1",
+      "size": 1606
+    },
+    "payload/src/app/services/mt5-vps/approachPreparation.js": {
+      "sha256": "b8dee707d66f80a97dbb7224d5e73bd1ba8ee94ca818c310377f906c745c30c4",
+      "size": 4475
+    },
+    "payload/src/app/services/mt5-vps/buildInfo.js": {
+      "sha256": "6f4549007e7638170d3d24736c6e752d6dcf1b2fbc3612c163ba89c3051667c5",
+      "size": 298
+    },
+    "payload/src/app/services/mt5-vps/cardRecovery.js": {
+      "sha256": "9953b45172f8868b84db3f3973e922184c330801a2c2e416a6f7616d7790b22b",
+      "size": 2878
+    },
+    "payload/src/app/services/mt5-vps/chunkEntryClient.js": {
+      "sha256": "a833347820fd017cca95ac794c213f699339c7742d5828b90d97a4ee2456826e",
+      "size": 38611
+    },
+    "payload/src/app/services/mt5-vps/client.js": {
+      "sha256": "7314eb8d19bb90b0ea4996e6c1a9525b1e14da562520ed44384888210b8915be",
+      "size": 55601
+    },
+    "payload/src/app/services/mt5-vps/commandJournal.js": {
+      "sha256": "be3243cd4c4547bf42813e553daf8c22bb5ee8dffe295b9d9345788cb1821879",
+      "size": 3776
+    },
+    "payload/src/app/services/mt5-vps/diagnosticLog.js": {
+      "sha256": "15233e2035c3c58480186b68845b418e1985e5ddbb92f921a55444f7c3db4dde",
+      "size": 1377
+    },
+    "payload/src/app/services/mt5-vps/entryAdmission.js": {
+      "sha256": "adac0e726ae6ffda163c3b5aeb046dd546f76ceee2e47b2371ce87b7380af2c8",
+      "size": 1822
+    },
+    "payload/src/app/services/mt5-vps/entryIntentClock.js": {
+      "sha256": "b88951f6a279430ebe814a4a7384dd1052b3c0424cd8f425ce4606f495be89df",
+      "size": 871
+    },
+    "payload/src/app/services/mt5-vps/entryLifecycle.js": {
+      "sha256": "13ba6654ee6b277067ad47696a76a9f3c06eb28d3ac3f84f6d5a1f8c92b12ce6",
+      "size": 27424
+    },
+    "payload/src/app/services/mt5-vps/entryRisk.js": {
+      "sha256": "c27f89b87c4f37facd864450b314d45aa32021931b1eea92b0bb7b56c2f78d21",
+      "size": 624
+    },
+    "payload/src/app/services/mt5-vps/entryStatus.js": {
+      "sha256": "57bc95cb9781c6f110695f4107cb108ef8afa953c87a4e904f2af8b0b65295bd",
+      "size": 1058
+    },
+    "payload/src/app/services/mt5-vps/levelControl.js": {
+      "sha256": "98f6d141ff659df07f1fd448e0786ee12d27200c74fa669dda6c134a79189e44",
+      "size": 6097
+    },
+    "payload/src/app/services/mt5-vps/management.js": {
+      "sha256": "5cfc3e9e697424b7d7802ade1e9d79004396ce1572eeb7e4d9ac84031580c269",
+      "size": 34567
+    },
+    "payload/src/app/services/mt5-vps/managementCache.js": {
+      "sha256": "f8f76853c4f26c123013e6ed6e10f37c7b503a285d2a13163adc7d021b5dc7bd",
+      "size": 2082
+    },
+    "payload/src/app/services/mt5-vps/managementFreshness.js": {
+      "sha256": "4034399b8eede07acdaba10e2ab5a1d27640f7f2895e8bdecef465d1741f620c",
+      "size": 943
+    },
+    "payload/src/app/services/mt5-vps/managementPolicy.js": {
+      "sha256": "5b3c290436514ada7ffa28e1d349da3a4df7fe7a13b8d884a16f07f19b2342a0",
+      "size": 6251
+    },
+    "payload/src/app/services/mt5-vps/quoteContinuity.js": {
+      "sha256": "44b8e005c01daf5a54321ec3e06e61fabd44a68107900edb9e2eaf96b93fc1c2",
+      "size": 1170
+    },
+    "payload/src/app/services/mt5-vps/quoteSnapshot.js": {
+      "sha256": "6359672462f87a5d28a8965d9336aaabcf76da7bff95e450d635e2d393c48255",
+      "size": 2024
+    },
+    "payload/src/app/services/mt5-vps/readCompression.js": {
+      "sha256": "9f0dc76ab3852aaa85602de75e14de758c28020b9e491fbe1cb67e065c45082b",
+      "size": 646
+    },
+    "payload/src/app/services/mt5-vps/runtimeActivity.js": {
+      "sha256": "806f3f12c5d5189103b8d24335d6bf938704cf8b2627335cfa26da641d3acdbe",
+      "size": 450
+    },
+    "payload/src/app/services/mt5-vps/secureAuth.js": {
+      "sha256": "18c7824ede03bac6ae86af0222f4010d21dfba56fb80528bf5e2a3018b6ff2e8",
+      "size": 3481
+    },
+    "payload/src/app/services/mt5-vps/sizing.js": {
+      "sha256": "cb7a00130fbbe2e82575fbba2bac307387cef864a28979a70c2681068c80edd6",
+      "size": 2999
+    },
+    "payload/src/app/services/mt5-vps/timeExit.js": {
+      "sha256": "3be1edb26a66bb0b51081cba5080138637f115369e227aaee69c92a8a33455f0",
+      "size": 2034
+    },
+    "payload/src/app/services/mt5-vps/timings.js": {
+      "sha256": "a74b18a3e0852458f42983f42141976469ff8c89131cc5fb040bbdb01216e865",
+      "size": 2766
+    },
+    "payload/src/app/services/mt5-vps/tradeSettings.js": {
+      "sha256": "9d18e29bc6b1d7efc2c32c1efcd5c0fec708f5b14a868bab6851083cbceb8e4a",
+      "size": 13307
+    },
+    "payload/src/app/services/tradeRules/index.js": {
+      "sha256": "aa4acf618e861d167ff8099fb8318354f4a596061764952835f98c4ff1f7ae15",
+      "size": 1959
+    },
+    "payload/src/app/services/tradeRules/maxOrderPriceDeviation.js": {
+      "sha256": "a4398df46ec302198f4e68b8d33f05a73ad19195f0b169a6edc29f5469f27a4c",
+      "size": 1036
+    },
+    "payload/src/app/services/tradeRules/maxQty.js": {
+      "sha256": "1d08e8e25d2e09e0557fe1024071b443ce19e653ee94ed11dca66f8623e37b0f",
+      "size": 789
+    },
+    "payload/src/app/services/tradeRules/minStopPoints.js": {
+      "sha256": "bc3f903a4726c0b133f1b87678ea8c193e8faa2e15e435252a556ad954574f7b",
+      "size": 1252
+    },
+    "payload/src/app/services/tradeRules/tradeRule.js": {
+      "sha256": "26969e3ae61577c3777da83b1d49baf1f45d6218bbf6a8a8d9fe4d717fe2d405",
+      "size": 144
+    },
+    "payload/src/app/services/tvListener/candle-mappings.js": {
+      "sha256": "353c9a84964ebad67da99ff32738310e4e0d85754b28763c14d667814a41ccce",
+      "size": 2523
+    },
+    "payload/vps/account_registry.py": {
+      "sha256": "2c4d1c21c173e446d51ea28e1bb5d72a38233fa0ed10b2c4f732b67895576d4d",
+      "size": 16457
+    },
+    "payload/vps/broker_opening_evidence.py": {
+      "sha256": "14da6cbde75a801642fb4917483b01f83db5fa4049c4ac73a8f6dbaaf97239bc",
+      "size": 3119
+    },
+    "payload/vps/candle_levels.py": {
+      "sha256": "e58df82160a7218a3e598e23b635d3cc33954f0baa20df733150305cec6d6f33",
+      "size": 22892
+    },
+    "payload/vps/chunk_entry.py": {
+      "sha256": "20808d65efbd77aaf87d0a2d21ac6ae969352cb49c836eb6d9175a73179c76c6",
+      "size": 341247
+    },
+    "payload/vps/entry_wait_totals.py": {
+      "sha256": "0f30df5ba9e5fde8ff1fd8796fba506f1b6e54a47c2a138ad29975ffa72b5006",
+      "size": 4623
+    },
+    "payload/vps/mt5_bridge.py": {
+      "sha256": "b48f773b91842250a212975655b3a74ba0b072fa341367724585a9085a7c4d74",
+      "size": 245247
+    },
+    "payload/vps/requirements.txt": {
+      "sha256": "3cd5548796028653ecf25e22ad1661961e6d8783998537c01ac05db1e460472e",
+      "size": 37
+    },
+    "prepare.py": {
+      "sha256": "839b26064d0efe62a509e8ad4c455e8138efcb58916ba74e85e98cdf381d109f",
+      "size": 5761
+    },
+    "reference/main-entry-handlers.js.txt": {
+      "sha256": "afcd591def15f09c4afabbf5baaea691e28640e47e439c2f9afa7aeb2ade2501",
+      "size": 2977
+    },
+    "reference/mt5-service-manifest.js.txt": {
+      "sha256": "bcaed7e34d5ef82872d82f5b211e70e3a1cce5e29eeeabec49b70868dbab17ce",
+      "size": 17218
+    },
+    "reference/renderer-functions.js.txt": {
+      "sha256": "29da139da662c3e669bb2cda4ff72018b0a509d9a28f6681b5eb43bcede1b357",
+      "size": 60559
+    },
+    "tests/entry-gate.test.js": {
+      "sha256": "7c57cefd853ccccce41c3d7fd4c9e574832f6dee8b3009371185e61179b18522",
+      "size": 757
+    },
+    "tests/host-trade-rules.cjs": {
+      "sha256": "85d42c158fde4e027af65f8fda498db67e1c81965a734d593b014a8a671beaaf",
+      "size": 562
+    },
+    "tests/management-contracts.test.js": {
+      "sha256": "3eecd3d3ffb2e628fd817d4558213d87c25541ca036cca1441804ed6ac47d285",
+      "size": 1358
+    },
+    "tests/market-zone-admission.test.js": {
+      "sha256": "a3dc0442d7ebb6295118d4cde6aa75c2666baa8c7acd25a116c9d0a43113a04b",
+      "size": 15041
+    },
+    "tests/market-zone-plan.test.js": {
+      "sha256": "51c4a381162fbdfe0b1fcf1fdc7a6cf0b3d42f1ba403e3edd96ae920589ca7a7",
+      "size": 9203
+    },
+    "tests/mt5-card-recovery.test.js": {
+      "sha256": "b6d019fe6dd995638faab0b53314f325ec0aa899cb8c8947e2258231e6b768f9",
+      "size": 5395
+    },
+    "tests/mt5-chunk-entry.test.js": {
+      "sha256": "ea95debf8ab96c4337831158dc19d2f6430687b85617004fca96cf0d4b5a943f",
+      "size": 22919
+    },
+    "tests/mt5-close-reconciliation.test.js": {
+      "sha256": "3726c713edc7d47c83d6c82f9f0cf49d6dae8f6c87937d67c9c6e34cddeb9b96",
+      "size": 1537
+    },
+    "tests/mt5-entry-protection-client.test.js": {
+      "sha256": "a1b6e0f3969ae558a5c149627d292ecfad64bfdda712b4d26a2f60bcdc2905cf",
+      "size": 18639
+    },
+    "tests/mt5-entry-stop-priority.test.js": {
+      "sha256": "f6775da4a90a4a04fc48b9c54189b4b99687d02aa73976c227b2d0bfb8666323",
+      "size": 8653
+    },
+    "tests/mt5-hybrid-management-routing.test.js": {
+      "sha256": "4cc2ee67e23291ffa16995e7f8ee55e026dafab06171241481aa08340b1d8361",
+      "size": 3536
+    },
+    "tests/test_account_lanes.py": {
+      "sha256": "9c5bd1e7ba86cbd8c12e4c5f75c5f8359de55a60cafd198afec6cbebd5eed703",
+      "size": 26397
+    },
+    "tests/test_atomic_entry_admission.py": {
+      "sha256": "fe813db534a75df489c3beeed4c4c3a0abdee13d2da7ba51c2e16cc37bf1110e",
+      "size": 2582
+    },
+    "tests/test_broker_opening_evidence.py": {
+      "sha256": "02487edadf2ebf5cddd66b15ae91c4e3262ecb5b698fd2ba666a3747c3abd966",
+      "size": 4028
+    },
+    "tests/test_chunk_bridge_guard.py": {
+      "sha256": "f84569bb5d184bb9a1859f2075097f2bcc952ef6f16982cde3ddd1101e6dd6da",
+      "size": 8163
+    },
+    "tests/test_chunk_entry.py": {
+      "sha256": "565e6e75321697c1670c95dd28d80fe000f445320ba1489ab9c5ad89d1d563d6",
+      "size": 40487
+    },
+    "tests/test_entry_price_fast_retry.py": {
+      "sha256": "425f8ebcb34b817548cdb5d30e29f22465bd60952639623efa6a604497d8f214",
+      "size": 5585
+    },
+    "tests/test_entry_stop_priority.py": {
+      "sha256": "d4c7b7c7205ea6320a42a47ed0f655553e1666bb8f17e308621e9e6a9071e2c8",
+      "size": 7515
+    },
+    "tests/test_entry_wait_totals.py": {
+      "sha256": "32dae16a7a81ba3965e8a439b0878990f850b4a617eb42bd9b26495638fd4561",
+      "size": 5041
+    },
+    "tests/test_hybrid_batch38.py": {
+      "sha256": "8d2910020f0b4827b423e38d72f8d0a02c821220f757d596dc67b6aa2e8b8545",
+      "size": 12604
+    },
+    "tests/test_hybrid_bridge.py": {
+      "sha256": "48ba0c91f279ff77ae0d0b16d7a0098fb9973c9034d968154ed2fc60ca2019bf",
+      "size": 23010
+    },
+    "tests/test_hybrid_entry.py": {
+      "sha256": "4633ef44b2d41cea8228e6299b2f6297abb5532f6bebb958bdbd718a1e6730c9",
+      "size": 59337
+    },
+    "tests/test_hybrid_integration.py": {
+      "sha256": "30cc7a9b0a70eb3b8e121f6dcce17c3424b79aa77cef3b4e5f6d22f2aadf4687",
+      "size": 8927
+    },
+    "tests/test_hybrid_native_reconciliation.py": {
+      "sha256": "2b5d2ebc63bdf0758ce3cb4c95db816406b0339a08f30818e799472a72bf889f",
+      "size": 14466
+    },
+    "tests/test_hybrid_protection.py": {
+      "sha256": "4a4343b6b4a309d7399c10139b5e5a1130c0ce7b08c16b6a45e53c2b199ef16e",
+      "size": 59946
+    },
+    "tests/test_hybrid_quote_wait39_bridge.py": {
+      "sha256": "ff8450af04a2f6762f2db3438294e9c4d3cb5bd1034dd2687918e32c74447b1b",
+      "size": 5432
+    },
+    "tests/test_hybrid_quote_wait39_integration.py": {
+      "sha256": "ed08904d594185d86d736c8a67a55beeda2e40c714b868e1a64477f50f86d5a9",
+      "size": 26402
+    },
+    "tests/test_hybrid_stale_recovery.py": {
+      "sha256": "76c6f0c28e68cd751dd56b94002c008e31b01c2e3ac6ff5a5aa94088f11ed1ef",
+      "size": 23841
+    },
+    "tests/test_independent_entry.py": {
+      "sha256": "f9d200c99454396b8d85edd59deb5f9b023dae0d11a95137e1e3df3d170b0501",
+      "size": 9180
+    },
+    "tests/test_independent_native.py": {
+      "sha256": "23ef4c7d4546f1435bf8f93db7dedd0c6e85c76dcb05751c9b6033fa1db5048d",
+      "size": 10802
+    },
+    "tests/test_isolated_entry_engines.py": {
+      "sha256": "980ae45b86b14712bf6763ef30be7cba0ad6428b298eb7d7c689c6eed07e9ef2",
+      "size": 9976
+    },
+    "tests/test_market_limit_entry.py": {
+      "sha256": "1015d0d89dad6fef7763a8ce5fc37ffffe2cce05af4c8deb0bd359583e4118e1",
+      "size": 18467
+    },
+    "tests/test_mt5_bridge.py": {
+      "sha256": "5aa6a9c82f221f145474d21040aea0a9fe9c4b7bc51ada762a9217bc59f614d8",
+      "size": 16063
+    },
+    "tests/test_parallel_entry.py": {
+      "sha256": "9873b63b4c7b0c983a4742e296615a959635bc69814935ff41d573f1af327ee5",
+      "size": 13861
+    },
+    "tests/test_prepare.py": {
+      "sha256": "535959ff0dc4b04826bc0c1b8bbaf27d79017c620b6a0d39ad602e4e6088b67b",
+      "size": 4140
+    },
+    "tests/test_public_scope.py": {
+      "sha256": "8e5fed6bf1c0a315d9ee77caa408a2be1d7e765542ff3368f211998b1608f179",
+      "size": 1892
+    }
+  }
+}

@@ -1,0 +1,2 @@
+MetaTrader5>=5.0,<6
+cryptography>=42

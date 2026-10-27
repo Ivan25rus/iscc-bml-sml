@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "tradingEnabled": false,
+  "executionPolicy": "hybrid-market-limit-v1",
+  "mappings": [],
+  "followers": [],
+  "timeExit": { "enabled": false, "time": "" }
+}

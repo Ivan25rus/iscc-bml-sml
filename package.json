@@ -1,0 +1,10 @@
+{
+  "name": "iscc-bml-sml",
+  "version": "0.2.0",
+  "private": true,
+  "main": "module/index.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {}
+}

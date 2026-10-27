@@ -1,0 +1,125 @@
+{
+  "properties": {
+    "name": "Level Orders",
+    "group": "Execution"
+  },
+  "options": {
+    "defaults": {
+      "description": "Default level order values",
+      "maxLot": {
+        "type": "number",
+        "description": "Максимальный лот одной части; 0 отключает дополнительный предел, процентное деление сохраняется"
+      },
+      "minLot": {
+        "type": "number",
+        "description": "Default minimum lot/quantity step; 1 keeps whole-number sizing"
+      },
+      "stopOffsetPts": {
+        "type": "number",
+        "description": "Default stop distance in broker points"
+      },
+      "stopMode": {
+        "type": "string",
+        "enum": [
+          "level",
+          "entry"
+        ],
+        "description": "Стоп считать от: level — уровня; entry — цены заявки"
+      },
+      "takeProfitPts": {
+        "type": "number",
+        "description": "Optional default take profit in points"
+      },
+      "chunkPercent": {
+        "type": "number",
+        "step": "any",
+        "max": 100,
+        "description": "Размер части, % от общего объёма: больше 0 и до 100 включительно; допустимы дробные значения"
+      },
+      "chunkMaxGap": {
+        "type": "number",
+        "description": "Допуск цены от первого исполнения, пункты индекса"
+      },
+      "buyPriceSource": {
+        "type": "string",
+        "enum": [
+          "bid",
+          "ask",
+          "mid"
+        ],
+        "description": "Price source for LB button"
+      },
+      "sellPriceSource": {
+        "type": "string",
+        "enum": [
+          "bid",
+          "ask",
+          "mid"
+        ],
+        "description": "Price source for LS button"
+      }
+    },
+    "symbols": {
+      "description": "Ticker-specific level order defaults",
+      "item": {
+        "description": "Ticker defaults",
+        "ticker": {
+          "type": "string",
+          "description": "Ticker"
+        },
+        "maxLot": {
+          "type": "number",
+          "description": "Максимальный лот одной части; 0 отключает дополнительный предел, процентное деление сохраняется"
+        },
+        "minLot": {
+          "type": "number",
+          "description": "Minimum lot/quantity step; 1 keeps whole-number sizing"
+        },
+        "stopOffsetPts": {
+          "type": "number",
+          "description": "Stop distance in broker points"
+        },
+        "stopMode": {
+          "type": "string",
+          "enum": [
+            "level",
+            "entry"
+          ],
+          "description": "Стоп считать от: level — уровня; entry — цены заявки"
+        },
+        "takeProfitPts": {
+          "type": "number",
+          "description": "Optional take profit in points"
+        },
+        "chunkPercent": {
+          "type": "number",
+          "step": "any",
+          "max": 100,
+          "description": "Размер части, %: больше 0 и до 100 включительно; допустимы дробные значения"
+        },
+        "chunkMaxGap": {
+          "type": "number",
+          "description": "Допустимое ухудшение от первой цены исполнения в пунктах индекса, не в шагах MT5"
+        },
+        "buyPriceSource": {
+          "type": "string",
+          "enum": [
+            "bid",
+            "ask",
+            "mid"
+          ],
+          "description": "Price source for LB button"
+        },
+        "sellPriceSource": {
+          "type": "string",
+          "enum": [
+            "bid",
+            "ask",
+            "mid"
+          ],
+          "description": "Price source for LS button"
+        }
+      }
+    }
+  }
+}

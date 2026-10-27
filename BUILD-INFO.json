@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "version": "0.2.0",
+  "kind": "iscc-bml-sml-integration-kit",
+  "receiverVersion": 39,
+  "executionPolicy": "hybrid-market-limit-v1",
+  "accountExecution": "independent-v5",
+  "riskPolicy": "initial-sizing-fixed-target",
+  "personalProgressIncluded": false,
+  "mobileIncluded": false,
+  "levelAlertsIncluded": false,
+  "positionManagementIncluded": true,
+  "partialCloseIncluded": true,
+  "defaultEnabled": false,
+  "fullAuthorPanelIncluded": false,
+  "ownerConfigurationIncluded": false,
+  "automaticApplicationReplacement": false,
+  "recipientAdapterIntegrationRequired": true,
+  "liveInstallationPerformed": false,
+  "liveOrdersSent": 0,
+  "publisherPrivateValueScanPassed": true
+}

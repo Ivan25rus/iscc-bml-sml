@@ -1,0 +1,44 @@
+  chunkAdmission=require('./services/levelOrder/chunkAdmission').createChunkAdmission({
+    getAdapter:()=>servicesApi.mt5VPS.getAdapter(),
+    getGroups:()=>servicesApi.levelTrack?.snapshot?.().config.groups || [],
+    getConfig:()=>require('./services/settings').readConfig('level-order')?.config || {},
+    getSnapshot:(symbol,payload)=>payload.entryMode==='side-zone'
+      ? require('./services/mt5-vps/quoteSnapshot').conditionalEntrySnapshot(instrumentInfo,symbol,{instrumentType:detectInstrumentType(symbol),payload})
+      : instrumentInfo.get({provider:'mt5-vps',symbol,instrumentType:detectInstrumentType(symbol),payload},{forceQuote:true}),
+    orderCalculator:orderCalc,validateTrade:(order,quote,options)=>tradeRules.validate(order,normalizeQuoteForValidation(quote),options),
+    log:row=>appendJsonl(EXEC_LOG,{t:nowTs(),...row})
+  });
+  ipcMain.handle('level-order:arm-chunks',(_event,payload)=>chunkAdmission.arm(payload));
+  ipcMain.handle('level-order:chunk-entries',async()=>{
+    try {return {status:'ok',entries:await servicesApi.mt5VPS.getAdapter().listChunkEntries()};}
+    catch(error){return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('level-order:chunk-events',async(_event,revision=0)=>{
+    const adapter=servicesApi.mt5VPS.getAdapter();
+    if(!adapter.capabilities?.includes('entry-events-v1'))return {supported:false};
+    if(!Number.isSafeInteger(revision) || revision<0)throw Error('Неверный номер состояния набора');
+    const value=await adapter.request('/entry-events?since='+revision,undefined,{readTimeoutMs:15000});
+    return {supported:true,status:'ok',revision:value.revision,entries:value.entries};
+  });
+  ipcMain.handle('level-order:stop-chunks',async(_event,payload={})=>{
+    try {
+      const result=await servicesApi.mt5VPS.getAdapter().stopChunkEntry(payload.entryId,{cancelContinueIds:payload.cancelContinueIds});
+      appendJsonl(EXEC_LOG,{t:nowTs(),kind:'chunk-entry-stop',entryId:payload.entryId,result});
+      return result;
+    } catch(error){return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('level-order:continue-chunks',async(_event,payload={})=>{
+    try {
+      const result=await servicesApi.mt5VPS.getAdapter().continueChunkEntry(payload.entryId,payload.account,{requestId:payload.requestId});
+      appendJsonl(EXEC_LOG,{t:nowTs(),kind:'chunk-entry-continue',entryId:payload.entryId,account:payload.account,result});
+      return result;
+    } catch(error){return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('level-order:close-chunks',async(_event,payload={})=>{
+    try {
+      const result=await servicesApi.mt5VPS.getAdapter().closeEntryPosition({id:payload.entryId,symbol:payload.symbol},{clickAt:payload.clickAt});
+      appendJsonl(EXEC_LOG,{t:nowTs(),kind:'chunk-entry-close',entryId:payload.entryId,result});
+      return result;
+    } catch(error){return {status:'rejected',reason:error.message};}
+  });
+

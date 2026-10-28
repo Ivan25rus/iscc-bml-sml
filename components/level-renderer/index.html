@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Отрисовщик уровней · дополнение ИСКК</title>
+<style>
+:root{color-scheme:light;--ink:#172a38;--muted:#516574;--blue:#135b91;--line:#d6e1e8}*{box-sizing:border-box}body{margin:0;background:#edf3f6;color:var(--ink);font:16px/1.55 system-ui,sans-serif}main{max-width:880px;margin:36px auto;padding:0 20px 44px}h1{font-size:clamp(27px,5vw,39px);line-height:1.15;margin:10px 0 18px}h2,legend{font-size:20px;font-weight:650}p{margin:8px 0 18px}.label{color:var(--blue);font-size:13px;letter-spacing:.08em;text-transform:uppercase}.card,fieldset{background:white;border:1px solid var(--line);border-radius:14px;padding:24px;margin:20px 0}legend{padding:0 8px}label{display:block;margin:14px 0}select{display:block;width:100%;font:inherit;background:white;border:1px solid #8095a3;border-radius:7px;padding:10px;margin-top:6px;color:var(--ink)}small{display:block;color:var(--muted);margin:5px 0 0 25px}input{accent-color:var(--blue);margin-right:8px}button{font:inherit;font-weight:600;border:0;border-radius:8px;padding:12px 20px;background:var(--blue);color:white;cursor:pointer}button:disabled{background:#8c9ba5;cursor:not-allowed}textarea{width:100%;height:260px;font:13px/1.6 ui-monospace,monospace;padding:12px;border:1px solid var(--line);border-radius:8px;margin:15px 0}a{color:var(--blue)}.muted{color:var(--muted)}#message{min-height:26px}input:focus-visible,select:focus-visible,button:focus-visible{outline:3px solid #77b7e8;outline-offset:3px}@media(max-width:540px){main{margin-top:20px}fieldset,.card{padding:17px}}
+</style>
+<main>
+<p class="label">Отдельное дополнение</p>
+<h1>Уровни TradingView<br>на графиках MT5</h1>
+<p>Добавьте отрисовщик к своей ИСКК. High/Low выбранной свечи, цвета, перенос и удаление. Цена попадает в ЛТ после подтверждения индикатора.</p>
+<form id="setup">
+<fieldset><legend>Ваша установленная ИСКК</legend>
+<label for="platform">Компьютер с ИСКК<select id="platform" required><option value="windows">Windows</option><option value="macos">Mac</option></select></label>
+<p class="muted">Совместимость проверяется автоматически по установленным исходникам. Вопросов о версии и своих доработках нет. Резервные копии не создаются.</p>
+</fieldset>
+<fieldset><legend>Что подключить</legend>
+<label><input type="checkbox" checked disabled>Отрисовщик уровней MT5</label><small>High/Low исходной свечи, её таймфрейм, обновление и удаление. Белый цвет становится красным, красный — фиолетовым. Только открытые графики MT5.</small>
+<label><input id="lt" type="checkbox" checked>Передавать подтверждённые цены в ЛТ</label><small>Не меняет ручные группы. Перед включением проверьте свои торговые правила, использующие ЛТ.</small>
+<label for="adapter">Приёмник свечей MT5<select id="adapter"><option value="auto">Определить автоматически</option><option value="stdio">Добавить приёмник только для свечей</option><option value="iscc">Использовать совместимый мост ИСКК</option></select></label>
+<small>Приёмник свечей нужен для обычной авторской панели. Он не содержит торговых команд. Существующий мост должен поддерживать точные окна свечей и цвета.</small>
+</fieldset>
+<div class="card"><h2>Подготовить установку</h2><p>Меню сохраняет локальный план для Codex или Claude. Пути, адреса, счета и пароли здесь не вводятся. Установка начинается с проверки исходников вашей панели.</p>
+<button id="download" type="submit">Скачать план установки</button>
+<p id="message" role="status" aria-live="polite">План готов к установке.</p>
+<label for="prompt">Инструкция для агента</label><textarea id="prompt" readonly aria-label="Инструкция для агента"></textarea>
+<button type="button" id="copy">Скопировать инструкцию</button>
+</div></form>
+<p class="muted">Дополнение изначально выключено. После сборки получатель заполняет свои пары символов и проверяет индикатор. Для Mac способ связи с MT5 проверяется отдельно. <a href="INSTALL.md">Подробности установки</a>.</p>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+function plan() {
+  return { schema:2,platform:$('platform').value,adapterMode:$('adapter').value,publishToLT:$('lt').checked };
+}
+function update() {
+  const value=plan();
+  $('message').textContent='План готов. Установка без дополнительных вопросов и резервных копий.';
+  $('prompt').value='Установи дополнение iscc-level-renderer к моей ИСКК. Прочитай AGENTS.md и INSTALL.md из пакета. Не спрашивай версию, наличие своих доработок или повторное подтверждение установки; резервные копии не создавай. Автоматически проверь совместимость и установи выбранные компоненты. Сохрани независимые изменения в коде. При конфликте остановись, не затирай существующий отрисовщик. Настрой мои пары и проверь отрисовку с выключенной автоторговлей.\n\nМой план:\n'+JSON.stringify(value,null,2);
+}
+$('setup').addEventListener('change',update);
+$('setup').addEventListener('submit',event=>{
+  event.preventDefault();const value=plan();
+  const url=URL.createObjectURL(new Blob([JSON.stringify(value,null,2)+'\n'],{type:'application/json'}));
+  const link=document.createElement('a');link.href=url;link.download='selection.json';link.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+});
+$('copy').addEventListener('click',async()=>{
+  try{await navigator.clipboard.writeText($('prompt').value);$('message').textContent='Инструкция скопирована.';}
+  catch{$('prompt').focus();$('prompt').select();$('message').textContent='Скопируйте выделенную инструкцию вручную.';}
+});
+if (/mac/i.test(navigator.platform || '')) $('platform').value='macos';
+update();
+</script>
+</html>

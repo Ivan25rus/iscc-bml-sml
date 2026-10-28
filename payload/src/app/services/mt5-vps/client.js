@@ -8,9 +8,27 @@ const { performance } = require('perf_hooks');
 const {followers,percentVolume}=require('./sizing');
 const {ENTRY_PROTECTION_CAPABILITY,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock}=require('./managementPolicy');
 const { ExecutionAdapter } = require('../brokerage/comps/base');
+const {EXACT_CLOSE_CAPABILITY,accountIds,controlEntry}=require('./entryControlState');
 
 const INDEX_SYMBOLS = new Set(['SPX', 'SPX500', 'USTEC']);
 function isIndex(symbol) { return INDEX_SYMBOLS.has(String(symbol || '').toUpperCase().split(':').pop()); }
+
+function entryCloseContext(state,entry,symbol,config) {
+  const parent=state.entryPlans?.find(row=>row.id===entry.id);
+  if(!parent || parent.executionPolicy!=='hybrid-market-limit-v1' || parent.symbol!==symbol
+    || !parent.accounts || Array.isArray(parent.accounts) || !Object.keys(parent.accounts).length
+    || parent.positionsConfirmed!==true || parent.hasOpenPositions!==true || parent.phase==='unknown'
+    || parent.protectionPending || !Array.isArray(parent.children) || parent.children.some(child=>['sending','unknown'].includes(child.state)))throw Error('Нет подтверждённых данных позиций всего набора БМЛ/СМЛ. Обнови список.');
+  const accounts=Object.keys(parent.accounts);
+  if(accounts.length>32 || accounts.some(value=>!/^[1-9][0-9]{0,19}$/.test(value)))throw Error('Некорректные счета набора БМЛ/СМЛ.');
+  const primary=state.accountStates?.[String(config.account)] || state;
+  if(!primary.connected || !primary.capabilities?.includes(ENTRY_PROTECTION_CAPABILITY))throw Error('Обнови и подключи основной приёмник VPS для управления БМЛ/СМЛ.');
+  for(const account of accounts) {
+    const view=state.accountStates?.[account];
+    if(!view?.connected || view.evidenceReady===false || String(view.account)!==account || view.server!==config.server || !view.capabilities?.includes(ENTRY_PROTECTION_CAPABILITY))throw Error('Нет подтверждённой связи с каждым счётом набора БМЛ/СМЛ.');
+  }
+  return {parent,accounts};
+}
 
 class MT5VPSAdapter extends ExecutionAdapter {
   constructor(config = {}) {
@@ -669,7 +687,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
       if(!row)throw Error('Выбранная позиция или заявка уже отсутствует. Обнови список.');
       const plan=entryPlanMetadata(row);
       if(plan.id!==captured.id || plan.side!==captured.side || JSON.stringify(plan.accounts)!==JSON.stringify(captured.accounts))throw Error('Принадлежность позиции набору БМЛ/СМЛ изменилась. Обнови список.');
-      if(this.commandJournal)await this.commandJournal.reconcile(async id=>this.validateCommandReceipt(id,(await this.request(`/receipt?id=${encodeURIComponent(id)}`)).result));
+      if(this.commandJournal)await this.commandJournal.reconcile(async id=>this.validateCommandReceipt(id,(await this.request(`/receipt?id=${encodeURIComponent(id)}`)).result),{ticket:scope});
       if(this.commandJournal.records.some(command=>command.ticket===scope && command.result?.status==='unknown'))return {status:'unknown',provider:this.provider,reason:'Есть неподтверждённая команда для всего набора БМЛ/СМЛ. Повтор заблокирован.'};
       const blocked=entryProtectionBlock({row,account:selected,linked:target.singleAccount!==true,capabilities:view.capabilities,
         commands:this.commandJournal?.records || [],accountStates:state.accountStates || {[selected]:view}});
@@ -697,13 +715,15 @@ class MT5VPSAdapter extends ExecutionAdapter {
         const accounts=[selected,...(request.mirrorAccounts || []).map(row=>row.account)];
         if(result.status==='ok' && (Object.keys(result.accountResults || {}).length!==accounts.length
           || accounts.some(value=>result.accountResults?.[value]?.status!=='ok')))throw Error('VPS не подтвердил защиту на всех выбранных счетах.');
-        return {...result,timings:{...result.timings,server:response.serverTiming || result.timings?.server,transport:response.transportTiming,
+        const entry=controlEntry(response.entry,result,{id:plan.id,symbol:row.symbol,side:plan.side,accounts:plan.accounts},'entry-protection');
+        return {...result,...(entry ? {entry} : {}),timings:{...result.timings,server:response.serverTiming || result.timings?.server,transport:response.transportTiming,
           macBeforeSendMs,macClickToResultMs:Math.max(0,Date.now()-clickAt)}};
       };
       submitted=true;
       const result=this.commandJournal ? await this.commandJournal.run('entry-protection',{...request,ticket:scope},send)
         : await send();
       this.managementSnapshot=null;this.managementStateView=null;
+      if(result.entry)require('./entryLifecycle').rememberEntry(this,result.entry);
       return {...result,provider:this.provider};
     } catch(error) {
       if(submitted){this.managementSnapshot=null;this.managementStateView=null;}
@@ -721,21 +741,49 @@ class MT5VPSAdapter extends ExecutionAdapter {
       if(this.inFlight.has(scope))return {status:'unknown',provider:this.provider,reason:'Команда для всего набора БМЛ/СМЛ уже выполняется.'};
       this.inFlight.add(scope);ownsScope=true;
       const managementStarted=performance.now();
-      const state=await this.managementState({maxAgeMs:-1});
-      preparation.managementReadMs=Number((performance.now()-managementStarted).toFixed(3));
-      const parent=state.entryPlans?.find(row=>row.id===entry.id);
-      if(!parent || parent.executionPolicy!=='hybrid-market-limit-v1' || parent.symbol!==this.brokerSymbol(entry.symbol)
-        || !parent.accounts || Array.isArray(parent.accounts) || !Object.keys(parent.accounts).length
-        || parent.positionsConfirmed!==true || parent.hasOpenPositions!==true || parent.phase==='unknown'
-        || parent.protectionPending || !Array.isArray(parent.children) || parent.children.some(child=>['sending','unknown'].includes(child.state)))throw Error('Нет подтверждённых данных позиций всего набора БМЛ/СМЛ. Обнови список.');
-      const accounts=Object.keys(parent.accounts);
-      if(accounts.length>32 || accounts.some(value=>!/^[1-9][0-9]{0,19}$/.test(value)))throw Error('Некорректные счета набора БМЛ/СМЛ.');
-      const primary=state.accountStates?.[String(this.config.account)] || state;
-      if(!primary.connected || !primary.capabilities?.includes(ENTRY_PROTECTION_CAPABILITY))throw Error('Обнови и подключи основной приёмник VPS для управления БМЛ/СМЛ.');
-      for(const account of accounts) {
-        const view=state.accountStates?.[account];
-        if(!view?.connected || view.evidenceReady===false || String(view.account)!==account || view.server!==this.config.server || !view.capabilities?.includes(ENTRY_PROTECTION_CAPABILITY))throw Error('Нет подтверждённой связи с каждым счётом набора БМЛ/СМЛ.');
+      let context;
+      const now=Date.now(),age=now-Number(this.managementStateAt || 0);
+      if(this.capabilities.includes(EXACT_CLOSE_CAPABILITY)) {
+        // Only authenticated backend state chooses the captured accounts.
+        // The VPS proves current ownership/remaining volume after draining
+        // acquisition; an unrelated UI snapshot is not a close prerequisite.
+        let parent=this.chunkLifecycleEntries?.get(entry.id)
+          || this.managementStateView?.entryPlans?.find(row=>row.id===entry.id);
+        if(!parent) {
+          const response=await this.request('/entry-plan?id='+encodeURIComponent(entry.id));
+          if(String(response.account)!==String(this.config.account) || response.server!==this.config.server
+            || !response.capabilities?.includes(EXACT_CLOSE_CAPABILITY))throw Error('VPS не подтвердил точный протокол закрытия набора.');
+          parent=response.entry;
+        }
+        const accounts=accountIds(parent);
+        if(!parent || parent.id!==entry.id || parent.symbol!==this.brokerSymbol(entry.symbol)
+          || parent.executionPolicy!=='hybrid-market-limit-v1' || !['buy','sell'].includes(parent.side)
+          || !accounts || !accounts.includes(String(this.config.account)))throw Error('Не подтверждены исходный набор и состав счетов закрытия.');
+        context={parent,accounts};preparation.managementSource='exact-parent-vps-proof';
       }
+      if(!context && this.managementStateView && age>=0 && age<=1000) {
+        // Reuse only a recent authenticated native proof for this exact parent.
+        // The VPS still drains lanes and rechecks ownership, remaining volume
+        // and every account before closing; no order is sent from this view.
+        const state=managementFreshness(this.managementStateView,this.managementStateAt,now);
+        try {
+          const candidate=entryCloseContext(state,entry,this.brokerSymbol(entry.symbol),this.config);
+          if([String(this.config.account),...candidate.accounts].every(account=>{
+            const view=state.accountStates?.[account];
+            return Number.isFinite(view?.checkedAt) && now-view.checkedAt>=-250 && now-view.checkedAt<=1000;
+          })) {
+            context=candidate;preparation.managementSource='recent-native-proof';
+            preparation.managementAgeMs=age;
+          }
+        } catch { /* An incomplete view must take the original fresh-read path. */ }
+      }
+      if(!context) {
+        const state=await this.managementState({maxAgeMs:-1});
+        context=entryCloseContext(state,entry,this.brokerSymbol(entry.symbol),this.config);
+        preparation.managementSource='fresh-read';
+      }
+      preparation.managementReadMs=Number((performance.now()-managementStarted).toFixed(3));
+      const {parent,accounts}=context;
       const reconciliationStarted=performance.now();
       await this.commandJournal.reconcile(async id=>this.validateCommandReceipt(id,(await this.request(`/receipt?id=${encodeURIComponent(id)}`)).result),{ticket:scope});
       preparation.receiptReconciliationMs=Number((performance.now()-reconciliationStarted).toFixed(3));
@@ -751,10 +799,12 @@ class MT5VPSAdapter extends ExecutionAdapter {
         const response=await this.request('/entry-plan-close',request,{execution:true}),value=response.result;
         if(!value || value.id!==request.id || value.entryId!==parent.id || !['ok','rejected','unknown'].includes(value.status)
           || value.status==='ok' && (Object.keys(value.accountResults || {}).length!==accounts.length || accounts.some(account=>value.accountResults?.[account]?.status!=='ok')))throw Error('VPS не подтвердил закрытие всего набора БМЛ/СМЛ.');
-        return {...value,...(response.entry?.id===parent.id && response.entry.symbol===parent.symbol && response.entry.executionPolicy===parent.executionPolicy ? {entry:response.entry} : {}),timings:{...value.timings,server:response.serverTiming || value.timings?.server,transport:response.transportTiming,
+        const entry=controlEntry(response.entry,value,{id:parent.id,symbol:parent.symbol,side:parent.side,accounts},'entry-close');
+        return {...value,...(entry ? {entry} : {}),timings:{...value.timings,server:response.serverTiming || value.timings?.server,transport:response.transportTiming,
           macBeforeSendMs,macClickToResultMs:Math.max(0,Date.now()-clickAt),macPreparation:{...preparation}}};
       });
       this.managementSnapshot=null;this.managementStateView=null;
+      if(result.entry)require('./entryLifecycle').rememberEntry(this,result.entry);
       return {...result,provider:this.provider};
     } catch(error) {
       if(submitted){this.managementSnapshot=null;this.managementStateView=null;}

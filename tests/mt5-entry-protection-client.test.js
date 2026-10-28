@@ -53,6 +53,138 @@ test('Close skips a broken unrelated receipt and retains exact pre-send timing',
   }
   assert.ok(result.timings.macPreparation.totalMs>=result.timings.macPreparation.managementReadMs);
 });
+test('Protection reconciles its own parent without waiting for an unrelated broken receipt',async t=>{
+  const f=fixture(t);
+  f.adapter.commandJournal.records.push({id:'unrelated',ticket:'entry:old',operation:'entry-close',payload:{entryId:'old'},result:{status:'unknown'}});
+  const request=f.adapter.request;
+  f.adapter.request=async(route,...args)=>{
+    if(route.startsWith('/receipt?id='))throw Error('Unrelated receipt must stay outside this action');
+    return request(route,...args);
+  };
+  const result=await f.adapter.modifyEntryProtection(f.row,{sl:24990});
+  assert.equal(result.status,'ok');assert.equal(f.posts().length,1);
+  assert.equal(f.adapter.commandJournal.records[0].result.status,'unknown');
+});
+test('A final protection response immediately retains the matching parent and rejects an older pending view',async t=>{
+  const f=fixture(t),{rememberEntry}=require('../payload/src/app/services/mt5-vps/entryLifecycle');
+  f.setReply(async(_route,payload)=>({result:{id:payload.id,entryId:f.plan.id,status:'ok',accountResults:{[primary]:{status:'ok'},[follower]:{status:'ok'}}},
+    entry:{...copy(f.parent),updatedAt:2000,phase:'completed',reason:'Whole-parent protection confirmed'}}));
+  const result=await f.adapter.modifyEntryProtection(f.row,{sl:24990});
+  assert.equal(result.status,'ok');assert.equal(result.entry.phase,'completed');
+  assert.equal(result.entry._controlReceipt.id,result.id);
+  assert.equal(f.adapter.commandJournal.records.at(-1).result.entry.updatedAt,2000);
+  rememberEntry(f.adapter,{...copy(f.parent),updatedAt:1999,phase:'paused',protectionPending:result.id,positionsConfirmed:false});
+  assert.equal(f.adapter.chunkLifecycleEntries.get(f.plan.id).phase,'completed');
+  assert.equal(f.adapter.chunkLifecycleEntries.get(f.plan.id).protectionPending,undefined);
+  rememberEntry(f.adapter,{...copy(f.parent),updatedAt:2001,phase:'paused',protectionPending:'new-command'});
+  assert.equal(f.adapter.chunkLifecycleEntries.get(f.plan.id).protectionPending,'new-command');
+});
+test('A wrong final protection parent cannot replace the current card',async t=>{
+  for(const change of [entry=>entry.id='other',entry=>entry.symbol='SPX500',entry=>entry.side='sell',
+    entry=>delete entry.accounts[follower],entry=>entry.protectionPending='new-command']) {
+    const f=fixture(t);
+    f.setReply(async(_route,payload)=>{
+      const entry={...copy(f.parent),updatedAt:2000};change(entry);
+      return {result:{id:payload.id,entryId:f.plan.id,status:'ok',accountResults:{[primary]:{status:'ok'},[follower]:{status:'ok'}}},entry};
+    });
+    const result=await f.adapter.modifyEntryProtection(f.row,{sl:24990});
+    assert.equal(result.status,'ok');assert.equal(result.entry,undefined);
+    assert.equal(f.adapter.chunkLifecycleEntries?.has(f.plan.id) || false,false);
+  }
+});
+function exactCloseView(f) {
+  f.adapter.capabilities=['entry-exact-parent-close-v1'];
+  f.adapter.chunkLifecycleEntries=new Map([[f.plan.id,copy(f.parent)]]);
+}
+test('Exact full close sends the captured parent directly despite unavailable display snapshots',async t=>{
+  const f=fixture(t);exactCloseView(f);
+  Object.assign(f.adapter.chunkLifecycleEntries.get(f.plan.id),{phase:'unknown',positionsConfirmed:false,lifecycleDeferred:true});
+  f.state.accountStates[follower].connected=false;
+  const request=f.adapter.request;
+  f.adapter.request=async(route,...args)=>{assert.notEqual(route,'/management');return request(route,...args);};
+  const result=await f.adapter.closeEntryPosition({id:f.plan.id,symbol:'USTEC',accounts:{'999999':{}}});
+  assert.equal(result.status,'ok');assert.equal(f.calls[0].route,'/entry-plan-close');
+  assert.equal(result.timings.macPreparation.managementSource,'exact-parent-vps-proof');
+  assert.deepEqual(f.adapter.commandJournal.records.at(-1).payload.capturedAccounts,[follower,primary]);
+  assert.deepEqual(Object.keys(f.posts()[0].payload).sort(),['entryId','expiresAt','id','symbol']);
+});
+test('A cold exact-close client reads only its authenticated exact parent',async t=>{
+  const f=fixture(t);f.adapter.capabilities=['entry-exact-parent-close-v1'];
+  const request=f.adapter.request;
+  f.adapter.request=async(route,...args)=>{
+    assert.notEqual(route,'/management');
+    if(route==='/entry-plan?id='+f.plan.id){f.calls.push({route});return {account:primary,server,capabilities:f.adapter.capabilities,entry:copy(f.parent)};}
+    return request(route,...args);
+  };
+  assert.equal((await f.adapter.closeEntryPosition({id:f.plan.id,symbol:'USTEC'})).status,'ok');
+  assert.equal(f.calls[0].route,'/entry-plan?id='+f.plan.id);assert.equal(f.posts().length,1);
+});
+test('Exact close retains account identity, receipt completeness, durable intent and no replay after a lost response',async t=>{
+  for(const change of [entry=>entry.symbol='SPX500',entry=>entry.side='invalid',entry=>delete entry.accounts[primary],
+    entry=>entry.accounts={'not-an-account':{}}]) {
+    const f=fixture(t);exactCloseView(f);change(f.adapter.chunkLifecycleEntries.get(f.plan.id));
+    assert.equal((await f.adapter.closeEntryPosition({id:f.plan.id,symbol:'USTEC'})).status,'rejected');
+    assert.equal(f.posts().length,0);
+  }
+  const f=fixture(t);exactCloseView(f);f.setReply(async(_route,payload)=>({result:{id:payload.id,entryId:f.plan.id,status:'ok',accountResults:{[primary]:{status:'ok'}}}}));
+  assert.equal((await f.adapter.closeEntryPosition({id:f.plan.id,symbol:'USTEC'})).status,'unknown');
+  assert.equal(f.posts().length,1);
+  assert.equal((await f.adapter.closeEntryPosition({id:f.plan.id,symbol:'USTEC'})).status,'unknown');
+  assert.equal(f.posts().length,1);
+  const g=fixture(t);exactCloseView(g);g.adapter.commandJournal.save=async()=>{throw Error('Synthetic storage unavailable');};
+  assert.equal((await g.adapter.closeEntryPosition({id:g.plan.id,symbol:'USTEC'})).status,'unknown');
+  assert.equal(g.posts().length,0);
+});
+function recentCloseView(f) {
+  const now=Date.now();
+  f.adapter.managementStateView=copy(f.state);f.adapter.managementStateAt=now;
+  for(const view of Object.values(f.adapter.managementStateView.accountStates))view.checkedAt=now;
+  return f.adapter.managementStateView;
+}
+test('Close reuses a recent native proof for every captured account without another management request',async t=>{
+  const f=fixture(t);recentCloseView(f);
+  const request=f.adapter.request;
+  f.adapter.request=async(route,...args)=>{
+    assert.notEqual(route,'/management','A fresh background proof already supplies the same preflight');
+    return request(route,...args);
+  };
+  const result=await f.adapter.closeEntryPosition({id:f.plan.id,symbol:'USTEC'});
+  assert.equal(result.status,'ok');assert.equal(f.posts().length,1);
+  assert.equal(result.timings.macPreparation.managementSource,'recent-native-proof');
+  assert.equal(f.calls[0].route,'/entry-plan-close');
+  assert.deepEqual(f.adapter.commandJournal.records[0].payload.capturedAccounts,[follower,primary]);
+});
+test('Old, incomplete or uncertain cached close proofs fall back to a fresh management read',async t=>{
+  const changes=[
+    (f,s)=>{f.adapter.managementStateAt-=1001;},
+    (_f,s)=>{s.accountStates[follower].checkedAt-=1001;},
+    (_f,s)=>{delete s.accountStates[primary].checkedAt;},
+    (_f,s)=>{s.accountStates[follower].checkedAt+=1000;},
+    (_f,s)=>{s.accountStates[follower].evidenceReady=false;},
+    (_f,s)=>{s.accountStates[follower].server='other';},
+    (_f,s)=>{s.entryPlans[0].positionsConfirmed=false;},
+    (_f,s)=>{s.entryPlans[0].children=[{state:'unknown'}];},
+    (_f,s)=>{s.entryPlans[0].id='other';}
+  ];
+  for(const change of changes) {
+    const f=fixture(t),state=recentCloseView(f);change(f,state);
+    const result=await f.adapter.closeEntryPosition({id:f.plan.id,symbol:'USTEC'});
+    assert.equal(result.status,'ok');assert.equal(f.calls[0].route,'/management');
+    assert.equal(result.timings.macPreparation.managementSource,'fresh-read');
+  }
+});
+test('Recent close proof cannot bypass an unknown parent command or treat a lost close reply as success',async t=>{
+  const f=fixture(t);recentCloseView(f);
+  f.adapter.commandJournal.records.push({id:'pending-parent',ticket:'entry:'+f.plan.id,operation:'entry-close',
+    payload:{entryId:f.plan.id},result:{status:'unknown'}});
+  assert.equal((await f.adapter.closeEntryPosition({id:f.plan.id,symbol:'USTEC'})).status,'unknown');
+  assert.equal(f.posts().length,0);
+  const g=fixture(t);recentCloseView(g);g.setReply(async()=>{throw Error('Lost reply');});
+  assert.equal((await g.adapter.closeEntryPosition({id:g.plan.id,symbol:'USTEC'})).status,'unknown');
+  assert.equal(g.adapter.managementStateView,null);
+  assert.equal((await g.adapter.closeEntryPosition({id:g.plan.id,symbol:'USTEC'})).status,'unknown');
+  assert.equal(g.posts().length,1);
+});
 test('Whole-parent protection uses captured accounts and fresh shared levels; no ticket, size, or current config multiplier reaches VPS',async t=>{
   const f=fixture(t);
   const result=await f.adapter.modifyEntryProtection(f.row,{sl:'24990'},{account:primary});

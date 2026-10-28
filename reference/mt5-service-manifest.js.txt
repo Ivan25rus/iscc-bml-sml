@@ -230,14 +230,18 @@ function initService(api) {
     if(enrollment.busy)return {status:'rejected',reason:'Дождись завершения добавления счёта'};
     const connection = forAccount(payload.account);
     if (payload.action === 'entry-close' && payload.target?.entryPlan) {
-      return api.mt5VPS.getAdapter().closeEntryPosition({id:payload.target.entryPlan.id,symbol:payload.target.symbol}, {
+      const result=await api.mt5VPS.getAdapter().closeEntryPosition({id:payload.target.entryPlan.id,symbol:payload.target.symbol}, {
         clickAt:payload.target.clickAt
       });
+      try {if(result.entry)_evt?.sender?.send('mt5-vps:entry-control',result);} catch { /* A closed view cannot change the durable command result. */ }
+      return result;
     }
     if (payload.action === 'entry-protection' || payload.action === 'modify' && payload.target?.entryPlan) {
-      return api.mt5VPS.getAdapter().modifyEntryProtection(payload.target, payload.changes || {}, {
+      const result=await api.mt5VPS.getAdapter().modifyEntryProtection(payload.target, payload.changes || {}, {
         account:String(connection.config.account),operation:payload.operation || 'modify'
       });
+      try {if(result.entry)_evt?.sender?.send('mt5-vps:entry-control',result);} catch { /* A closed view cannot change the durable command result. */ }
+      return result;
     }
     if (payload.action === 'cancel' && payload.target?.__isPosition === false) {
       return connection.cancelPendingOrder(payload.target.ticket, payload.target.symbol,payload.target.singleAccount,payload.target.clickAt);

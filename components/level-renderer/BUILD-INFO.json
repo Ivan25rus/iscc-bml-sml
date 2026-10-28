@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "kind": "iscc-renderer-addon",
+  "version": "0.1.4",
+  "indicatorVersion": "1.17",
+  "fullAuthorPanelIncluded": false,
+  "tradingReceiverIncluded": false,
+  "originalGitHistoryIncluded": false,
+  "publisherPrivateValueScanPassed": true,
+  "liveInstallationPerformed": false,
+  "targetMachineVerified": false,
+  "installationQuestionsRequired": false,
+  "backupCreatedByInstaller": false,
+  "baselineIntegrationCommit": "19262f3253f14570fb96fafa63e233e71d63617e"
+}

@@ -1,0 +1,14 @@
+/local/
+/node_modules/
+__pycache__/
+*.py[cod]
+*.ex5
+*.sqlite3*
+*.log
+*.pem
+*.key
+*.pfx
+*.p12
+.env*
+config.local.json
+*.asar

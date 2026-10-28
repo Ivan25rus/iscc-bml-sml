@@ -1,9 +1,16 @@
 """Verify this kit and stage selected sources for a preserving agent merge."""
 import argparse
+import importlib.util
 import hashlib
 import json
 import pathlib
+import re
 import tempfile
+
+_spec=importlib.util.spec_from_file_location('iscc_feature_selection',pathlib.Path(__file__).with_name('selection.py'))
+_selection=importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_selection)
+resolve,IDS=_selection.resolve,_selection.IDS
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -36,13 +43,56 @@ def verify(root=ROOT):
 
 
 def selection(value):
-    if not isinstance(value, dict) or set(value) != {'schema','platform','frontend','receiver','tradingEnabled'}:
+    if not isinstance(value, dict):
+        raise ValueError('Use a plan from SETUP.html')
+    fields={'schema','platform','frontend','receiver','tradingEnabled'}
+    schema=value.get('schema')
+    if type(schema) is not int or schema not in (1,2) or set(value)!=(fields|({'features'} if schema==2 else set())):
         raise ValueError('Unknown selection fields')
-    if (value['schema'] != 1 or value['platform'] not in ('windows','macos')
+    if (value['platform'] not in ('windows','macos')
             or type(value['frontend']) is not bool or type(value['receiver']) is not bool
             or value['tradingEnabled'] is not False or not (value['frontend'] or value['receiver'])):
         raise ValueError('Choose components; trading stays disabled during preparation')
-    return value
+    # Older plans keep the scope of 0.2.0; levels require a new explicit choice.
+    selected=resolve(value['features'] if schema==2 else IDS[:6])
+    if 'levels' in selected['features'] and not value['frontend']:
+        raise ValueError('The levels addon needs frontend integration')
+    return {**value,'schema':2,'features':selected['features']}
+
+
+ROOTS = {
+    'bml-sml':['levelOrder/chunkAdmission.js','mt5-vps/cardRecovery.js','mt5-vps/runtimeActivity.js','tradeRules/index.js'],
+    'management':['mt5-vps/management.js'],
+    'accounts':['mt5-vps/tradeSettings.js','mt5-vps/accountEnrollment.js'],
+    'time-exit':['mt5-vps/tradeSettings.js']}
+REQUIRE=re.compile(r'''require\(\s*['"](\.[^'"\r\n]+)['"]\s*\)''')
+
+
+def frontend_files(root,manifest,plan):
+    if not plan['frontend'] or not resolve(plan['features'])['mt5Core']:
+        return set()
+    prefix='payload/src/app/services/'
+    pending=[prefix+name for key in plan['features'] for name in ROOTS.get(key,[])]
+    pending += [prefix+'mt5-vps/client.js',prefix+'mt5-vps/buildInfo.js']
+    chosen=set()
+    while pending:
+        name=pending.pop()
+        if name in chosen: continue
+        if name not in manifest['files']:
+            raise ValueError('Missing selected dependency: '+name)
+        chosen.add(name)
+        for relative in REQUIRE.findall((root/name).read_text(encoding='utf-8')):
+            base=(root/name).parent/relative
+            candidates=(base,base.with_suffix('.js'),base/'index.js')
+            dependency=next((item.resolve().relative_to(root).as_posix() for item in candidates
+                if item.resolve().is_relative_to(root) and item.resolve().relative_to(root).as_posix() in manifest['files']),None)
+            if dependency is None:
+                if relative=='../../config/load': continue # Recipient's existing configuration service.
+                raise ValueError('Missing selected import: '+name+' -> '+relative)
+            pending.append(dependency)
+    if 'bml-sml' in plan['features']:
+        chosen.add(prefix+'levelOrder/config/level-order-settings-descriptor.json')
+    return chosen
 
 
 def prepare(source, plan, root=ROOT):
@@ -59,6 +109,9 @@ def prepare(source, plan, root=ROOT):
     app = candidates[0]
     if app.is_symlink() or not app.resolve().is_relative_to(source):
         raise ValueError('Application source must remain in its project')
+    # Resolve the complete dependency closure before creating any output.
+    selected=resolve(plan['features'])
+    selected_files=frontend_files(root,manifest,plan)
     local = root / 'local'
     if local.is_symlink():
         raise ValueError('local/ must not be a symlink')
@@ -67,12 +120,16 @@ def prepare(source, plan, root=ROOT):
     records = []
     for name, expected in manifest['files'].items():
         target = None
-        if name.startswith('payload/src/app/') and plan['frontend']:
+        if name in selected_files:
             target = app / name.removeprefix('payload/src/app/')
-        elif name.startswith('payload/vps/') and plan['receiver']:
+        elif name.startswith('payload/vps/') and plan['receiver'] and selected['mt5Core']:
             target = source / name.removeprefix('payload/')
         if target is None:
-            if name.startswith('reference/') and plan['frontend']:
+            if (name.startswith('reference/') and plan['frontend'] and selected['mt5Core']
+                    and ('bml-sml' in plan['features'] or name=='reference/mt5-service-manifest.js.txt')
+                    or name.startswith('module/') and plan['frontend'] and selected['mt5Core']
+                    or name in ('selection.js','features.json') and plan['frontend'] and selected['mt5Core']
+                    or name.startswith('components/level-renderer/') and 'levels' in plan['features']):
                 output = work / name
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_bytes((root/name).read_bytes())
@@ -86,7 +143,14 @@ def prepare(source, plan, root=ROOT):
         output.write_bytes((root/name).read_bytes())
         records.append({'source':name, 'target':str(target), 'currentSHA256':current,
                         'candidateSHA256':expected['sha256'], 'status':state})
-    report = {'schema':1, 'kitVersion':manifest['version'], 'selection':plan,
+    if 'levels' in plan['features']:
+        (work/'levels-selection.json').write_text(json.dumps({'schema':2,'platform':plan['platform'],
+            'adapterMode':'auto','publishToLT':'levels-to-lt' in plan['features']},indent=2)+'\n')
+    (work/'feature-policy.json').write_text(json.dumps({'schema':1,'features':plan['features'],
+        'enabled':False,'tradingEnabled':False},indent=2)+'\n')
+    report = {'schema':2, 'kitVersion':manifest['version'], 'selection':plan,
+        'mandatorySharedCore':selected['mt5Core'],
+        'preserveExistingHostFeatures':True,'removeExistingRules':False,
         'sourceProject':str(source), 'applicationSources':str(app),
         'readyForAutomaticReplacement':False, 'applicationModified':False,
         'receiverStarted':False, 'liveOrdersSent':0, 'files':records,

@@ -1212,21 +1212,29 @@ class ChunkEntries:
                 self._account(account)
                 views[account]=self._owned_close_view(payload,state,account)
             self._expiry(command)
-            for account,rows in views.items():
-                results=[];result['accountResults'][account]=dict(status='unknown',positions=results)
-                for row in rows:
-                    if row['status']=='closed':
-                        results.append(dict(ticket=row['ticket'],status='closed',alreadyClosed=True));continue
-                    close_id='parent-close:'+hashlib.sha256((identifier+':'+account+':'+row['ticket']).encode()).hexdigest()
-                    outcome=self._call(account,'execute','close',dict(id=close_id,ticket=row['ticket'],symbol=payload['symbol'],
-                        volume=row['volume'],expectedVolume=row['volume'],expiresAt=time.time()*1000+3000))['result']
-                    results.append({**hybrid_receipt(outcome),'ticket':row['ticket']})
-                    if outcome.get('status')!='ok':
-                        raise RuntimeError('An owned close result is unconfirmed; no automatic retry')
-                proof=self._owned_close_view(payload,state,account)
-                if any(row['status']!='closed' for row in proof):
-                    raise RuntimeError('Broker has not confirmed every owned position fully closed')
-                result['accountResults'][account]['status']='ok'
+            # Every preflight/cancel is finished before the first close. Each
+            # independent terminal is sequential; workers return data only.
+            warm=getattr(self.bridge,'warm_group_executor',None)
+            if len(views)>1 and callable(warm):
+                jobs={}
+                try:
+                    executor=warm()
+                    for account,rows in views.items():
+                        jobs[account]=executor.submit(self._close_account_positions,identifier,payload,state,account,rows)
+                finally:
+                    # Even a dispatch failure must drain already-started work
+                    # before releasing the parent control barrier.
+                    if jobs:wait(list(jobs.values()))
+                    for account,job in jobs.items():
+                        try:result['accountResults'][account]=job.result()
+                        except Exception as error:
+                            result['accountResults'][account]=dict(status='unknown',positions=[],reason=str(error))
+            else:
+                for account,rows in views.items():
+                    result['accountResults'][account]=self._close_account_positions(identifier,payload,state,account,rows)
+                    if result['accountResults'][account]['status']!='ok':break
+            if set(result['accountResults'])!=set(views) or any(row['status']!='ok' for row in result['accountResults'].values()):
+                raise RuntimeError('An owned close result is unconfirmed; no automatic retry')
             # Read all accounts again: no successful envelope relies solely on
             # an order-send retcode or an earlier account's stale snapshot.
             for account in state['accounts']:
@@ -1240,6 +1248,25 @@ class ChunkEntries:
             state.update(phase='unknown',reason=str(error));result['reason']=str(error)
         self._save(state, ('chunk_entry_closures', identifier, result))
         return dict(result=result,entry=public_record(state))
+
+    def _close_account_positions(self, identifier, payload, state, account, rows):
+        result=dict(status='unknown',positions=[])
+        try:
+            for row in rows:
+                if row['status']=='closed':
+                    result['positions'].append(dict(ticket=row['ticket'],status='closed',alreadyClosed=True));continue
+                close_id='parent-close:'+hashlib.sha256((identifier+':'+account+':'+row['ticket']).encode()).hexdigest()
+                outcome=self._call(account,'execute','close',dict(id=close_id,ticket=row['ticket'],symbol=payload['symbol'],
+                    volume=row['volume'],expectedVolume=row['volume'],expiresAt=time.time()*1000+3000))['result']
+                result['positions'].append({**hybrid_receipt(outcome),'ticket':row['ticket']})
+                if outcome.get('status')!='ok':
+                    raise RuntimeError('An owned close result is unconfirmed; no automatic retry')
+            if any(row['status']!='closed' for row in self._owned_close_view(payload,state,account)):
+                raise RuntimeError('Broker has not confirmed every owned position fully closed')
+            result['status']='ok'
+        except Exception as error:
+            result['reason']=str(error)
+        return result
 
     def _active_rows(self):
         # Called under self.lock. Ordering matches the previous full-table
@@ -3962,13 +3989,16 @@ class ChunkEntries:
                     halt = {account for account in selected if state['accounts'][account].get('entryHalted')}
                     if inside or relocate or halt:
                         self._parallel_cancel(payload, state, child, inside | relocate | halt)
+                        self.pending_poll_at[child['id']] = time.monotonic()+.25
                     elif due:
                         before = {account: child.get('positions', {}).get(account, {}).get('volume', 0.) for account in selected}
                         self._hybrid_limit(payload, state, child, accounts=selected)
                         changed = {account for account in selected if child.get('positions', {}).get(account, {}).get('volume', 0.) > before[account]+1e-8}
                         if changed.intersection(pending_accounts(child)):
                             self._parallel_cancel(payload, state, child, changed.intersection(pending_accounts(child)))
-                    self.pending_poll_at[child['id']] = time.monotonic()+.25
+                        self.pending_poll_at[child['id']] = time.monotonic()+.25
+                    # A quote-only round must not postpone the next native
+                    # limit read: frequent quotes otherwise starve fill proof.
                 for account in quotes:
                     proof=getattr(self,'cancel_proofs',{}).pop((state['id'],account),None)
                     if (proof and str(proof.get('account'))==account and proof.get('server')==self.bridge.config['server']
@@ -5079,7 +5109,11 @@ class IsolatedEntries(ChunkEntries):
                 if (identifier,account) in self.account_states])
             parent['reason'] = 'Independent account engines; exact account outcomes retained'
             if parent.get('protectionPending') or parent.get('closurePending'):
-                parent.update(phase='unknown',reason='Interrupted parent control; inspect its exact receipt')
+                if self._protecting(identifier):
+                    parent.update(phase='paused',reason='Closing exact owned parent positions' if parent.get('closurePending')
+                        else 'Updating whole-parent protection')
+                else:
+                    parent.update(phase='unknown',reason='Interrupted parent control; inspect its exact receipt')
             self.projections[identifier] = parent
             self._index_committed(parent)
             ChunkEntries._remember(self,parent)

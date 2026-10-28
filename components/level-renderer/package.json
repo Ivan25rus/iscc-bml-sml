@@ -1,0 +1,14 @@
+{
+  "name": "iscc-level-renderer",
+  "version": "0.1.4",
+  "private": true,
+  "description": "Isolated candle renderer addon for ISCC",
+  "main": "module/index.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.22.0",
+    "node-fetch": "^2.7.0"
+  }
+}

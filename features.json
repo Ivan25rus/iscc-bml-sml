@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "features": [
+    {"id":"bml-sml","title":"Набор BML/SML от LT","description":"Процент частей, рынок и лимитка, общий стоп, остановка, восстановление и проверки исполнения — единый набор.","requires":[],"mt5Core":true},
+    {"id":"accounts","title":"Несколько счетов MT5","description":"Добавление отдельных терминалов, включение копирования и множители лота.","requires":[],"mt5Core":true},
+    {"id":"management","title":"Управление позициями","description":"SL/TP, стоп во вход, полное закрытие и отмена заявки.","requires":[],"mt5Core":true},
+    {"id":"partial-close","title":"Частичное закрытие","description":"Лоты или процент выбранной позиции с проверкой остатка.","requires":["management"],"mt5Core":true},
+    {"id":"price-close","title":"Закрытие части по цене","description":"Сохранённое условие; при достижении цены выбранная доля закрывается по рынку.","requires":["partial-close"],"mt5Core":true},
+    {"id":"time-exit","title":"Закрытие по времени","description":"Настройка срока новых сделок; исполнитель работает и без открытой панели.","requires":[],"mt5Core":true},
+    {"id":"levels","title":"Уровни TradingView → MT5","description":"High/Low закрытой свечи, цвета, перенос, удаление и подтверждение индикатором.","requires":[],"mt5Core":false},
+    {"id":"levels-to-lt","title":"Подтверждённые уровни MT5 → LT в ISCC","description":"Передача в Level Track только после подтверждения MT5; ручные уровни сохраняются.","requires":["levels"],"mt5Core":false}
+  ]
+}

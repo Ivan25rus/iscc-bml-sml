@@ -10,6 +10,7 @@ const CANCEL_FIELDS=new Set(['id','phase','reason','accounts','children','create
 const MAX_WATCH=400;
 const WATCH_BATCH=100;
 const {readErrorKind}=require('./entryStatus');
+const {retainControlEntry}=require('./entryControlState');
 const supportsLifecycle=(state,entry)=>LIFECYCLE_VERSIONS.has(state?.version)
   && (entry.executionPolicy!==HYBRID_POLICY || HYBRID_LIFECYCLE_VERSIONS.has(state.version));
 const unresolved=entry=>(entry.children || []).some(child=>!['confirmed','cancelled','rejected'].includes(child.state));
@@ -126,6 +127,7 @@ function entryWatch(entry) {
 function rememberEntry(adapter,entry) {
   if(!entry?.id)return;
   adapter.chunkLifecycleEntries ||= new Map();
+  if(retainControlEntry(adapter.chunkLifecycleEntries.get(entry.id),entry))return;
   const closed=adapter.closedControlProofs?.get(entry.id);
   if(closed && settledClosingOutcome(entry) && closed.identity===closedControlIdentity(entry)) {
     adapter.chunkLifecycleEntries.set(entry.id,JSON.parse(JSON.stringify(closed.entry)));return;

@@ -1,6 +1,7 @@
 {
   "enabled": false,
   "tradingEnabled": false,
+  "features": [],
   "executionPolicy": "hybrid-market-limit-v1",
   "mappings": [],
   "followers": [],

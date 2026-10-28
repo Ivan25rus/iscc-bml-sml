@@ -23,6 +23,11 @@ class PreparationTests(unittest.TestCase):
         self.files = {'payload/src/app/services/levelOrder/marketZone.js':b'candidate\n',
                       'payload/vps/chunk_entry.py':b'# execution candidate\n',
                       'reference/renderer-functions.js.txt':b'merge reference\n'}
+        for names in prepare.ROOTS.values():
+            for name in names:self.files['payload/src/app/services/'+name]=b'// dependency fixture\n'
+        for name in ['mt5-vps/client.js','mt5-vps/buildInfo.js','levelOrder/config/level-order-settings-descriptor.json']:
+            self.files['payload/src/app/services/'+name]=b'// fixture\n'
+        self.files['payload/src/app/services/levelOrder/chunkAdmission.js']=b"require('./marketZone');\n"
         for name,data in self.files.items():
             target=self.kit/name; target.parent.mkdir(parents=True,exist_ok=True); target.write_bytes(data)
         self.manifest={'schema':1,'kind':'iscc-bml-sml','version':'test',

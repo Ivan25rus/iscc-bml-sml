@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "kind": "iscc-bml-sml-integration-kit",
   "receiverVersion": 39,
   "executionPolicy": "hybrid-market-limit-v1",
@@ -11,6 +11,10 @@
   "levelAlertsIncluded": false,
   "positionManagementIncluded": true,
   "partialCloseIncluded": true,
+  "featureSelectionSchema": 2,
+  "levelRendererIncluded": true,
+  "levelRendererVersion": "0.1.4",
+  "indicatorVersion": "1.17",
   "defaultEnabled": false,
   "fullAuthorPanelIncluded": false,
   "ownerConfigurationIncluded": false,

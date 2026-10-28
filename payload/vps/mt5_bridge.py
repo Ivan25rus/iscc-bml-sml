@@ -1130,7 +1130,7 @@ class Bridge:
                 'hybrid-native-reconcile-v1','hybrid-support-reprice-v1','atomic-entry-admission-v1','entry-progress-snapshots-v1','independent-account-entry-v2',
                 'parallel-account-entry-v3','entry-progress-fast-read-v1',
                 'independent-account-lanes-v4','entry-events-v1','entry-account-continue-v1','entry-stop-priority-v1',
-                'entry-control-recovery-v1','entry-intent-delivery-v1','entry-status-order-v1',
+                'entry-control-recovery-v1','entry-intent-delivery-v1','entry-status-order-v1','entry-exact-parent-close-v1',
                 *(['independent-account-engines-v5','entry-initial-sizing-only-v1'] if getattr(self,'isolated_entries',False) else []),
                 *ENTRY_PROTOCOL_CAPABILITIES] + (['lt-level-sync-v1'] if getattr(self,'lt_level_sync',None) else []) + (['account-enrollment','mt4-preparation'] if getattr(self,'account_registry',None) else [])
 

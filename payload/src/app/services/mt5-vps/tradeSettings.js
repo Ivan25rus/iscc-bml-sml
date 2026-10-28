@@ -1,4 +1,4 @@
-function mountTradeSettings(ipc,toolbar) {
+function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true}={}) {
   const launch=document.createElement('button');launch.id='mt5-trade-settings-button';launch.textContent='Счета и время · MT5';toolbar.append(launch);
   let dialog;
   launch.onclick=()=>{
@@ -27,6 +27,11 @@ function mountTradeSettings(ipc,toolbar) {
     const message=make('p');message.id='mt5-settings-result';message.setAttribute('role','status');
     const refresh=make('button','Обновить');refresh.id='mt5-settings-refresh';
     const dismiss=make('button','Закрыть');dismiss.style.marginLeft='8px';dismiss.onclick=()=>dialog.close();
+    const selectionStyle=make('style');selectionStyle.textContent=
+      (!accounts?'#mt5-trade-settings #mt5-followers-section,#mt5-trade-settings #mt5-enrollment-section{display:none!important}':'')+
+      (!timeExit?'#mt5-trade-settings #mt5-time-exit{display:none!important}':'');
+    copies.id='mt5-followers-section';enrollment.id='mt5-enrollment-section';
+    launch.textContent=title.textContent=accounts?(timeExit?'Счета и время · MT5':'Счета · MT5'):'Закрытие по времени · MT5';
     let busy=false,loading=false,ready=false,readPromise=null,copiesDirty=false,exitDirty=false,capabilities=[],catalogBusy=false,catalogScanning=false;
     function controls() {
       // A background GET must never disable a focused editor. Only initial
@@ -131,7 +136,7 @@ function mountTradeSettings(ipc,toolbar) {
     const poll=setInterval(()=>{if(dialog.open && !document.hidden && !busy && !loading){refresh.onclick();if(catalogScanning)catalog();}},2000);
     window.addEventListener('beforeunload',()=>clearInterval(poll),{once:true});
     document.body.append(dialog);dialog.showModal();
-    reload().then(()=>{if(capabilities.includes('account-enrollment'))catalog();}).catch(error=>{status.textContent=error.message;});
+    reload().then(()=>{if(accounts && capabilities.includes('account-enrollment'))catalog();}).catch(error=>{status.textContent=error.message;});
   };
 }
 module.exports={mountTradeSettings};

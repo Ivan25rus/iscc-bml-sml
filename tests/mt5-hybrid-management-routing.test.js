@@ -5,12 +5,13 @@ const {EventEmitter}=require('events');
 
 test('Hybrid protection and complete close use the primary coordinator even when the follower is selected',async()=>{
   const handlers={},calls=[],app=new EventEmitter(),module={exports:{}};
+  let finalEntry;
   app.getPath=()=>os.tmpdir();
   const config={enabled:true,account:900000002,server:'Example-MT5',followers:[{account:'900000001',multiplier:1,enabled:true}]};
   class Connection extends EventEmitter {
     constructor(config){super();this.config=config;this.inFlight=new Set();}
-    modifyEntryProtection(target,changes,options){calls.push({kind:'parent-protection',route:this.config.routePrefix,target,changes,options});return {status:'ok'};}
-    closeEntryPosition(entry,options){calls.push({kind:'parent-close',route:this.config.routePrefix,entry,options});return {status:'ok'};}
+    modifyEntryProtection(target,changes,options){calls.push({kind:'parent-protection',route:this.config.routePrefix,target,changes,options});return {status:'ok',entry:finalEntry};}
+    closeEntryPosition(entry,options){calls.push({kind:'parent-close',route:this.config.routePrefix,entry,options});return {status:'ok',entry:finalEntry};}
     modifyOrder(target,changes){calls.push({kind:'ordinary-modify',route:this.config.routePrefix,target,changes});return {status:'ok'};}
     close(){}
   }
@@ -41,5 +42,11 @@ test('Hybrid protection and complete close use the primary coordinator even when
   assert.equal(calls[3].kind,'ordinary-modify');assert.equal(calls[3].route,'/accounts/900000001');
   await assert.rejects(manage(null,{action:'entry-protection',account:'999999',target}),/не настроен/);
   assert.equal(calls.length,4);
+  finalEntry={id:'parent-a',phase:'completed'};
+  const delivered=[];
+  await manage({sender:{send:(channel,result)=>delivered.push({channel,result})}},{action:'entry-protection',account:'900000001',target,changes:{sl:25001}});
+  assert.equal(delivered[0].channel,'mt5-vps:entry-control');assert.equal(delivered[0].result.entry,finalEntry);
+  const result=await manage({sender:{send(){throw Error('Synthetic closed renderer');}}},{action:'entry-close',account:'900000001',target});
+  assert.equal(result.status,'ok');assert.equal(result.entry,finalEntry);
   app.emit('before-quit');
 });

@@ -2,40 +2,90 @@
 <html lang="ru">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
-<title>BML/SML · дополнение ИСКК</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>ISCC · выбор дополнений</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#eff3f6;color:#183043;font:16px/1.6 system-ui,sans-serif}main{max-width:850px;margin:40px auto;padding:0 24px 40px}h1{font-size:38px;line-height:1.2}fieldset,.card{background:white;border:1px solid #cbd7df;border-radius:14px;padding:24px;margin:22px 0}legend{font-weight:650;padding:0 8px}label{display:block;margin:14px 0}select,textarea{width:100%;font:inherit;padding:10px;border:1px solid #8da3b1;border-radius:6px}textarea{height:240px;font-size:14px}small{display:block;margin-left:25px;color:#536675}button{padding:12px 18px;background:#145b85;color:white;border:0;border-radius:7px;font:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}a{color:#145b85}input{accent-color:#145b85}#status{color:#536675}p{margin:12px 0}
+*{box-sizing:border-box}body{margin:0;background:#eff3f6;color:#183043;font:16px/1.55 system-ui,sans-serif}main{max-width:920px;margin:36px auto;padding:0 24px 40px}h1{font-size:36px;line-height:1.2}fieldset,.card{background:white;border:1px solid #cbd7df;border-radius:14px;padding:22px;margin:22px 0}legend{font-weight:650;padding:0 8px}label{display:block;margin:14px 0}select,textarea{width:100%;font:inherit;padding:10px;border:1px solid #8da3b1;border-radius:6px}textarea{height:280px;font-size:13px}small{display:block;margin-left:25px;color:#536675}button{padding:11px 16px;background:#145b85;color:white;border:0;border-radius:7px;font:inherit;cursor:pointer;margin:4px 6px 4px 0}button:disabled{opacity:.5;cursor:not-allowed}a{color:#145b85}input{accent-color:#145b85}.auto{color:#145b85;font-size:13px}#status{padding:12px;border-radius:8px;background:#eef5f9}p{margin:12px 0}
 </style>
 <main>
-<h1>BML/SML для Level Track</h1>
-<p>Процентный набор рынком с лимитной поддержкой, общим стопом и независимыми счетами. Управление позицией и частичное закрытие. Комплект 0.2.0 для интеграции через Codex или Claude.</p>
+<h1>Выбери дополнения для ISCC</h1>
+<p>Набор BML/SML и Level Track: TradingView → MT5 → ISCC. Комплект 0.3.0 для установки через Claude Code или Codex.</p>
 <form id="setup">
-<fieldset><legend>Компьютер с панелью</legend>
-<label for="platform">Система<select id="platform"><option value="windows">Windows</option><option value="macos">Mac</option></select></label>
-<p>Версия и существующие доработки определяются по локальным исходникам. Для MT5 нужен совместимый адаптер исполнения.</p>
+<section class="card"><p>Быстрый выбор</p>
+<button type="button" data-profile="all">Все функции</button>
+<button type="button" data-profile="entry">Только BML/SML</button>
+<button type="button" data-profile="levels">Только уровни TV → MT5 → LT</button>
+</section>
+<fieldset><legend>Какие функции установить</legend>
+<div id="features"></div>
+<p>Нужные зависимости добавятся автоматически. Стоп, проверка объёма, подтверждение отмены, сверка исполнения и восстановление входят в BML/SML целиком.</p>
+<p>Существующие функции ISCC и сохранённые правила остаются доступны. Снятие галочки определяет состав нового дополнения и не отменяет действующие сделки или условия.</p>
 </fieldset>
-<fieldset><legend>Подготовить компоненты</legend>
-<label><input id="frontend" type="checkbox" checked>Кнопки BML/SML и управление набором</label>
-<small>Расчёт объёма, LT, общий стоп, восстановление карточки, счета, управление SL/TP и частичное закрытие.</small>
-<label><input id="receiver" type="checkbox" checked>Ядро исполнения MT5</label>
-<small>Независимые счета, фиксированный первоначальный лот, резервирование объёма и подтверждение отмены. Существующий приёмник сравнивается перед объединением.</small>
+<fieldset><legend>Где подготовить установку</legend>
+<label for="platform">Компьютер с панелью<select id="platform"><option value="windows">Windows</option><option value="macos">Mac</option></select></label>
+<label><input id="frontend" type="checkbox" checked>Подготовить дополнения для панели ISCC</label>
+<label><input id="receiver" type="checkbox" checked>Подготовить исполнитель MT5, если нужен выбранным функциям</label>
+<small>Для одних уровней используется приёмник свечей или существующий мост. Торговое ядро для них не добавляется.</small>
 </fieldset>
 <section class="card"><h2>План для агента</h2>
-<p>Подготовка не включает торговлю и не меняет действующие заявки. Адреса, счета и пароли здесь не вводятся.</p>
-<button id="download" type="submit">Скачать план подготовки</button>
 <p id="status" role="status"></p>
-<label for="prompt">Инструкция для Codex или Claude</label><textarea id="prompt" readonly></textarea>
+<button id="download" type="submit">Скачать выбранный план</button>
+<label for="prompt">Скопируй инструкцию в Claude Code или Codex</label><textarea id="prompt" readonly></textarea>
+<p>Передай агенту распакованную папку и план. Он проверит текущую ISCC, объединит выбранные изменения, выполнит тесты и сборку. Подготовка оставляет торговлю выключенной.</p>
 </section></form>
-<p>Получателю нужны объединение исходников, сборка и проверка своего MT5. Обычной авторской панели одного добавления кнопок недостаточно. <a href="INSTALL.md">Порядок установки</a>.</p>
+<p><a href="CHOICES.md">Функции и зависимости</a> · <a href="INSTALL.md">Порядок установки</a></p>
 </main>
+<script src="selection.js"></script>
 <script>
 'use strict';
 const $=id=>document.getElementById(id);
-function plan(){return {schema:1,platform:$('platform').value,frontend:$('frontend').checked,receiver:$('receiver').checked,tradingEnabled:false};}
-function update(){const value=plan(),valid=value.frontend||value.receiver;$('download').disabled=!valid;$('status').textContent=valid?'План готов. Торговля при подготовке выключена.':'Выберите хотя бы один компонент.';$('prompt').value='Подготовь интеграцию BML/SML в мою ИСКК из этого комплекта. Прочитай AGENTS.md и INSTALL.md. Определи версию и независимые доработки локально; не спрашивай версию повторно. Выполни prepare.py, сравни изменения, сохрани мои настройки и журналы. Не заменяй main.js или renderer.js целиком и не запускай реальные сделки. Настрой совместимый MT5-адаптер локально, выполни тесты и сборку.\n\nПлан:\n'+JSON.stringify(value,null,2);}
-$('setup').addEventListener('change',update);
-$('setup').addEventListener('submit',event=>{event.preventDefault();const value=plan();if(!(value.frontend||value.receiver))return;const link=document.createElement('a'),url=URL.createObjectURL(new Blob([JSON.stringify(value,null,2)+'\n'],{type:'application/json'}));link.href=url;link.download='bml-sml-selection.json';link.click();URL.revokeObjectURL(url);});
+const definitions=[
+ ['bml-sml','Набор BML/SML от LT','Процент частей, рынок и лимитка, общий стоп, остановка и восстановление.'],
+ ['accounts','Несколько счетов MT5','Добавление терминалов, копирование и коэффициенты лота.'],
+ ['management','Управление позициями','SL/TP, стоп во вход, полное закрытие и отмена заявки.'],
+ ['partial-close','Частичное закрытие','Лоты или процент выбранной позиции; включает управление.'],
+ ['price-close','Закрытие части по цене','Условие с исполнением на MT5; включает частичное закрытие.'],
+ ['time-exit','Закрытие по времени','Настройка срока новых сделок.'],
+ ['levels','Уровни TradingView → MT5','High/Low свечей, цвета, перенос, удаление и подтверждение.'],
+ ['levels-to-lt','Подтверждённые уровни MT5 → LT в ISCC','Включает перенос из TradingView; ручные уровни сохраняются.']
+];
+let requested=new Set(ISCCSelection.ids);
+for(const [id,title,description] of definitions){
+ const label=document.createElement('label'),input=document.createElement('input'),small=document.createElement('small');
+ input.type='checkbox';input.id='feature-'+id;input.dataset.feature=id;
+ label.append(input,document.createTextNode(' '+title));small.textContent=description;label.append(small);$('features').append(label);
+ input.onchange=()=>{if(input.checked)requested.add(id);else requested.delete(id);update();};
+}
+function plan(){return {schema:2,platform:$('platform').value,frontend:$('frontend').checked,receiver:$('receiver').checked,
+ features:[...requested],tradingEnabled:false};}
+function update(){
+ try{
+  const value=plan(),selected=ISCCSelection.resolve(value.features);
+  if(!(value.frontend||value.receiver))throw Error('Выберите панель или исполнитель.');
+  if(selected.features.includes('levels')&&!value.frontend)throw Error('Для уровней нужна подготовка панели ISCC.');
+  for(const [id] of definitions){const input=$('feature-'+id),automatic=selected.automaticallyIncluded.includes(id);
+   input.checked=selected.features.includes(id);input.disabled=automatic;input.parentNode.classList.toggle('auto',automatic);
+   input.title=automatic?'Обязательная зависимость: сначала снимите зависимую функцию':'';
+  }
+  const automatic=definitions.filter(row=>selected.automaticallyIncluded.includes(row[0])).map(row=>row[1]);
+  $('status').textContent='Выбрано функций: '+selected.features.length+'. '+(automatic.length?'Добавлено автоматически: '+automatic.join(', ')+'. ':'')+
+   (selected.mt5Core?'Общее ядро MT5 и проверки сохраняются целиком.':'Только уровни: торговое ядро не устанавливается.');
+  $('download').disabled=false;
+  $('prompt').value='Установи выбранные дополнения ISCC из этой папки. Сначала прочитай AGENTS.md, INSTALL.md и CHOICES.md. Если плана выбора ещё нет, сначала предложи функции из features.json и дождись выбора. Используй prepare.py с выбранным планом; не устанавливай невыбранные интерфейсы. Зависимости и проверки исполнения сохраняй целиком. Существующие функции, настройки, позиции и правила получателя сохраняй. Для уровней используй вложенный components/level-renderer и подготовленный levels-selection.json, сравнив уже имеющуюся реализацию. Не запускай второй синхронизатор или координатор. Определи версию локально, объедини изменения, выполни тесты и сборку, проверь среду получателя. Не отправляй реальные торговые команды.\n\nПлан:\n'+JSON.stringify(value,null,2);
+ }catch(error){
+  $('download').disabled=true;$('status').textContent=error.message;$('prompt').value='';
+  for(const [id] of definitions){const input=$('feature-'+id);input.disabled=false;input.checked=requested.has(id);}
+ }
+}
+for(const button of document.querySelectorAll('[data-profile]'))button.onclick=()=>{
+ requested=new Set(button.dataset.profile==='all'?ISCCSelection.ids:button.dataset.profile==='entry'?['bml-sml']:['levels-to-lt']);update();
+};
+for(const id of ['platform','frontend','receiver'])$(id).addEventListener('change',update);
+$('setup').addEventListener('submit',event=>{
+ event.preventDefault();if($('download').disabled)return;
+ const link=document.createElement('a'),url=URL.createObjectURL(new Blob([JSON.stringify(plan(),null,2)+'\n'],{type:'application/json'}));
+ link.href=url;link.download='iscc-selection.json';link.click();URL.revokeObjectURL(url);
+});
 update();
 </script>
 </html>

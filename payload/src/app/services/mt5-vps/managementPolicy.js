@@ -3,6 +3,7 @@
 const PROTECTION_WARNING='SL или TP на счетах различаются';
 const ENTRY_PROTECTION_CAPABILITY='hybrid-position-protection-v1';
 const ENTRY_POLICY='hybrid-market-limit-v1';
+const {EXACT_CLOSE_CAPABILITY}=require('./entryControlState');
 function isEntryPlanRow(row) {
   return Boolean(row && (Object.hasOwn(row,'entryPlan') || row.executionPolicy===ENTRY_POLICY));
 }
@@ -33,6 +34,17 @@ function entryProtectionBlock({row,account,linked,capabilities=[],commands=[],ac
     if(!state?.connected)return 'Нет подтверждённой связи с одним из счетов набора БМЛ/СМЛ.';
     if(!state.capabilities?.includes(ENTRY_PROTECTION_CAPABILITY))return 'Обнови приёмник VPS на каждом выбранном счёте БМЛ/СМЛ.';
   }
+  return '';
+}
+function exactEntryCloseBlock({row,account,capabilities=[],commands=[],rules=[],timeRules=[]}) {
+  if(!capabilities.includes(EXACT_CLOSE_CAPABILITY))return 'Точный протокол закрытия набора недоступен.';
+  let plan;try{plan=entryPlanMetadata(row);}catch(error){return error.message;}
+  if(!row.__isPosition || !plan.accounts.includes(String(account)))return 'Выбери позицию из этого набора.';
+  if(commands.some(command=>(command.ticket===`entry:${plan.id}` || command.payload?.entryId===plan.id
+      || String(command.ticket)===String(row.ticket)) && command.result?.status==='unknown')
+    || rules.some(rule=>String(rule.ticket)===String(row.ticket) && ['unknown','firing'].includes(rule.state))
+    || timeRules.some(rule=>String(rule.ticket)===String(row.ticket) && ['opening','unknown','firing'].includes(rule.state)))
+    return 'Есть неподтверждённая команда для набора. Дождись сверки с MT5; повтор заблокирован.';
   return '';
 }
 function protectionView(row) {
@@ -82,4 +94,4 @@ function protectionChanges(row,values,dirty) {
   return changes;
 }
 module.exports={managementBlock,decimal,protectionChanges,PROTECTION_WARNING,
-  ENTRY_PROTECTION_CAPABILITY,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock,protectionView};
+  ENTRY_PROTECTION_CAPABILITY,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock,exactEntryCloseBlock,protectionView};

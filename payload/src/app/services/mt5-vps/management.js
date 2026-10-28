@@ -1,7 +1,7 @@
 const {closeVolumes}=require('./sizing');
 const {timingLines}=require('./timings');
-const {managementBlock,decimal,protectionChanges,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock,protectionView}=require('./managementPolicy');
-function mountManagement(ipc, toolbar) {
+const {managementBlock,decimal,protectionChanges,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock,exactEntryCloseBlock,protectionView}=require('./managementPolicy');
+function mountManagement(ipc, toolbar, {partialClose=true,priceClose=true}={}) {
   const launch = document.createElement('button');
   launch.id = 'mt5-manage-button';
   launch.textContent = 'Позиции · MT5';
@@ -135,7 +135,10 @@ function mountManagement(ipc, toolbar) {
       modify.disabled = busy || protectionBlocked || !row || !hybrid && !capabilities.includes('modify');
       toEntry.disabled=busy || !row?.__isPosition || hybrid && Boolean(protectionBlocked);toEntry.hidden=!row?.__isPosition;
       cancel.disabled = busy || blocked || !row || row.__isPosition || !capabilities.includes('cancel');
-      full.disabled = busy || blocked || !row?.__isPosition || !capabilities.includes('close') || hybrid && Boolean(entryProtectionBlock({row,account:dataAccount(),linked:true,capabilities,commands,accountStates}));
+      const exactClose=hybrid && capabilities.includes('entry-exact-parent-close-v1');
+      const fullBlock=exactClose ? exactEntryCloseBlock({row,account:dataAccount(),capabilities,commands,rules,timeRules})
+        : blocked || hybrid && entryProtectionBlock({row,account:dataAccount(),linked:true,capabilities,commands,accountStates});
+      full.disabled = busy || fullBlock || !row?.__isPosition || !capabilities.includes('close');
       full.textContent=hybrid ? 'Закрыть всё · все счета' : 'Закрыть всю позицию';
       let preview=[];
       try {preview=closeVolumes(row,dataAccount(),!hybrid && mirror.checked,sizeMode.value,decimal(sizeMode.value==='percent' ? percent.value : volume.value));}
@@ -151,7 +154,8 @@ function mountManagement(ipc, toolbar) {
         closeSummary.textContent=preview.map(item=>`${preview.length>1?item.account+': ':''}${item.error || `${item.volume} л. → остаток ${item.remaining} л.`}`).join(' · ');
       }
       closeSummary.hidden=!row?.__isPosition;
-      partial.disabled = full.disabled || !capabilities.includes('partial-close') || !preview.length || preview.some(item=>item.error);
+      partial.disabled = full.disabled || blocked || hybrid && Boolean(protectionBlocked)
+        || !capabilities.includes('partial-close') || !preview.length || preview.some(item=>item.error);
       partial.textContent=sizeMode.value==='percent' ? `Закрыть ${percent.value || '…'}%` : 'Закрыть часть';
       let triggerPrice=0;try{triggerPrice=decimal(trigger.value);}catch{}
       schedule.disabled = partial.disabled || !capabilities.includes('schedule-close') || !(triggerPrice>0)
@@ -167,6 +171,10 @@ function mountManagement(ipc, toolbar) {
       for(const button of presets.querySelectorAll('button')){button.disabled=busy || !row?.__isPosition;button.setAttribute('aria-pressed',String(sizeMode.value==='percent' && Number(percent.value)===Number(button.dataset.percent)));}
       presets.hidden=!row?.__isPosition;
       for (const button of conditions.querySelectorAll('button')) button.disabled=busy;
+      if(!partialClose){
+        for(const element of [partial,partialRow,closeRow,closePreview,closeSummary,customSize])element.hidden=true;
+      }
+      if(!priceClose)conditional.hidden=true;
       refresh.disabled = busy;
     }
     function choose(preserve = false) {
@@ -306,15 +314,17 @@ function mountManagement(ipc, toolbar) {
       try {
         // A periodic read must not swallow a click. Wait for that same read,
         // then revalidate the captured target; never queue a second POST.
-        if(readPromise)await readPromise;
+        const exactClose=action==='entry-close' && isEntryPlanRow(selected) && capabilities.includes('entry-exact-parent-close-v1');
+        if(readPromise && !exactClose)await readPromise;
         const current=target();
         if(dataAccount()!==selectedAccount || !current || String(current.ticket)!==String(selected.ticket)
-          || current.__isPosition!==selected.__isPosition || Number(current.lots)!==Number(selected.lots))
+          || current.__isPosition!==selected.__isPosition || !exactClose && Number(current.lots)!==Number(selected.lots))
           throw Error('Позиция или её объём изменились. Проверь параметры заново.');
         const hybrid=isEntryPlanRow(current),wholeProtection=action==='entry-protection',wholeClose=action==='entry-close';
         if((wholeProtection || wholeClose) && current.entryPlan?.id!==selected.entryPlan?.id)throw Error('Набор БМЛ/СМЛ изменился. Обнови список.');
-        const blocked=(connected ? managementBlock({row:current,account:dataAccount(),linked:!hybrid && mirror.checked,commands,rules,timeRules,alerts,accountStates}) : 'Нет подтверждённой связи с MT5. Обнови список.')
-          || ((wholeProtection || wholeClose) ? entryProtectionBlock({row:current,account:dataAccount(),linked:wholeClose || mirror.checked,capabilities,commands,accountStates}) : '');
+        const blocked=exactClose ? exactEntryCloseBlock({row:current,account:dataAccount(),capabilities,commands,rules,timeRules})
+          : (connected ? managementBlock({row:current,account:dataAccount(),linked:!hybrid && mirror.checked,commands,rules,timeRules,alerts,accountStates}) : 'Нет подтверждённой связи с MT5. Обнови список.')
+            || ((wholeProtection || wholeClose) ? entryProtectionBlock({row:current,account:dataAccount(),linked:wholeClose || mirror.checked,capabilities,commands,accountStates}) : '');
         if(blocked){showMessage(blocked,'Проверка');return;}
         showMessage('Отправляю команду…');
         submitted=true;

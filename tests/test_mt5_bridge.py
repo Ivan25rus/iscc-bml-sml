@@ -105,7 +105,7 @@ class BridgeTests(unittest.TestCase):
 
 
     def moscow_bridge(self):
-        bridge=Bridge(self.mt5,{**self.config,'brokerUtcOffsetSeconds':10800},self.file)
+        bridge=Bridge(self.mt5,{**self.config,'brokerUtcOffsetSeconds':10800,'brokerClockModel':'fixed-offset'},self.file)
         self.addCleanup(bridge.db.close)
         return bridge
 

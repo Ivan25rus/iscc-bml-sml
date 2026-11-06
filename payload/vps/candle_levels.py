@@ -86,9 +86,9 @@ def read_window(mt5, payload, offset):
     """One extreme inside [TV open, TV close), never the extra broker hour.
 
     Aligned candles use their native MT5 bar. For different session boundaries,
-    minute history must reproduce every enclosing closed H1 bar's tick volume
-    and extremes. Thus legitimate minutes without quotes are allowed, while
-    partial history cannot silently produce a price.
+    smaller closed bars must reproduce every enclosing H1 bar's tick volume
+    and extremes. M5 is tried first because older M1 history may be absent.
+    No adjacent bars or unverified hourly extremes are substituted.
     """
     start, end = payload['time'] + offset, payload['endTime'] + offset
     def read(tf, left, right):
@@ -111,36 +111,50 @@ def read_window(mt5, payload, offset):
     if start % 3600 or end % 3600:
         raise ValueError('No exact native MT5 candle; minute windows are not replaced by adjacent bars')
     hours = read('H1', start, end - 1)
-    minutes = read('M1', start, end - 1)
-    if hours is None or minutes is None or not len(hours) or not len(minutes):
+    if hours is None or not len(hours):
         raise ValueError('MT5 history for the exact TV window is unavailable')
-    if len(hours) > 32 * 24 or len(minutes) > 32 * 1440:
+    if len(hours) > 32 * 24:
         raise ValueError('MT5 window history exceeds its bounded size')
     parents = {int(row['time']): row for row in hours}
     if (len(parents) != len(hours) or len(parents) != (end - start) // 3600
             or start not in parents or end - 3600 not in parents
             or any(stamp < start or stamp >= end or stamp % 3600 for stamp in parents)):
         raise ValueError('MT5 hourly coverage does not span the exact TV window')
-    children = {stamp: [] for stamp in parents}
-    previous = start - 60
-    for row in minutes:
-        stamp = int(row['time'])
-        if stamp <= previous or stamp < start or stamp >= end or stamp % 60 or stamp // 3600 * 3600 not in children:
-            raise ValueError('Invalid or incomplete MT5 minute window coverage')
-        previous = stamp
-        children[stamp // 3600 * 3600].append(row)
-    for stamp, parent in parents.items():
-        rows = children[stamp]
-        if not rows:
-            raise ValueError('MT5 minute history is incomplete')
-        high, low = prices(rows)
-        volume = int(parent['tick_volume'])
-        if (volume <= 0 or any(int(row['tick_volume']) <= 0 for row in rows)
-                or sum(int(row['tick_volume']) for row in rows) != volume
-                or high != float(parent['high']) or low != float(parent['low'])):
-            raise ValueError('MT5 minute history does not reproduce the hourly tick volume and extremes')
-    high, low = prices(minutes)
-    return dict(high=high, low=low, brokerTime=start, method='mt5-m1-window', minuteCount=len(minutes), coverageHours=len(hours))
+    last_error = None
+    for period, step in (('M5', 300), ('M1', 60)):
+        if not hasattr(mt5, 'TIMEFRAME_' + period):
+            continue
+        try:
+            smaller = read(period, start, end - 1)
+            if smaller is None or not len(smaller):
+                raise ValueError('MT5 ' + period + ' history for the exact TV window is unavailable')
+            if len(smaller) > 32 * 86400 // step:
+                raise ValueError('MT5 window history exceeds its bounded size')
+            children = {stamp: [] for stamp in parents}
+            previous = start - step
+            for row in smaller:
+                stamp = int(row['time'])
+                if stamp <= previous or stamp < start or stamp >= end or stamp % step or stamp // 3600 * 3600 not in children:
+                    raise ValueError('Invalid or incomplete MT5 minute window coverage (' + period + ')')
+                previous = stamp
+                children[stamp // 3600 * 3600].append(row)
+            for stamp, parent in parents.items():
+                rows = children[stamp]
+                if not rows:
+                    raise ValueError('MT5 minute history is incomplete (' + period + ')')
+                high, low = prices(rows)
+                volume = int(parent['tick_volume'])
+                if (volume <= 0 or any(int(row['tick_volume']) <= 0 for row in rows)
+                        or sum(int(row['tick_volume']) for row in rows) != volume
+                        or high != float(parent['high']) or low != float(parent['low'])):
+                    raise ValueError('MT5 minute history does not reproduce the hourly tick volume and extremes (' + period + ')')
+            high, low = prices(smaller)
+            return dict(high=high, low=low, brokerTime=start, method='mt5-' + period.lower() + '-window',
+                        **({'minuteCount': len(smaller)} if period == 'M1' else {'fiveMinuteCount': len(smaller)}),
+                        coverageHours=len(hours))
+        except ValueError as error:
+            last_error = error
+    raise last_error or ValueError('MT5 history for the exact TV window is unavailable')
 
 
 def candle_window_worker(connection, config, payload):

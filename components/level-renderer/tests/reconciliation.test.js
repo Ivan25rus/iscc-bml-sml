@@ -64,6 +64,59 @@ test('incomplete origin cancels a pending retirement; repeated same capture does
   f.advance(); f.snapshot([], { complete: false }); f.advance(); f.snapshot([]);
   assert.equal(f.sync.records.get('one').removed, false);
 });
+test('closed historical origins no longer veto two complete reads after restart', () => {
+  const old = imported(); old.snapshot(['one'], {scope:'closed'});
+  const f = fixture(old.sync.serialize());
+  f.sync.acceptOpenCharts(['origin'],1800000000000); f.snapshot([]);
+  assert.equal(f.sync.records.get('one').removed,false);
+  f.advance(); f.sync.acceptOpenCharts(['origin'],1800000010000); f.snapshot([]);
+  assert.equal(f.sync.records.get('one').removed,true);
+  assert.deepEqual(f.sync.records.get('one').chartScopes,['origin','closed']);
+});
+test('an open origin needs a complete inventory from this discovery cycle', () => {
+  const f = imported(); f.snapshot(['one'], {scope:'copy'});
+  f.advance(); f.snapshot([]); f.snapshot([], {scope:'copy'});
+  f.advance(); f.sync.acceptOpenCharts(['origin','copy'],1800000020000); f.snapshot([]);
+  assert.equal(f.sync.records.get('one').removed,false,'old absence from another open tab is insufficient');
+  f.snapshot([], {scope:'copy'});
+  assert.equal(f.sync.records.get('one').removed,false,'first complete cycle only');
+  f.advance(); f.sync.acceptOpenCharts(['copy','origin'],1800000030000); f.snapshot([]);
+  assert.equal(f.sync.records.get('one').removed,false,'unread open tab still blocks');
+  f.snapshot([], {scope:'copy'}); assert.equal(f.sync.records.get('one').removed,true);
+});
+test('closed origins alone and an unrelated open layout never establish absence', () => {
+  const f=imported();
+  f.sync.acceptOpenCharts(['other'],1800000000000); f.snapshot([], {scope:'other'});
+  f.advance(); f.sync.acceptOpenCharts(['other'],1800000010000); f.snapshot([], {scope:'other'});
+  assert.equal(f.sync.records.get('one').removed,false);
+});
+test('reopening an origin cancels pending absence and surviving copies block retirement', () => {
+  const f=imported();f.snapshot(['one'],{scope:'copy'});
+  f.advance();f.sync.acceptOpenCharts(['origin'],1800000010000);f.snapshot([]);
+  f.advance();f.sync.acceptOpenCharts(['origin','copy'],1800000020000);f.snapshot([]);
+  f.snapshot(['one'],{scope:'copy'});f.advance();f.snapshot([]);
+  assert.equal(f.sync.records.get('one').removed,false);
+});
+test('failed, expired, duplicate, or truncated discovery cannot disregard a closed origin', () => {
+  for(const scopes of [null,['origin','origin'],Array.from({length:17},(_,i)=>'tab'+i)]) {
+    const f=imported();f.snapshot(['one'],{scope:'closed'});
+    f.sync.acceptOpenCharts(scopes,1800000000000);f.snapshot([]);f.advance();f.snapshot([]);
+    assert.equal(f.sync.records.get('one').removed,false);
+  }
+  const f=imported();f.snapshot(['one'],{scope:'closed'});
+  f.sync.acceptOpenCharts(['origin'],1800000000000);f.snapshot([]);f.advance(31000);f.snapshot([]);
+  assert.equal(f.sync.records.get('one').removed,false);
+});
+test('loading or changed-symbol open origins continue to block deletion', () => {
+  for(const options of [{complete:false},{symbolComplete:false},{symbol:'SPREADEX:SPX'}]) {
+    const f=imported();f.snapshot(['one'],{scope:'copy'});
+    for(const stamp of [1800000010000,1800000020000]) {
+      f.advance();f.sync.acceptOpenCharts(['origin','copy'],stamp);f.snapshot([]);
+      f.snapshot([],{scope:'copy',...options});
+    }
+    assert.equal(f.sync.records.get('one').removed,false,JSON.stringify(options));
+  }
+});
 test('extractor marks loading, unsaved, and truncated collections unsafe for deletion', () => {
   for (const kind of ['complete', 'loading', 'unsaved', 'truncated', 'manyWidgets', 'drawingLoad', 'drawingSave', 'unknownReadiness']) {
     const main = { symbol: () => SYMBOL, interval: () => '1', isLoading: () => kind === 'loading',
@@ -82,7 +135,6 @@ test('extractor marks loading, unsaved, and truncated collections unsafe for del
     } finally { delete global.window; }
   }
 });
-// Addon reader inventory handoff is covered in renderer.test.js.
 test('confirmed absence uses durable owned deletion and waits for the indicator before completion', async () => {
   const f = imported(), requests = [], published = [], saved = [];
   const row = f.sync.records.get('one'); row.phase = 'ready'; row.price = 28870.83;

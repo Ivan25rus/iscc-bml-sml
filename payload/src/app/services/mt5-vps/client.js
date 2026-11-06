@@ -6,9 +6,10 @@ const { randomUUID } = require('crypto');
 const { EventEmitter } = require('events');
 const { performance } = require('perf_hooks');
 const {followers,percentVolume}=require('./sizing');
-const {ENTRY_PROTECTION_CAPABILITY,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock}=require('./managementPolicy');
+const {ENTRY_PROTECTION_CAPABILITY,ACCOUNT_CONTROL_CAPABILITY,independentControls,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock,exactEntryProtectionBlock}=require('./managementPolicy');
 const { ExecutionAdapter } = require('../brokerage/comps/base');
-const {EXACT_CLOSE_CAPABILITY,accountIds,controlEntry}=require('./entryControlState');
+const {EXACT_CLOSE_CAPABILITY,EXACT_PROTECTION_CAPABILITY,PARENT_PARTIAL_CAPABILITY,accountIds,controlEntry}=require('./entryControlState');
+const {createQuoteFrameReader}=require('./quoteFrameReader');
 
 const INDEX_SYMBOLS = new Set(['SPX', 'SPX500', 'USTEC']);
 function isIndex(symbol) { return INDEX_SYMBOLS.has(String(symbol || '').toUpperCase().split(':').pop()); }
@@ -70,6 +71,26 @@ class MT5VPSAdapter extends ExecutionAdapter {
     return name === 'USTEC' ? this.config.ustecSymbol : this.config.spxSymbol;
   }
   candleSymbol(symbol) { return require('../tvListener/candle-mappings').brokerName(symbol); }
+  async minuteBars(symbol) {
+    const name=this.brokerSymbol(symbol),minute=Math.floor(Date.now()/60000);
+    this.minuteBarsCache ||= new Map();this.minuteBarsReads ||= new Map();
+    const cached=this.minuteBarsCache.get(name);
+    if(cached?.minute===minute)return cached.value;
+    if(this.minuteBarsReads.has(name))return this.minuteBarsReads.get(name);
+    const pending=(async()=>{
+      if(!this.capabilities.includes('minute-chart-bars-v1'))return null;
+      const value=await this.request('/minute-bars?symbol='+encodeURIComponent(name)+'&limit=30',undefined,{readTimeoutMs:7500});
+      if(String(value.account)!==String(this.config.account) || value.server!==this.config.server || value.symbol!==name
+        || value.timeframe!=='M1' || value.basis!=='bid' || !Array.isArray(value.bars) || value.bars.length>30
+        || !Number.isFinite(value.capturedAt) || Math.abs(Date.now()-value.capturedAt)>60000
+        || value.bars.some((row,index,rows)=>!Array.isArray(row) || row.length!==5 || !row.every(Number.isFinite)
+          || row[0]<=0 || row[0]%60 || row[0]*1000>Date.now()+1000 || row.slice(1).some(x=>x<=0)
+          || row[3]>Math.min(row[1],row[4]) || row[2]<Math.max(row[1],row[4]) || index && row[0]<=rows[index-1][0]))
+        throw Error('Некорректные минутные бары MT5');
+      this.minuteBarsCache.set(name,{minute,value});return value;
+    })().finally(()=>this.minuteBarsReads.delete(name));
+    this.minuteBarsReads.set(name,pending);return pending;
+  }
   async validateCandleSymbols(symbols) {
     if (!Array.isArray(symbols) || symbols.length > 32) throw Error('Допускается до 32 инструментов переноса');
     const names = [...new Set(symbols.map(symbol => this.candleSymbol(symbol)))];
@@ -109,7 +130,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     return this.candleSnapshotInflight.get(name);
   }
   request(route, payload, {execution = false, enrollment = false, readTimeoutMs} = {}) {
-    if(readTimeoutMs!==undefined && (payload || !Number.isInteger(readTimeoutMs) || readTimeoutMs<2500 || readTimeoutMs>15000 || !['/health','/management','/diagnostics','/entry-events'].includes(route.split('?')[0])))
+    if(readTimeoutMs!==undefined && (payload || !Number.isInteger(readTimeoutMs) || readTimeoutMs<2500 || readTimeoutMs>15000 || !['/health','/management','/diagnostics','/entry-events','/minute-bars'].includes(route.split('?')[0])))
       return Promise.reject(Error('Extended diagnostic timeout is restricted to read-only health/management/diagnostics'));
     const cfg = this.config;
     if (!cfg.enabled || !cfg.endpoint || !cfg.token || !cfg.caFile || !cfg.account || !cfg.server) return Promise.reject(Error('Подключение MT5 VPS не настроено'));
@@ -127,12 +148,18 @@ class MT5VPSAdapter extends ExecutionAdapter {
     };
     const body = payload ? Buffer.from(JSON.stringify(payload)) : null;
     let agent=execution ? this.agents.execution : this.agents.commands;
-    const entryControl=execution && body && (['/entry-plan-stop','/entry-plan-continue'].includes(pathname)
-      || ['/entry-plan','/entry-plan-admit'].includes(pathname) && payload.entryMode==='side-zone');
-    if(entryControl && Object.values(agent.sockets || {}).reduce((count,rows)=>count+rows.length,0)>=agent.maxSockets) {
+    if(!body && pathname==='/minute-bars'){
+      this.agents.chartHistory ||= new https.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:1,scheduling:'fifo',...tls});
+      agent=this.agents.chartHistory;
+    }
+    const priorityPool=execution && body && (['/place','/entry-plan','/entry-plan-admit'].includes(pathname) ? 'entryOpening'
+      : pathname==='/entry-plan-stop' ? 'entryStop' : pathname==='/entry-plan-continue' ? 'entryControl'
+      : ['/entry-plan-close','/entry-plan-protection','/close','/modify','/cancel'].includes(pathname) ? 'entrySafety' : null);
+    if(priorityPool && Object.values(agent.sockets || {}).reduce((count,rows)=>count+rows.length,0)>=agent.maxSockets) {
       // Keep the prepared sockets on the ordinary path. If both are occupied,
-      // a paused health read must not queue a new BML/SML or its cancellation.
-      const pool=pathname==='/entry-plan-stop' ? 'entryStop' : 'entryControl';
+      // Opening, cancellation and protection each retain an independent,
+      // bounded path when background warm-up or another command is pending.
+      const pool=priorityPool;
       this.agents[pool] ||= new https.Agent({keepAlive:true,maxSockets:2,maxFreeSockets:2,scheduling:'fifo',...tls});
       agent=this.agents[pool];
     }
@@ -140,7 +167,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     const timing = {startedAt:started};
     return new Promise((resolve, reject) => {
       let deadline,readTimer,request,readFinished=false;
-      const traceRead=!body && ['/health','/management','/snapshot','/orders','/diagnostics'].includes(pathname);
+      const traceRead=!body && ['/health','/management','/snapshot','/orders','/diagnostics','/minute-bars'].includes(pathname);
       const readDetail=()=>({account:String(cfg.account),route:pathname,startedAt:started,elapsedMs:Number((performance.now()-startedPerf).toFixed(2))});
       const finishRead=ok=>{
         if(readFinished)return;readFinished=true;clearTimeout(deadline);clearTimeout(readTimer);
@@ -149,7 +176,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
       const fail=error=>{
         if(readFinished)return;
         finishRead(false);
-        this.lastStatus={connected:false,message:error.message,at:Date.now()};
+        if(pathname!=='/minute-bars' || body)this.lastStatus={connected:false,message:error.message,at:Date.now()};
         // A broken reply settles once. The caller retains any uncertain trade
         // result; neither transport cleanup nor status polling resends it.
         if(request && !request.destroyed)request.destroy(error);
@@ -239,12 +266,17 @@ class MT5VPSAdapter extends ExecutionAdapter {
   ensureQuoteStream() {
     const cfg = this.config;
     if (this.closed || this.streamRequest || this.streamTimer || !cfg.enabled || !cfg.endpoint || !cfg.token || !cfg.caFile) return;
-    let request, freshnessTimer, backlogTimer, loopTimer, reason='connection-closed', accepted=false, discarding=false;
-    const fail=(code,error)=>{if (!request?.destroyed) {reason=code;request?.destroy(error);}};
+    let request, freshnessTimer, freshnessDue, backlogTimer, loopTimer, frameReader, reason='connection-closed', accepted=false, discarding=false;
+    const fail=(code,error)=>{frameReader?.close();if (!request?.destroyed) {reason=code;request?.destroy(error);}};
+    const checkFreshness=()=>{
+      freshnessTimer=null;
+      const remaining=freshnessDue-performance.now();
+      if(remaining<=0){fail(accepted ? 'no-fresh-frames' : 'connection-or-first-frame-timeout',Error('Quote stream freshness timeout'));return;}
+      freshnessTimer=setTimeout(checkFreshness,remaining);freshnessTimer.unref?.();
+    };
     const watchFreshness=()=>{
-      clearTimeout(freshnessTimer);
-      freshnessTimer=setTimeout(()=>fail(accepted ? 'no-fresh-frames' : 'connection-or-first-frame-timeout',Error('Quote stream freshness timeout')),5000);
-      freshnessTimer.unref?.();
+      freshnessDue=performance.now()+5000;
+      if(!freshnessTimer){freshnessTimer=setTimeout(checkFreshness,5000);freshnessTimer.unref?.();}
     };
     try {
       const url = connectionURL(cfg);
@@ -266,19 +298,12 @@ class MT5VPSAdapter extends ExecutionAdapter {
       request = https.request(url,{method:'GET',agent:this.agents.quotes,...tls,
         headers:{authorization:`Bearer ${cfg.token}`}}, response => {
         if (response.statusCode !== 200) { response.resume(); fail('http-'+response.statusCode,Error('Quote stream unavailable')); return; }
-        let buffer = '';
         response.setEncoding('utf8');
-        response.on('data',chunk => {
-          try {
-            buffer += chunk;
-            if (buffer.length > 131072) throw Error('Quote stream frame too large');
-            let boundary;
-            while ((boundary=buffer.indexOf('\n')) >= 0) {
-              const line = buffer.slice(0,boundary); buffer = buffer.slice(boundary+1);
-              if (line) {
-                const frame=JSON.parse(line);
+        frameReader=createQuoteFrameReader((frame,arrival)=>{
+                const workStarted=performance.now();
                 const usable=this.acceptQuoteFrame(frame,{discardStale:true});
-                const timing=this.quoteContinuity.observe(frame.capturedAt,Date.now(),performance.now(),usable,this.streamDiagnostics.attempts);
+                const timing=this.quoteContinuity.observe(frame.capturedAt,arrival.receivedAt,arrival.arrivalPerf,usable,this.streamDiagnostics.attempts,
+                  {...arrival,publishedAt:frame.publishedAt,writeStartedAt:frame.writeStartedAt,quoteTiming:frame.quoteTiming,frameWorkMs:performance.now()-workStarted});
                 this.eventBus.emit('quote:timing',timing);
                 if (timing.arrivalGapMs>=750 || timing.captureGapMs>=750) this.recordQuoteStream('frame-gap','capture-vs-arrival',timing);
                 // Authenticated expired frames prove this stream is still alive.
@@ -293,7 +318,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
                   this.streamDiagnostics.discardedFrames++;
                   if (!discarding) this.recordQuoteStream('delayed','expired-frame',timing);
                   discarding=true;
-                  continue;
+                  return;
                 }
                 clearTimeout(backlogTimer);backlogTimer=null;
                 const now=Date.now(),previous=this.streamDiagnostics.lastFrameAt;
@@ -304,10 +329,8 @@ class MT5VPSAdapter extends ExecutionAdapter {
                 this.streamFailures=0;
                 if (!accepted || discarding || gap>=1000) this.recordQuoteStream('receiving',discarding ? 'backlog-recovered' : !accepted ? 'first-frame' : 'gap-recovered',timing);
                 accepted=true;discarding=false;
-              }
-            }
-          } catch (error) { fail('invalid-frame',error); }
-        });
+        },error=>fail('invalid-frame',error));
+        response.on('data',chunk=>frameReader.push(chunk));
         response.on('error',error => fail('response-error',error));
         response.on('end',() => fail('response-ended'));
         response.on('close',() => {if (!request.destroyed) fail('response-closed');});
@@ -316,6 +339,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
       watchFreshness();
       request.on('error',() => {if(reason==='connection-closed')reason='transport-error';});
       request.on('close',() => {
+        frameReader?.close();
         clearTimeout(freshnessTimer);
         clearTimeout(backlogTimer);
         clearInterval(loopTimer);
@@ -340,7 +364,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     clearTimeout(this.streamTimer);
     this.streamTimer = null;
     this.streamRequest?.destroy();
-    this.agents?.commands.destroy(); this.agents?.execution?.destroy(); this.agents?.entryControl?.destroy(); this.agents?.entryStop?.destroy(); this.agents?.quotes.destroy();
+    for(const agent of Object.values(this.agents || {}))agent.destroy();
     this.linkedWarmConnection?.close();
     this.snapshots.clear();
   }
@@ -351,7 +375,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     return result;
   }
   validateManagementState(state, endpointState=state) {
-    if(state?.evidenceReady===false)throw Error('Проверяем состояние сделки');
+    if(state?.evidenceReady===false){const error=Error('Проверяем состояние сделки');error.code='MT5_VIEW_PENDING';throw error;}
     if (!state?.connected || Number(state.account) !== Number(this.config.account) || state.server !== this.config.server
       || !Array.isArray(state.orders) || !Array.isArray(state.capabilities)) throw Error('Некорректный снимок счёта MT5');
     // A nested account view describes its native worker. Entry-engine routing
@@ -372,7 +396,16 @@ class MT5VPSAdapter extends ExecutionAdapter {
     if(Array.isArray(endpointState?.capabilities)) {
       this.capabilities = [...endpointState.capabilities]; this.capabilitiesAt = Date.now();
     }
+    this.rememberProtectionDispatch(endpointState);
     return true;
+  }
+  rememberProtectionDispatch(state) {
+    // Retain authenticated routing identity only. The VPS must prove the
+    // captured position again; this cache never authorizes an entry or close.
+    if(!this.capabilities.includes(EXACT_PROTECTION_CAPABILITY) || !state)return;
+    const identity=view=>({account:view.account,server:view.server,capabilities:[...(view.capabilities || [])]});
+    this.protectionDispatchState={...identity(state),accountStates:Object.fromEntries(
+      Object.entries(state.accountStates || {}).map(([account,view])=>[account,identity(view)]))};
   }
   cacheManagementResponse(raw,generation) {
     const state=managementFreshness(raw,Date.now());
@@ -407,19 +440,33 @@ class MT5VPSAdapter extends ExecutionAdapter {
     // Ticket histories are requested only for the captured opening group.
     // They must never be satisfied by an ordinary cached management snapshot.
     if (watch?.length) {
+      const key=JSON.stringify(watch.map(row=>[String(row.account),String(row.ticket),row.symbol]).sort());
+      this.managementWatchedReads ||= new Map();
+      if(this.managementWatchedReads.has(key))return this.managementWatchedReads.get(key);
       const generation=this.managementRequestGeneration=(this.managementRequestGeneration || 0)+1;
-      const raw=await this.request('/management?watch='+encodeURIComponent(JSON.stringify(watch)));
-      return this.cacheManagementResponse(raw,generation);
+      const pending=this.request(this.managementRoute(watch)).then(raw=>this.cacheManagementResponse(raw,generation))
+        .finally(()=>{if(this.managementWatchedReads.get(key)===pending)this.managementWatchedReads.delete(key);});
+      this.managementWatchedReads.set(key,pending);
+      return pending;
     }
     const age=Date.now()-Number(this.managementStateAt || 0);
     if (this.managementStateView && age>=0 && age<=maxAgeMs) return managementFreshness(this.managementStateView,this.managementStateAt);
     if (!this.managementReading) this.managementReading=(async()=>{
       const generation=this.managementRequestGeneration=(this.managementRequestGeneration || 0)+1;
-      const raw=await this.request('/management');
+      const raw=await this.request(this.managementRoute());
       return this.cacheManagementResponse(raw,generation);
     })().finally(()=>{this.managementReading=null;});
     return this.managementReading;
   }
+  managementRoute(watch) {
+    const query=[];
+    if(watch?.length)query.push('watch='+encodeURIComponent(JSON.stringify(watch)));
+    if(!this.config.routePrefix && this.capabilities.includes('management-active-v1'))query.push('view=active');
+    return '/management'+(query.length?'?'+query.join('&'):'');
+  }
+  // Explicit full history remains available without replacing the current
+  // position proof cache or affecting native command preflight.
+  async managementHistory() {return this.request('/management');}
   async maintainManagementSnapshot() {
     const age=Date.now()-Number(this.managementSnapshot?.at || 0);
     const interested=this.managementHasPositions || Date.now()<this.managementLeaseUntil;
@@ -558,17 +605,28 @@ class MT5VPSAdapter extends ExecutionAdapter {
   }
   validateCommandReceipt(id, result) {
     const record=this.commandJournal?.records.find(row=>row.id===id);
-    if(!record || !['entry-protection','entry-close'].includes(record.operation))return result;
+    if(record?.operation==='entry-take'){
+      if(!result || result.id!==id || result.entryId!==record.payload.entryId || !['ok','rejected','unknown'].includes(result.status))return null;
+      if(result.status==='ok' && (result.rule?.entryId!==record.payload.entryId || result.rule?.symbol!==record.payload.symbol
+        || Object.keys(result.rule?.accounts || {}).sort().join(',')!==[...record.payload.capturedAccounts].sort().join(',')
+        || result.rule?.id!==(record.payload.operation==='arm'?id:record.payload.ruleId)))return null;
+      return result;
+    }
+    if(!record || !['entry-protection','entry-close','entry-partial-close'].includes(record.operation))return result;
     if(!result || typeof result!=='object' || Array.isArray(result) || result.id!==id
       || result.entryId!==record.payload?.entryId || !['ok','rejected','unknown'].includes(result.status))return null;
     if(result.status==='ok') {
-      const accounts=record.operation==='entry-close' ? record.payload.capturedAccounts
+      const accounts=record.operation!=='entry-protection' ? record.payload.capturedAccounts
         : [record.payload.account,...(record.payload.mirrorAccounts || []).map(row=>row.account)];
       if(!Array.isArray(accounts) || !accounts.length || accounts.length>32
         || accounts.some(account=>typeof account!=='string' || !/^[1-9][0-9]{0,19}$/.test(account))
         || new Set(accounts).size!==accounts.length || !result.accountResults || Array.isArray(result.accountResults)
         || Object.keys(result.accountResults).length!==accounts.length
         || accounts.some(account=>result.accountResults[account]?.status!=='ok'))return null;
+      if(record.operation==='entry-partial-close' && (result.closePercent!==record.payload.closePercent
+        || accounts.some(account=>!Number.isFinite(result.accountResults[account].filledVolume)
+          || result.accountResults[account].filledVolume<0 || !Number.isFinite(result.accountResults[account].remainingVolume)
+          || result.accountResults[account].remainingVolume<0)))return null;
     }
     return result;
   }
@@ -664,11 +722,13 @@ class MT5VPSAdapter extends ExecutionAdapter {
     } catch (error) { return {status:'rejected',provider:this.provider,reason:error.message}; }
   }
   async modifyEntryProtection(target, changes = {}, {account=String(this.config.account),operation='modify'} = {}) {
-    let submitted=false,scope,ownsScope=false;
+    let submitted=false,scope,ownsScope=false,request;
+    const preparationStarted=performance.now(),preparation={};
     const clickAt=Number.isFinite(target?.clickAt) && Date.now()-target.clickAt>=0 && Date.now()-target.clickAt<=60000 ? target.clickAt : Date.now();
     try {
       if(this.config.routePrefix)throw Error('Общий стоп и тейк БМЛ/СМЛ отправляются через основной приёмник VPS.');
-      if(this.closed || this.connectionRestarting || this.accountEnrollmentBusy)throw Error('Подключение обновляется. Дождись готовности счетов.');
+      const fast=this.capabilities.includes(EXACT_PROTECTION_CAPABILITY);
+      if(this.closed || !fast && this.connectionRestarting || this.accountEnrollmentBusy)throw Error('Подключение обновляется. Дождись готовности счетов.');
       if(!this.commandJournal)throw Error('Не подключён журнал команд защиты БМЛ/СМЛ.');
       const captured=entryPlanMetadata(target),selected=String(account);
       if(!['modify','breakeven'].includes(operation))throw Error('Неизвестное изменение защиты набора БМЛ/СМЛ.');
@@ -678,18 +738,24 @@ class MT5VPSAdapter extends ExecutionAdapter {
       ownsScope=true;
       // Always resolve ownership again on the primary transport, including a
       // separately selected follower. Renderer data never selects the tickets.
-      const state=await this.managementState({maxAgeMs:-1});
+      const state=fast ? this.managementStateView || this.protectionDispatchState : await this.managementState({maxAgeMs:-1});
+      if(!state)throw Error('Нет подтверждённых данных набора. Обнови список.');
+      preparation.managementSource=fast?'exact-parent-vps-proof':'fresh-read';
       const primary=state.accountStates?.[String(this.config.account)] || state;
-      if(!primary.connected || !primary.capabilities?.includes(ENTRY_PROTECTION_CAPABILITY))throw Error('Обнови и подключи основной приёмник VPS для защиты БМЛ/СМЛ.');
+      if(!fast && !primary.connected || !primary.capabilities?.includes(ENTRY_PROTECTION_CAPABILITY))throw Error('Обнови и подключи основной приёмник VPS для защиты БМЛ/СМЛ.');
       const view=state.accountStates?.[selected] || (String(state.account)===selected ? state : null);
-      if(!view?.connected || view.evidenceReady===false || view.server!==this.config.server || String(view.account)!==selected || !Array.isArray(view.orders))throw Error('Нет подтверждённых данных выбранного счёта MT5.');
-      const row=view.orders.find(row=>String(row.ticket)===String(target.ticket) && row.symbol===this.brokerSymbol(target.symbol) && row.__isPosition===target.__isPosition);
+      if(!view || view.server!==this.config.server || String(view.account)!==selected
+        || !fast && (!view.connected || view.evidenceReady===false || !Array.isArray(view.orders)))throw Error('Нет подтверждённых данных выбранного счёта MT5.');
+      if(fast)this.rememberProtectionDispatch(state);
+      const row=fast ? target : view.orders.find(row=>String(row.ticket)===String(target.ticket) && row.symbol===this.brokerSymbol(target.symbol) && row.__isPosition===target.__isPosition);
       if(!row)throw Error('Выбранная позиция или заявка уже отсутствует. Обнови список.');
       const plan=entryPlanMetadata(row);
+      const independent=independentControls(plan,primary.capabilities);
       if(plan.id!==captured.id || plan.side!==captured.side || JSON.stringify(plan.accounts)!==JSON.stringify(captured.accounts))throw Error('Принадлежность позиции набору БМЛ/СМЛ изменилась. Обнови список.');
       if(this.commandJournal)await this.commandJournal.reconcile(async id=>this.validateCommandReceipt(id,(await this.request(`/receipt?id=${encodeURIComponent(id)}`)).result),{ticket:scope});
-      if(this.commandJournal.records.some(command=>command.ticket===scope && command.result?.status==='unknown'))return {status:'unknown',provider:this.provider,reason:'Есть неподтверждённая команда для всего набора БМЛ/СМЛ. Повтор заблокирован.'};
-      const blocked=entryProtectionBlock({row,account:selected,linked:target.singleAccount!==true,capabilities:view.capabilities,
+      if(this.commandJournal.records.some(command=>command.ticket===scope && command.result?.status==='unknown'
+        && !(independent && command.payload?.independentAccountControls===true)))return {status:'unknown',provider:this.provider,reason:'Есть неподтверждённая команда для всего набора БМЛ/СМЛ. Повтор заблокирован.'};
+      const blocked=(fast ? exactEntryProtectionBlock : entryProtectionBlock)({row,account:selected,linked:target.singleAccount!==true,capabilities:fast?this.capabilities:view.capabilities,
         commands:this.commandJournal?.records || [],accountStates:state.accountStates || {[selected]:view}});
       if(blocked)throw Error(blocked);
       const values={};
@@ -700,15 +766,25 @@ class MT5VPSAdapter extends ExecutionAdapter {
         values[key]=value;
       }
       if(operation==='modify' && !Object.keys(values).length)throw Error('Нет изменений стопа или тейка.');
-      const request={id:randomUUID(),entryId:plan.id,symbol:row.symbol,operation,account:selected,...values,expiresAt:Date.now()+2000};
+      request={id:randomUUID(),entryId:plan.id,symbol:row.symbol,operation,account:selected,...values,expiresAt:Date.now()+2000};
+      if(fast) {
+        if(row.__isPosition!==true || !/^[1-9][0-9]{0,19}$/.test(String(row.ticket))
+          || ![row.lots,row.open_price,row.sl].every(value=>Number.isFinite(value)&&value>0)
+          || !Number.isFinite(row.tp) || row.tp<0)throw Error('Некорректная выбранная позиция набора.');
+        request.capturedAccounts=[...captured.accounts];request.capturedSide=captured.side;
+        request.capturedTarget={account:selected,ticket:String(row.ticket),volume:row.lots,fillPrice:row.open_price,sl:row.sl,tp:row.tp};
+      }
       if(target.singleAccount!==true) {
         const mirrors=plan.accounts.filter(value=>value!==selected);
         if(mirrors.length)request.mirrorAccounts=mirrors.map(account=>({account}));
       }
-      // Whole-parent uncertainty is stricter than an ordinary linked ticket:
-      // even a known primary result cannot authorize a second parent command.
-      const send=async()=>{
+      // Independent account engines retain their own unresolved-send guards.
+      // A new user intent must reach each healthy account, even when a peer
+      // failed. Legacy whole-parent commands retain the original barrier.
+      const send=async(journalTiming)=>{
         const macBeforeSendMs=Math.max(0,Date.now()-clickAt);
+        preparation.totalMs=Number((performance.now()-preparationStarted).toFixed(3));
+        preparation.journalMs=journalTiming?.journalTotalMs;
         const response=await this.request('/entry-plan-protection',request,{execution:true});
         const result=response.result;
         if(!result || result.id!==request.id || result.entryId!==plan.id || !['ok','rejected','unknown'].includes(result.status))throw Error('VPS не подтвердил команду защиты всего набора.');
@@ -717,25 +793,28 @@ class MT5VPSAdapter extends ExecutionAdapter {
           || accounts.some(value=>result.accountResults?.[value]?.status!=='ok')))throw Error('VPS не подтвердил защиту на всех выбранных счетах.');
         const entry=controlEntry(response.entry,result,{id:plan.id,symbol:row.symbol,side:plan.side,accounts:plan.accounts},'entry-protection');
         return {...result,...(entry ? {entry} : {}),timings:{...result.timings,server:response.serverTiming || result.timings?.server,transport:response.transportTiming,
-          macBeforeSendMs,macClickToResultMs:Math.max(0,Date.now()-clickAt)}};
+          macBeforeSendMs,macClickToResultMs:Math.max(0,Date.now()-clickAt),macPreparation:{...preparation}}};
       };
       submitted=true;
-      const result=this.commandJournal ? await this.commandJournal.run('entry-protection',{...request,ticket:scope},send)
+      const result=this.commandJournal ? await this.commandJournal.run('entry-protection',{...request,ticket:scope,...(independent ? {independentAccountControls:true} : {})},send)
         : await send();
       this.managementSnapshot=null;this.managementStateView=null;
       if(result.entry)require('./entryLifecycle').rememberEntry(this,result.entry);
-      return {...result,provider:this.provider};
+      return {id:request.id,entryId:plan.id,...result,provider:this.provider};
     } catch(error) {
       if(submitted){this.managementSnapshot=null;this.managementStateView=null;}
-      return {status:submitted?'unknown':'rejected',provider:this.provider,reason:error.message};
+      return {status:submitted?'unknown':'rejected',...(submitted && request ? {id:request.id,entryId:request.entryId} : {}),provider:this.provider,reason:error.message};
     } finally {if(ownsScope)this.inFlight.delete(scope);}
   }
-  async closeEntryPosition(entry, {clickAt=Date.now()} = {}) {
+  async closeEntryPosition(entry, {clickAt=Date.now(),closePercent} = {}) {
     let scope,ownsScope=false,submitted=false;
     const preparationStarted=performance.now(),preparation={};
     try {
       if(this.config.routePrefix || this.closed || this.connectionRestarting || this.accountEnrollmentBusy)throw Error('Дождись готовности основного приёмника VPS.');
       if(!this.commandJournal)throw Error('Не подключён журнал команд БМЛ/СМЛ.');
+      const partial=closePercent!==undefined,operation=partial?'entry-partial-close':'entry-close';
+      if(partial && (!Number.isFinite(closePercent) || closePercent<=0 || closePercent>=100))throw Error('Процент закрытия набора должен быть больше 0 и меньше 100.');
+      if(partial && !this.capabilities.includes(PARENT_PARTIAL_CAPABILITY))throw Error('Обнови приёмник VPS для закрытия части всего набора на связанных счетах.');
       if(!entry || typeof entry.id!=='string' || !/^[A-Za-z0-9_.:-]{1,100}$/.test(entry.id))throw Error('Нет номера всего набора БМЛ/СМЛ.');
       scope=`entry:${entry.id}`;
       if(this.inFlight.has(scope))return {status:'unknown',provider:this.provider,reason:'Команда для всего набора БМЛ/СМЛ уже выполняется.'};
@@ -784,22 +863,29 @@ class MT5VPSAdapter extends ExecutionAdapter {
       }
       preparation.managementReadMs=Number((performance.now()-managementStarted).toFixed(3));
       const {parent,accounts}=context;
+      const independent=parent.accountExecution==='independent-v5' && this.capabilities.includes(ACCOUNT_CONTROL_CAPABILITY);
       const reconciliationStarted=performance.now();
       await this.commandJournal.reconcile(async id=>this.validateCommandReceipt(id,(await this.request(`/receipt?id=${encodeURIComponent(id)}`)).result),{ticket:scope});
       preparation.receiptReconciliationMs=Number((performance.now()-reconciliationStarted).toFixed(3));
-      if(this.commandJournal.records.some(command=>command.ticket===scope && command.result?.status==='unknown'))return {status:'unknown',provider:this.provider,reason:'Есть неподтверждённая команда для всего набора БМЛ/СМЛ. Повтор заблокирован.'};
+      if(this.commandJournal.records.some(command=>command.ticket===scope && command.result?.status==='unknown'
+        && !(independent && command.payload?.independentAccountControls===true)))return {status:'unknown',provider:this.provider,reason:'Есть неподтверждённая команда для всего набора БМЛ/СМЛ. Повтор заблокирован.'};
       if(!Number.isFinite(clickAt) || Date.now()-clickAt<0 || Date.now()-clickAt>60000)clickAt=Date.now();
       const request={id:randomUUID(),entryId:parent.id,symbol:parent.symbol,expiresAt:Date.now()+2000};
+      if(partial)request.closePercent=closePercent;
       submitted=true;
       const journalStarted=performance.now();
-      const result=await this.commandJournal.run('entry-close',{...request,ticket:scope,capturedAccounts:accounts},async()=>{
+      const result=await this.commandJournal.run(operation,{...request,ticket:scope,capturedAccounts:accounts,...(independent ? {independentAccountControls:true} : {})},async()=>{
         const macBeforeSendMs=Math.max(0,Date.now()-clickAt);
         preparation.journalBeforeSendMs=Number((performance.now()-journalStarted).toFixed(3));
         preparation.totalMs=Number((performance.now()-preparationStarted).toFixed(3));
         const response=await this.request('/entry-plan-close',request,{execution:true}),value=response.result;
         if(!value || value.id!==request.id || value.entryId!==parent.id || !['ok','rejected','unknown'].includes(value.status)
           || value.status==='ok' && (Object.keys(value.accountResults || {}).length!==accounts.length || accounts.some(account=>value.accountResults?.[account]?.status!=='ok')))throw Error('VPS не подтвердил закрытие всего набора БМЛ/СМЛ.');
-        const entry=controlEntry(response.entry,value,{id:parent.id,symbol:parent.symbol,side:parent.side,accounts},'entry-close');
+        if(partial && (value.closePercent!==closePercent || value.status==='ok' && accounts.some(account=>{
+          const result=value.accountResults[account];
+          return !Number.isFinite(result.filledVolume) || result.filledVolume<0 || !Number.isFinite(result.remainingVolume) || result.remainingVolume<0;
+        })))throw Error('VPS не подтвердил точный процент и остатки каждого счёта.');
+        const entry=controlEntry(response.entry,value,{id:parent.id,symbol:parent.symbol,side:parent.side,accounts},operation);
         return {...value,...(entry ? {entry} : {}),timings:{...value.timings,server:response.serverTiming || value.timings?.server,transport:response.transportTiming,
           macBeforeSendMs,macClickToResultMs:Math.max(0,Date.now()-clickAt),macPreparation:{...preparation}}};
       });
@@ -817,6 +903,35 @@ class MT5VPSAdapter extends ExecutionAdapter {
       : row.mirrorAccount ? {mirrorAccount:String(row.mirrorAccount)} : {};
   }
   async listCloseRules() { return (await this.request('/close-rules')).rules; }
+  async configureParentTake(row, options) {
+    let scope,submitted=false,owned=false;
+    try{
+      if(this.config.routePrefix || this.closed || this.connectionRestarting || this.accountEnrollmentBusy)throw Error('Дождись готовности основного приёмника VPS.');
+      if(!this.capabilities.includes('entry-parent-partial-take-v1') || !this.commandJournal)throw Error('Обнови приёмник VPS для отдельного частичного тейка всего набора.');
+      const plan=entryPlanMetadata(row),operation=options?.operation;
+      scope=`entry:${plan.id}`;
+      if(this.inFlight.has(scope))return {status:'unknown',reason:'Команда для этого набора уже выполняется.'};
+      this.inFlight.add(scope);owned=true;
+      const request={id:randomUUID(),entryId:plan.id,symbol:this.brokerSymbol(row.symbol),operation,expiresAt:Date.now()+3000};
+      if(operation==='arm'){
+        const targetPrice=Number(options.targetPrice),closePercent=Number(options.closePercent);
+        if(!Number.isFinite(targetPrice) || targetPrice<=0 || !Number.isFinite(closePercent) || closePercent<=0 || closePercent>=100)throw Error('Проверь цену и процент частичного тейка.');
+        Object.assign(request,{targetPrice,closePercent});
+      }else if(operation==='cancel' && typeof options.ruleId==='string')request.ruleId=options.ruleId;
+      else throw Error('Неверная команда частичного тейка.');
+      await this.commandJournal.reconcile(async id=>this.validateCommandReceipt(id,(await this.request('/receipt?id='+encodeURIComponent(id))).result),{ticket:scope});
+      submitted=true;
+      const result=await this.commandJournal.run('entry-take',{...request,ticket:scope,capturedAccounts:plan.accounts},async()=>{
+        const response=await this.request('/entry-parent-take',request,{execution:true});
+        const result=this.validateCommandReceipt(request.id,response.result);
+        if(!result)throw Error('VPS не подтвердил частичный тейк точного набора.');
+        return result;
+      });
+      this.managementSnapshot=null;this.managementStateView=null;
+      return result;
+    }catch(error){return {status:submitted?'unknown':'rejected',reason:error.message};}
+    finally{if(owned)this.inFlight.delete(scope);}
+  }
   async schedulePartialClose(position, volume, targetPrice, comparison, percent) {
     try {
       const row = await this.findManagementTarget(position,true);

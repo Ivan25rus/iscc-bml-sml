@@ -8,6 +8,8 @@ function createFeaturePolicy(features){
   // active plans, stop/cancel/reconciliation and saved rules stay available.
   function allow(channel,payload={}){
     if(channel==='mt5-vps:manage'){
+      if(payload.action==='entry-partial-close')return has('partial-close');
+      if(payload.action==='entry-take')return payload.take?.operation==='cancel' ? has('management') : has('price-close');
       if(['cancel-close','cancel-time-exit'].includes(payload.action))return has('management');
       if(payload.action==='schedule-close')return has('price-close');
       if(payload.action==='close')return has('management') && (has('partial-close') ||

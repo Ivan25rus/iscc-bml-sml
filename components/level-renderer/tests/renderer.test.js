@@ -142,7 +142,7 @@ test('disabled page reader never accesses TradingView', async () => {
 });
 
 test('a failed chart does not block later chart snapshots', async () => {
-  const fixture=readerHarness({getTargets:async()=>[{id:'bad'},{id:'good'}],run:async(_url,expression)=>{
+  const fixture=readerHarness({getTargets:async()=>[{id:'bad',webSocketDebuggerUrl:'ws://127.0.0.1:9222/devtools/page/bad'},{id:'good',webSocketDebuggerUrl:'ws://127.0.0.1:9222/devtools/page/good'}],run:async(_url,expression)=>{
     if(expression.includes('collect: (')) {
       if(!fixture.tried){fixture.tried=true;throw Error('one chart unavailable');}
     }
@@ -180,7 +180,7 @@ test('unchanged addon reads refresh scoped inventory proof without replaying sou
 test('a failed addon read discards cached inventory before recovery', async () => {
   const inventories=[];let reads=0;
   const fixture=readerHarness({acceptInventory:value=>inventories.push(value),
-    getTargets:async()=>[{id:'one',url:'https://tradingview.com/chart/probe/'}],
+    getTargets:async()=>[{id:'one',url:'https://tradingview.com/chart/probe/',webSocketDebuggerUrl:'ws://127.0.0.1:9222/devtools/page/one'}],
     run:async()=>{
       if(++reads===1)return {sources:[],series:[],token:'one:1',
         inventory:{scope:'probe',complete:true,symbols:[]}};
@@ -192,4 +192,33 @@ test('a failed addon read discards cached inventory before recovery', async () =
     assert.equal(fixture.errors.length,1);
     assert.equal(inventories.length,0);
   } finally {fixture.reader.stop();}
+});
+
+test('addon discovery includes inaccessible chart origins before reading accessible drawings',async()=>{
+  const events=[];const fixture=readerHarness({
+    getTargets:async()=>[{id:'one',url:'https://tradingview.com/chart/probe/',webSocketDebuggerUrl:'ws://127.0.0.1:9222/devtools/page/one'},
+      {id:'two',url:'https://tradingview.com/chart/other/'}],
+    acceptOpenCharts:scopes=>events.push({scopes}),acceptSnapshot:()=>events.push({snapshot:true})});
+  try{await fixture.next();assert.deepEqual(events[0],{scopes:['probe','other']});assert.deepEqual(events[1],{snapshot:true});
+    assert.equal(fixture.expressions.length,1);
+  }finally{fixture.reader.stop();}
+});
+
+test('failed addon discovery invalidates topology instead of reusing a prior proof',async()=>{
+  const events=[];let failed=false;const fixture=readerHarness({
+    getTargets:async()=>{if(failed)throw Error('offline');return [];},acceptOpenCharts:scopes=>events.push(scopes)});
+  try{await fixture.next();failed=true;await fixture.next();assert.deepEqual(events,[[],null]);}
+  finally{fixture.reader.stop();}
+});
+
+test('missing old candle history uses a bounded separate query and a refresh requested in flight survives',async()=>{
+  const snapshots=[],anchor={symbol:'CAPITALCOM:NAS100',interval:'D1',time:1789336800};let fixture;
+  fixture=readerHarness({anchors:()=>[anchor],acceptSnapshot:value=>snapshots.push(value),
+    run:async(_url,expression)=>{
+      if(expression.includes('readCandleHistory')){fixture.reader.refresh();return {symbol:anchor.symbol,interval:'D1',bars:[[anchor.time,100,90]],windows:[[anchor.time,anchor.time+86400]]};}
+      return {sources:[],series:[],token:'one:1'};
+    }});
+  try{await fixture.next();assert.equal(snapshots.length,2);assert.equal(snapshots[1].series[0].interval,'D1');
+    assert.equal([...fixture.timers.values()][0].delay,250);
+  }finally{fixture.reader.stop();}
 });

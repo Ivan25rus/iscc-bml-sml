@@ -37,6 +37,11 @@ test('partial exit does not implicitly expose a new price or time rule',()=>{
  assert.equal(policy.allow('mt5-vps:manage',{action:'schedule-close'}),false);
  assert.equal(policy.allow('mt5-vps:save-time-exit'),false);
  assert.ok(createFeaturePolicy(['price-close']).allow('mt5-vps:manage',{action:'schedule-close'}));
+ assert.ok(policy.allow('mt5-vps:manage',{action:'entry-partial-close',closePercent:50}));
+ assert.equal(createFeaturePolicy(['management']).allow('mt5-vps:manage',{action:'entry-partial-close',closePercent:50}),false);
+ assert.equal(policy.allow('mt5-vps:manage',{action:'entry-take',take:{operation:'arm'}}),false);
+ assert.ok(createFeaturePolicy(['price-close']).allow('mt5-vps:manage',{action:'entry-take',take:{operation:'arm'}}));
+ assert.ok(createFeaturePolicy(['management']).allow('mt5-vps:manage',{action:'entry-take',take:{operation:'cancel'}}));
 });
 test('unselected new entry is blocked but stopping an existing plan remains available',async()=>{
  const calls=[],addon=createBmlSml({features:['management'],enabled:()=>true,
@@ -47,4 +52,22 @@ test('unselected new entry is blocked but stopping an existing plan remains avai
 test('levels-only renderer does not load or mount trading dialogs',()=>{
  require('../module/renderer').mount({features:['levels-to-lt'],ipc:{invoke:()=>assert.fail('Unexpected IPC')},
   toolbar:{append:()=>assert.fail('Unexpected trading UI')}});
+});
+test('selected management retains quote events and does not expose partial-take actions',async()=>{
+ const name=require.resolve('../payload/src/app/services/mt5-vps/management');
+ const original=require(name),calls=[];let mounted;
+ require.cache[name].exports={mountManagement:(...args)=>mounted=args};
+ try{
+  const ipc={invoke:(...args)=>{calls.push(['invoke',...args]);return Promise.resolve({status:'ok'});},
+   on:(...args)=>calls.push(['on',...args]),removeListener:(...args)=>calls.push(['remove',...args])};
+  const getInstrumentInfo=()=>({bid:100,ask:101});
+  require('../module/renderer').mount({features:['management'],ipc,toolbar:{},getInstrumentInfo});
+  const [selected,,options]=mounted;assert.equal(options.getInstrumentInfo,getInstrumentInfo);
+  assert.equal(options.partialClose,false);assert.equal(options.priceClose,false);
+  const callback=()=>{};selected.on('instrument:updated',callback);selected.removeListener('instrument:updated',callback);
+  assert.equal((await selected.invoke('mt5-vps:manage',{action:'entry-take',take:{operation:'arm'}})).status,'rejected');
+  assert.equal(calls.filter(row=>row[0]==='invoke').length,0);
+  await selected.invoke('mt5-vps:manage',{action:'entry-close'});
+  assert.deepEqual(calls.map(row=>row[0]),['on','remove','invoke']);
+ }finally{require.cache[name].exports=original;}
 });

@@ -1,9 +1,21 @@
 {
   "schema": 1,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "kind": "iscc-bml-sml-integration-kit",
   "receiverVersion": 39,
   "executionPolicy": "hybrid-market-limit-v1",
+  "capabilitiesByFeature": {
+    "management": [
+      "entry-exact-parent-protection-v1",
+      "minute-chart-bars-v1"
+    ],
+    "partial-close": [
+      "entry-parent-partial-close-v1"
+    ],
+    "price-close": [
+      "entry-parent-partial-take-v1"
+    ]
+  },
   "accountExecution": "independent-v5",
   "riskPolicy": "initial-sizing-fixed-target",
   "personalProgressIncluded": false,
@@ -13,7 +25,7 @@
   "partialCloseIncluded": true,
   "featureSelectionSchema": 2,
   "levelRendererIncluded": true,
-  "levelRendererVersion": "0.1.4",
+  "levelRendererVersion": "0.2.0",
   "indicatorVersion": "1.17",
   "defaultEnabled": false,
   "fullAuthorPanelIncluded": false,

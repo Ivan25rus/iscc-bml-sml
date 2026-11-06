@@ -40,7 +40,14 @@ function snapshotCandlePage(makeWindowReader = candleWindowReader, options = {})
   const symbols = new Set(Array.isArray(options.sources) ? options.sources.slice(0, 32)
     : ['CAPITALCOM:NAS100', 'SPREADEX:SPX', 'CAPITALCOM:US500']);
   const collection = window._exposed_chartWidgetCollection;
-  if (!collection?.getAll || collection.readOnly?.()) return { sources: [], series: [] };
+  if (!collection?.getAll) return { sources: [], series: [] };
+  const layouts = options.sourceLayouts || {}, readOnly = collection.readOnly?.() === true;
+  const scoped = /^[A-Za-z0-9_-]{1,128}$/.test(options.scope || '');
+  for (const symbol of symbols) {
+    const selected = layouts[symbol];
+    if ((selected && (!scoped || selected !== options.scope)) || (readOnly && (!selected || !scoped))) symbols.delete(symbol);
+  }
+  if (readOnly && !symbols.size) return { sources: [], series: [] };
   const sources = [], series = [], panels = [], needed = new Map();
   const widgets = collection.getAll();
   const inventory = /^[A-Za-z0-9_-]{1,128}$/.test(options.scope || '')
@@ -74,23 +81,37 @@ function snapshotCandlePage(makeWindowReader = candleWindowReader, options = {})
     const model = widget.model?.(), main = model?.mainSeries?.();
     const symbol = main?.symbol?.();
     if (!symbols.has(symbol)) continue;
-    if (!inventories.has(symbol)) inventories.set(symbol, { symbol, ids: new Set(), complete: true });
+    if (!inventories.has(symbol)) inventories.set(symbol, { symbol, ids: new Set(), complete: true, unsafe: false, pendingSaveIds: new Set() });
     const contents = inventories.get(symbol);
     const synchronizer = widget.lineToolsSynchronizer?.();
     if (widget.isReady?.() !== true || widget._inLoadingState === true || collection._loadingContent === true
-      || synchronizer?.hasPendingLoadRequests?.() !== false
-      || synchronizer?.hasPendingSaveRequests?.() !== false) contents.complete = false;
-    if (main.isLoading()) { contents.complete = false; continue; }
+      || synchronizer?.hasPendingLoadRequests?.() !== false) contents.unsafe = true;
+    if (synchronizer?.hasPendingSaveRequests?.() !== false) {
+      contents.complete = false;
+      // Switching symbols can strand a deletion for the previous symbol. Send
+      // only its IDs for host-side classification; unknown changes still veto
+      // deletion. Never bypass an in-flight save, group change or present tool.
+      const pending = synchronizer?._invalidatedLineToolsAndStudyStubs;
+      if (synchronizer?._pendingSaveRequestsCounter === 0 && pending instanceof Map && pending.size > 0 && pending.size <= 2000
+        && synchronizer._invalidatedLineToolGroups instanceof Map && !synchronizer._invalidatedLineToolGroups.size
+        && synchronizer._migratedSharedLineToolsDuplicates instanceof Set && !synchronizer._migratedSharedLineToolsDuplicates.size
+        && typeof model.dataSourceForId === 'function'
+        && [...pending.keys()].every(id => typeof id === 'string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(id)
+          && model.dataSourceForId(id) === null)) {
+        for (const id of pending.keys()) contents.pendingSaveIds.add(id);
+      } else contents.unsafe = true;
+    }
+    if (main.isLoading()) { contents.unsafe = true; continue; }
     const interval = String(main.interval());
     panels.push({ widget, widgetIndex, main, symbol, interval });
     const dataSources = model.dataSources();
-    if (dataSources.length > 4000) contents.complete = false;
+    if (dataSources.length > 4000) contents.unsafe = true;
     for (const source of dataSources.slice(0, 4000)) {
       // Saved line tools expose a server timestamp; studies have a different state API.
       if (typeof source.serverUpdateTime !== 'function') continue;
-      if (source.isLoading?.()) { contents.complete = false; continue; }
+      if (source.isLoading?.()) { contents.unsafe = true; continue; }
       const version = source.serverUpdateTime();
-      if (!Number.isFinite(version) || version <= 0) { contents.complete = false; continue; }
+      if (!Number.isFinite(version) || version <= 0) { contents.unsafe = true; continue; }
       const state = source.state();
       if (!['LineToolHorzLine', 'LineToolHorzRay'].includes(state?.type) || state.state?.symbol !== symbol) continue;
       contents.ids.add(source.id());
@@ -172,7 +193,9 @@ function snapshotCandlePage(makeWindowReader = candleWindowReader, options = {})
   }
   const snapshot = { sources, series };
   if (inventory) {
-    inventory.symbols = [...inventories.values()].map(value => ({ ...value, ids: [...value.ids] }));
+    inventory.symbols = [...inventories.values()].map(value => ({ symbol: value.symbol, ids: [...value.ids],
+      complete: value.complete && !value.unsafe,
+      ...(!value.unsafe && value.pendingSaveIds.size ? { pendingSaveIds: [...value.pendingSaveIds] } : {}) }));
     snapshot.inventory = inventory;
   }
   if (!selective) return snapshot;
@@ -230,4 +253,4 @@ async function readCandleHistory(anchor, makeWindowReader = candleWindowReader) 
   } finally {clearTimeout(timer);session.destroy();}
 }
 
-module.exports = { snapshotCandlePage, candleWindowReader };
+module.exports = { snapshotCandlePage, candleWindowReader, readCandleHistory };

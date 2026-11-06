@@ -63,7 +63,7 @@ def listener_patch(text):
     text = once(text, '    tvProxy.addListener((rec) => {', '''    tvProxy.addListener((rec) => {
       if (rec?.event === 'candle_bars') { candleRenderer.acceptBars(rec); return; }''')
     anchor = "          const sourceKey = sourceId != null && sourceId !== '' ? String(sourceId) : null;"
-    text = once(text, anchor, anchor + "\n          if (candleRenderer.acceptSource(sourceKey, src, { local: rec.event === 'http_request' && rec.dir === 'out' })) return;")
+    text = once(text, anchor, anchor + "\n          if (src === null && candleRenderer.acceptRemovalEvent(sourceKey, rec)) return;\n          if (candleRenderer.acceptSource(sourceKey, src, { local: rec.event === 'http_request' && rec.dir === 'out' })) return;")
     return text
 
 

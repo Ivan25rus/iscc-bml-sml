@@ -2,8 +2,16 @@
 // blocking divergence; the VPS independently rechecks every account and ticket.
 const PROTECTION_WARNING='SL или TP на счетах различаются';
 const ENTRY_PROTECTION_CAPABILITY='hybrid-position-protection-v1';
+const ACCOUNT_CONTROL_CAPABILITY='entry-account-controls-v1';
+function independentControls(plan,capabilities=[]) {
+  return plan?.independentAccountControls===true && capabilities.includes(ACCOUNT_CONTROL_CAPABILITY);
+}
+function blocksParentCommand(command,plan,independent) {
+  return (command.ticket===`entry:${plan.id}` || command.payload?.entryId===plan.id)
+    && command.result?.status==='unknown' && !(independent && command.payload?.independentAccountControls===true);
+}
 const ENTRY_POLICY='hybrid-market-limit-v1';
-const {EXACT_CLOSE_CAPABILITY}=require('./entryControlState');
+const {EXACT_CLOSE_CAPABILITY,EXACT_PROTECTION_CAPABILITY}=require('./entryControlState');
 function isEntryPlanRow(row) {
   return Boolean(row && (Object.hasOwn(row,'entryPlan') || row.executionPolicy===ENTRY_POLICY));
 }
@@ -18,30 +26,43 @@ function entryPlanMetadata(row) {
     throw Error('Нет подтверждённых данных всего набора БМЛ/СМЛ. Обнови список и приёмник VPS.');
   return plan;
 }
-function entryProtectionBlock({row,account,linked,capabilities=[],commands=[],accountStates={}}) {
+function entryProtectionBlock({row,account,linked,capabilities=[],commands=[],accountStates={},connectionIndependent=false}) {
   if(!isEntryPlanRow(row))return '';
   let plan;try{plan=entryPlanMetadata(row);}catch(error){return error.message;}
   const selected=String(account);
+  const independent=independentControls(plan,capabilities);
   if(!plan.accounts.includes(selected))return 'Выбранный счёт не входит в этот набор БМЛ/СМЛ.';
   if(!capabilities.includes(ENTRY_PROTECTION_CAPABILITY))return 'Обнови приёмник VPS для общего стопа и тейка БМЛ/СМЛ.';
   if(plan.protectionReady!==true || plan.phase==='unknown' || !Number.isFinite(plan.averagePrice) || plan.averagePrice<=0)
     return 'Защита набора БМЛ/СМЛ ещё не подтверждена. Дождись сверки с MT5.';
-  if(commands.some(command=>(command.ticket===`entry:${plan.id}` || command.payload?.entryId===plan.id)
-    && command.result?.status==='unknown'))return 'Есть неподтверждённая команда для всего набора БМЛ/СМЛ. Повтор заблокирован.';
-  for(const value of linked ? plan.accounts : [selected]) {
+  if(commands.some(command=>blocksParentCommand(command,plan,independent)))return 'Есть неподтверждённая команда для всего набора БМЛ/СМЛ. Повтор заблокирован.';
+  for(const value of linked && !independent ? plan.accounts : [selected]) {
     const state=accountStates[value];
-    if(state?.evidenceReady===false)return 'Проверяем состояние сделки';
-    if(!state?.connected)return 'Нет подтверждённой связи с одним из счетов набора БМЛ/СМЛ.';
-    if(!state.capabilities?.includes(ENTRY_PROTECTION_CAPABILITY))return 'Обнови приёмник VPS на каждом выбранном счёте БМЛ/СМЛ.';
+    if(!connectionIndependent && state?.evidenceReady===false)return 'Проверяем состояние сделки';
+    if(!connectionIndependent && !state?.connected)return 'Нет подтверждённой связи с одним из счетов набора БМЛ/СМЛ.';
+    if(!state?.capabilities?.includes(ENTRY_PROTECTION_CAPABILITY))return 'Обнови приёмник VPS на каждом выбранном счёте БМЛ/СМЛ.';
   }
+  return '';
+}
+function exactEntryProtectionBlock(options) {
+  const {row,account,capabilities=[],commands=[],rules=[],timeRules=[]}=options;
+  if(!capabilities.includes(EXACT_PROTECTION_CAPABILITY))return 'Точный протокол защиты набора недоступен.';
+  if(!isEntryPlanRow(row))return 'Выбери позицию из набора БМЛ/СМЛ.';
+  const blocked=entryProtectionBlock({...options,connectionIndependent:true});
+  if(blocked)return blocked;
+  if(!row?.__isPosition || !row.entryPlan.accounts.includes(String(account)))return 'Выбери позицию из этого набора.';
+  if(commands.some(command=>String(command.ticket)===String(row.ticket) && command.result?.status==='unknown')
+    || rules.some(rule=>String(rule.ticket)===String(row.ticket) && ['unknown','firing'].includes(rule.state))
+    || timeRules.some(rule=>String(rule.ticket)===String(row.ticket) && ['opening','unknown','firing'].includes(rule.state)))
+    return 'Есть неподтверждённая команда для набора. Дождись сверки с MT5; повтор заблокирован.';
   return '';
 }
 function exactEntryCloseBlock({row,account,capabilities=[],commands=[],rules=[],timeRules=[]}) {
   if(!capabilities.includes(EXACT_CLOSE_CAPABILITY))return 'Точный протокол закрытия набора недоступен.';
   let plan;try{plan=entryPlanMetadata(row);}catch(error){return error.message;}
   if(!row.__isPosition || !plan.accounts.includes(String(account)))return 'Выбери позицию из этого набора.';
-  if(commands.some(command=>(command.ticket===`entry:${plan.id}` || command.payload?.entryId===plan.id
-      || String(command.ticket)===String(row.ticket)) && command.result?.status==='unknown')
+  if(commands.some(command=>blocksParentCommand(command,plan,independentControls(plan,capabilities))
+      || String(command.ticket)===String(row.ticket) && command.result?.status==='unknown')
     || rules.some(rule=>String(rule.ticket)===String(row.ticket) && ['unknown','firing'].includes(rule.state))
     || timeRules.some(rule=>String(rule.ticket)===String(row.ticket) && ['opening','unknown','firing'].includes(rule.state)))
     return 'Есть неподтверждённая команда для набора. Дождись сверки с MT5; повтор заблокирован.';
@@ -56,7 +77,8 @@ function managementBlock({row,account,linked,commands=[],rules=[],timeRules=[],a
   if(!row)return 'Выбери позицию или заявку';
   const ticket=String(row.ticket),selected=String(account);
   if(accountStates[selected]?.connected===false)return 'Нет связи с выбранным счётом';
-  const parentUnknown=row.entryPlan?.id && commands.some(command=>(command.ticket===`entry:${row.entryPlan.id}` || command.payload?.entryId===row.entryPlan.id) && command.result?.status==='unknown');
+  const parentUnknown=row.entryPlan?.id && commands.some(command=>blocksParentCommand(command,row.entryPlan,
+    independentControls(row.entryPlan,accountStates[selected]?.capabilities)));
   const unknown=parentUnknown || commands.some(command=>String(command.ticket)===ticket && command.result?.status==='unknown'
     && (linked || !command.result.accountResults || !command.result.accountResults[selected]
       || command.result.accountResults[selected].status==='unknown'));
@@ -94,4 +116,4 @@ function protectionChanges(row,values,dirty) {
   return changes;
 }
 module.exports={managementBlock,decimal,protectionChanges,PROTECTION_WARNING,
-  ENTRY_PROTECTION_CAPABILITY,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock,exactEntryCloseBlock,protectionView};
+  ENTRY_PROTECTION_CAPABILITY,ACCOUNT_CONTROL_CAPABILITY,independentControls,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock,exactEntryProtectionBlock,exactEntryCloseBlock,protectionView};

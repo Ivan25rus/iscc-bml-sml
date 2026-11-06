@@ -1,6 +1,8 @@
 // Final control receipts can retire only their own older pending projection.
 // This is display state, never permission to replay a command or infer a fill.
 const EXACT_CLOSE_CAPABILITY='entry-exact-parent-close-v1';
+const EXACT_PROTECTION_CAPABILITY='entry-exact-parent-protection-v1';
+const PARENT_PARTIAL_CAPABILITY='entry-parent-partial-close-v1';
 const PHASES=new Set(['armed','running','paused','sending','completed','stopped','unknown']);
 function accountIds(entry) {
   if(!entry?.accounts || typeof entry.accounts!=='object' || Array.isArray(entry.accounts))return null;
@@ -30,7 +32,7 @@ function retainControlEntry(current,next) {
   return !!proof && ['ok','rejected'].includes(proof.status) && proof.entryId===current.id && sameParent(current,next)
     && !current.protectionPending && !current.closurePending
     && (proof.operation==='entry-protection' && next.protectionPending===proof.id
-      || proof.operation==='entry-close' && next.closurePending===proof.id)
+      || ['entry-close','entry-partial-close'].includes(proof.operation) && next.closurePending===proof.id)
     && Number.isFinite(current.updatedAt) && Number.isFinite(next.updatedAt) && next.updatedAt<=current.updatedAt;
 }
-module.exports={EXACT_CLOSE_CAPABILITY,accountIds,controlEntry,retainControlEntry};
+module.exports={EXACT_CLOSE_CAPABILITY,EXACT_PROTECTION_CAPABILITY,PARENT_PARTIAL_CAPABILITY,accountIds,controlEntry,retainControlEntry};

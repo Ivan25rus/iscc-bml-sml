@@ -6,6 +6,10 @@ function readErrorKind(error) {
   return 'checking';
 }
 function readErrorLabel(entry) {
+  if(entry?._lastConfirmedControl?.status==='ok' && entry._lastConfirmedControl.entryId===entry.id
+    && entry._lastConfirmedControl.operation==='entry-protection' && entry.phase!=='unknown'
+    && !entry.protectionPending && !entry.closurePending)
+    return 'Защита подтверждена · обновляем состояние VPS';
   const kind=readErrorKind(entry?._readError);
   return {journal:'Ошибка сверки журнала',connection:'Нет связи с VPS',checking:'Проверяем исполнение и закрытие'}[kind]
     || 'Проверяем исполнение и закрытие';

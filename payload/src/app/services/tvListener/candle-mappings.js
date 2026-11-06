@@ -22,14 +22,22 @@ function mappings(config = {}) {
     if (!/^[A-Z0-9_.-]+:[A-Z0-9_.!#&+\/()-]+$/.test(sourceSymbol) || sourceSymbol.length > 160)
       throw Error(`Пара ${index + 1}: нужен полный символ ТВ, например CAPITALCOM:NAS100`);
     brokerName(mt5Symbol);
+    const sourceLayout = row.sourceLayout ?? '';
+    if (typeof sourceLayout !== 'string' || (sourceLayout && !/^[A-Za-z0-9_-]{1,128}$/.test(sourceLayout)))
+      throw Error(`Пара ${index + 1}: некорректный ID исходного графика ТВ`);
     if (row.enabled && seen.has(sourceSymbol)) throw Error(`Для ${sourceSymbol} включено несколько назначений MT5`);
     if (row.enabled) seen.add(sourceSymbol);
-    return { enabled: row.enabled, sourceSymbol, mt5Symbol };
+    return { enabled: row.enabled, sourceSymbol, mt5Symbol, ...(sourceLayout ? { sourceLayout } : {}) };
   });
 }
 
 function sourceMap(config = {}) {
   return Object.fromEntries(mappings(config).filter(row => row.enabled).map(row => [row.sourceSymbol, row.mt5Symbol]));
+}
+
+function sourceLayouts(config = {}) {
+  return Object.fromEntries(mappings(config).filter(row => row.enabled && row.sourceLayout)
+    .map(row => [row.sourceSymbol, row.sourceLayout]));
 }
 
 async function validateChanges(config, previous, getAdapter) {
@@ -39,4 +47,4 @@ async function validateChanges(config, previous, getAdapter) {
   return next;
 }
 
-module.exports = { DEFAULT_SOURCES, DEFAULT_MAPPINGS, brokerName, mappings, sourceMap, validateChanges };
+module.exports = { DEFAULT_SOURCES, DEFAULT_MAPPINGS, brokerName, mappings, sourceMap, sourceLayouts, validateChanges };

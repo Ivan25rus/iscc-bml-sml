@@ -157,7 +157,7 @@ test('only acknowledged MT5 price is published, never the source TV price', asyn
   assert.equal(f.sync.status().ready, 1);
 });
 
-test('restart retains the exact acknowledged candle level in LT while VPS revalidation is unavailable',async()=>{
+test('restart retains the acknowledged candle price without republishing it before fresh source verification',async()=>{
   const original=fixture();original.bars();original.sync.acceptSource('one',shape());await original.sync.tick();
   let saved=original.sync.serialize();
   for(let restart=0;restart<2;restart++) {
@@ -165,7 +165,9 @@ test('restart retains the exact acknowledged candle level in LT while VPS revali
     assert.deepEqual(restored.sync.currentLevels(),{USTEC:[30380.25]});
     assert.equal(restored.sync.status().ready,0,'Retaining a known price does not invent a new indicator acknowledgement');
     await restored.sync.tick();
-    assert.deepEqual(restored.published.at(-1),{USTEC:[30380.25]});
+    assert.deepEqual(restored.published.at(-1),{},'An omitted instrument preserves the existing LT group');
+    assert.deepEqual(updateManagedLevels({groups:[{key:'owned',source:OWNER,ticker:'USTEC',levels:[30380.25]}]},
+      restored.published.at(-1),{preserveUnspecified:true}).groups[0].levels,[30380.25]);
     saved=restored.sync.serialize();
     if(restart===1) {
       restored.sync.acceptSource('one',null);await restored.sync.publishCurrent();
@@ -457,7 +459,8 @@ test('legacy saved geometry gets a new revision before a TV-window request is se
   assert.equal(f.sync.records.get('one').revision,oldRevision+1);
   assert.equal(f.sync.records.get('one').phase,'awaiting-tv');
   await f.sync.tick();assert.equal(f.calls.at(-1).payload.action,'delete');
-  f.bars();await f.sync.tick();assert.equal(f.sync.status().ready,1);
+  f.bars();await f.sync.tick();assert.equal(f.sync.status().ready,0,'Fresh bars alone do not prove that the drawing still exists');
+  f.sync.acceptSource('one',shape());await f.sync.tick();assert.equal(f.sync.status().ready,1);
   assert.ok(f.calls.at(-2).payload.revision>oldRevision);
 });
 

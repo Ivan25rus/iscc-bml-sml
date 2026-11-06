@@ -86,7 +86,10 @@ class ParallelEntryTests(unittest.TestCase):
         entered,release=threading.Event(),threading.Event()
         self.addCleanup(release.set)
         def call(method,*args):
-            if method=='entry_snapshot':entered.set();release.wait(2)
+            # The fixture remains blocked until the assertion's finally
+            # releases it. Slow Windows SQLite commits must not release the
+            # follower early and turn this into a race against two seconds.
+            if method=='entry_snapshot':entered.set();release.wait()
             return original(method,*args)
         worker.call=call
         f.engine.arm(f.payload)

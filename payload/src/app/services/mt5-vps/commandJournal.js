@@ -38,7 +38,9 @@ class CommandJournal {
       if (previous.digest !== digest) return {status:'rejected',reason:'Номер команды уже использован с другими параметрами'};
       return previous.result;
     }
-    if (this.records.some(x => x.ticket === payload.ticket && uncertain(x.result))) {
+    const independent=['entry-protection','entry-close','entry-partial-close'].includes(operation) && payload.independentAccountControls===true;
+    if (this.records.some(x => x.ticket === payload.ticket && uncertain(x.result)
+      && !(independent && ['entry-protection','entry-close','entry-partial-close'].includes(x.operation) && x.payload?.independentAccountControls===true))) {
       return {status:'unknown',reason:'Есть неподтверждённая команда для этой позиции. Проверь MT5 и журнал команд; повтор заблокирован.'};
     }
     const record = {id:payload.id, operation, ticket:payload.ticket, symbol:payload.symbol, payload:core,
@@ -57,7 +59,8 @@ class CommandJournal {
   async reconcile(receipt, {ticket} = {}) {
     for (const record of this.records.filter(x => x.result.status === 'unknown' && (ticket===undefined || x.ticket===ticket))) {
       const result = await receipt(record.id);
-      if (result && ['ok','rejected'].includes(result.status)) {
+      if (result && (['ok','rejected'].includes(result.status)
+        || result.status==='unknown' && result.independentAccountControls===true && record.payload?.independentAccountControls===true)) {
         record.result = result; record.updatedAt = Date.now(); await this.save([record]);
       }
     }

@@ -21,6 +21,7 @@ from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from functools import wraps, lru_cache
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
+from datetime import datetime, timezone
 from collections import deque
 from types import SimpleNamespace
 from broker_opening_evidence import opening_order_evidence
@@ -160,6 +161,16 @@ class Bridge:
         offset = config.get('brokerUtcOffsetSeconds', 0)
         if type(offset) not in (int, float) or not math.isfinite(offset) or abs(offset) > 14*3600:
             raise ValueError('Invalid broker UTC offset')
+        # Migrate only the verified Gerchik summer-clock configuration. Other
+        # brokers and explicitly fixed clocks retain their configured offset.
+        self.broker_clock_model = config.get('brokerClockModel',
+            'fixed-offset')
+        if self.broker_clock_model not in ('fixed-offset', 'new-york-plus-hours'):
+            raise ValueError('Invalid broker clock model')
+        self.broker_clock_hours = config.get('brokerClockHours', 7)
+        if (self.broker_clock_model == 'new-york-plus-hours'
+                and (type(self.broker_clock_hours) is not int or not -9 <= self.broker_clock_hours <= 18)):
+            raise ValueError('Invalid seasonal broker clock hours')
         self.broker_utc_offset_seconds = offset
         # Every bridge operation is serialized by the HTTP handler, including
         # ledger access. Quote streams release the lock before network writes.
@@ -361,18 +372,37 @@ class Bridge:
             raise ValueError('Account does not permit independent hedged entry')
         snapshot=self._entry_snapshot_for(payload['symbol'],account)
         spec={key:snapshot['metadata'][key] for key in ('quantityStep','minQty','maxQty')}
-        from chunk_entry import ChunkEntries
-        state=dict(accounts={str(account.login):dict(parts=[payload['chunkVolume']])})
+        from chunk_entry import ChunkEntries, account_entry_sizes
+        _, chunk=account_entry_sizes(payload,spec)
+        state=dict(accounts={str(account.login):dict(parts=[chunk])})
         request=ChunkEntries._child(SimpleNamespace(primary=str(account.login)),payload,state,0,payload['trigger'])
         self.open_request(request)
         self.validate_deadline(request)
         return dict(identity=worker_result('account',account),snapshot=snapshot,spec=spec,checkedRequest=request)
 
+    @property
+    def broker_utc_offset_seconds(self):
+        if getattr(self, 'broker_clock_model', 'fixed-offset') == 'new-york-plus-hours':
+            local = datetime.fromtimestamp(time.time(), timezone.utc).astimezone(new_york_zone())
+            return int(local.utcoffset().total_seconds()) + self.broker_clock_hours * 3600
+        return self._fixed_broker_utc_offset_seconds
+
+    @broker_utc_offset_seconds.setter
+    def broker_utc_offset_seconds(self, value):
+        self._fixed_broker_utc_offset_seconds = value
+
     def tick_utc_seconds(self, tick):
-        # Convert the configured broker wall clock to UTC.
-        # is UTC regardless of the Windows/Mac display timezone. Convert only
-        # the configured broker clock; never infer an offset from a stale tick.
+        # Convert the tick's own broker wall date using pinned calendar rules,
+        # never its observed age or the OS display timezone. Reject repeated
+        # and nonexistent DST hours rather than guessing a fresh timestamp.
         stamp = getattr(tick, 'time_msc', 0)/1000 or getattr(tick, 'time', 0)
+        if getattr(self, 'broker_clock_model', 'fixed-offset') == 'new-york-plus-hours':
+            wall = datetime.fromtimestamp(stamp - self.broker_clock_hours * 3600, timezone.utc).replace(tzinfo=None)
+            zone = new_york_zone()
+            first, second = (wall.replace(tzinfo=zone, fold=fold) for fold in (0, 1))
+            if first.utcoffset() != second.utcoffset():
+                raise ValueError('Broker quote time is ambiguous or nonexistent at a clock change')
+            return first.timestamp()
         return stamp - self.broker_utc_offset_seconds
 
     def observe_quote(self, symbol, tick, source, captured_at, read_ms):
@@ -426,10 +456,12 @@ class Bridge:
         return self.volume_specs
 
     def quote_frame(self):
-        account = self.account()
+        started=time.perf_counter();timing={}
+        account = self.account(timing)
         snapshots = {symbol: self._snapshot(symbol, account) for symbol in self.config['symbols']}
         return {'account': account.login, 'server': account.server, 'snapshots': snapshots,
-                'capturedAt': time.time() * 1000, 'intervalMs': round(self.quote_interval() * 1000)}
+                'capturedAt': time.time() * 1000, 'intervalMs': round(self.quote_interval() * 1000),
+                'quoteTiming':dict(timing,nativeMs=round((time.perf_counter()-started)*1000,3))}
 
     def _snapshot(self, symbol, account):
         if symbol not in self.config['symbols']:
@@ -459,10 +491,14 @@ class Bridge:
             self.spec_checked_at[symbol]=time.monotonic()
             if hasattr(self,'volume_specs'):
                 self.volume_specs[symbol]={key:metadata[key] for key in ('quantityStep','minQty','maxQty')}
-        return {'account': account.login, 'server': account.server,
+        utc_time = self.tick_utc_seconds(tick)
+        raw_time = getattr(tick, 'time_msc', 0)/1000 or getattr(tick, 'time', 0)
+        tick_offset = (round(raw_time - utc_time)
+            if self.broker_clock_model == 'new-york-plus-hours' else self.broker_utc_offset_seconds)
+        return {'account': account.login, 'server': account.server, 'symbol': symbol,
                 'quote': {'bid': tick.bid, 'ask': tick.ask, 'price': (tick.bid + tick.ask) / 2, 'tickSize': metadata['tickSize'],
                           'time': tick.time, 'timeMsc': getattr(tick, 'time_msc', 0),
-                          'utcTime': self.tick_utc_seconds(tick), 'brokerUtcOffsetSeconds': self.broker_utc_offset_seconds,
+                          'utcTime': utc_time, 'brokerUtcOffsetSeconds': tick_offset,
                           'nativeCapturedAt': captured_at, 'nativeAgeMs': observation['nativeAgeMs']},
                 'metadata': dict(metadata)}
 
@@ -555,7 +591,8 @@ class Bridge:
                 return timed(dict(status='rejected', reason=str(error), entryDiagnostics=details))
             return rejected(str(error))
         if time.time() * 1000 >= expires:
-            return rejected('Command expired before submission')
+            return timed(dict(status='rejected',reason='Command expired before submission',mutationStarted=False,
+                finalPreMutationRejection=True,retryableExpiry=operation=='place' and 'entryGuard' in payload))
         unknown = {'status': 'unknown', 'reason': 'Submission recorded; verify receipt with MT5'}
         if operation != 'place':
             # A pending-order removal cannot close or change an already filled
@@ -573,7 +610,8 @@ class Bridge:
         self.db.commit()
         timing['ledgerBeforeMs'] = round((time.perf_counter()-ledger_started)*1000, 2)
         if time.time()*1000 >= expires:
-            status={'status':'rejected','reason':'Command expired before broker submission'}
+            status=dict(status='rejected',reason='Command expired before broker submission',mutationStarted=False,
+                finalPreMutationRejection=True,retryableExpiry=operation=='place' and 'entryGuard' in payload)
             self.db.execute('UPDATE requests SET result=? WHERE id=?',(json.dumps(status),identifier))
             if operation=='place' and 'closeAtUtc' in payload:
                 self.db.execute('UPDATE time_rules SET state=?,result=? WHERE id=?',('rejected',json.dumps(status),identifier))
@@ -590,6 +628,8 @@ class Bridge:
                     raise ValueError('Chunk command expired during final validation')
             except (ValueError,TypeError,KeyError) as error:
                 status={'status':'rejected','reason':str(error)}
+                if str(error)=='Chunk command expired during final validation':
+                    status.update(mutationStarted=False,finalPreMutationRejection=True,retryableExpiry=True)
                 details = getattr(error, 'entry_diagnostics', None)
                 if details is not None:
                     status['entryDiagnostics'] = details
@@ -1122,6 +1162,34 @@ class Bridge:
             quote=dict(bid=tick.bid, ask=tick.ask, price=(tick.bid+tick.ask)/2, tickSize=size,
                        utcTime=self.tick_utc_seconds(tick)), metadata=dict(tickSize=size))
 
+    def minute_bars(self, symbol, count=10):
+        """Bounded M1 Bid history on the separate read-only chart client."""
+        if symbol not in self.config['symbols']:raise ValueError('Minute chart symbol is not configured')
+        if type(count) is not int or count not in (10,30):raise ValueError('Invalid minute chart window')
+        account=self.account()
+        minute=int(time.time()//60)
+        cache=getattr(self,'minute_bar_cache',{})
+        key=(symbol,count)
+        if key in cache and cache[key][0]==minute:return copy.deepcopy(cache[key][1])
+        from candle_levels import available_symbol
+        available_symbol(self.mt5,symbol,select=True)
+        rates=self.mt5.copy_rates_from_pos(symbol,self.mt5.TIMEFRAME_M1,0,count)
+        if rates is None:raise ValueError('MT5 minute history is unavailable')
+        rows=[]
+        for raw in rates:
+            stamp=self.tick_utc_seconds(SimpleNamespace(time=int(raw['time']),time_msc=0))
+            values=[float(raw[key]) for key in ('open','high','low','close')]
+            if (not math.isfinite(stamp) or stamp%60 or stamp>time.time()+1
+                    or not all(math.isfinite(x) and x>0 for x in values)
+                    or values[2]>min(values[0],values[3]) or values[1]<max(values[0],values[3])
+                    or rows and stamp<=rows[-1][0]):raise ValueError('Invalid minute chart history')
+            rows.append([int(stamp),*values])
+        if len(rows)>count:raise ValueError('Minute chart history exceeds its bound')
+        result=dict(account=account.login,server=account.server,symbol=symbol,timeframe='M1',basis='bid',
+                    capturedAt=int(time.time()*1000),bars=rows)
+        cache[key]=(minute,result);self.minute_bar_cache=cache
+        return copy.deepcopy(result)
+
     def _capabilities(self):
         # Entry receipts also carry this full list: clients replace their
         # connection capability cache when an authenticated reply includes it.
@@ -1130,8 +1198,9 @@ class Bridge:
                 'hybrid-native-reconcile-v1','hybrid-support-reprice-v1','atomic-entry-admission-v1','entry-progress-snapshots-v1','independent-account-entry-v2',
                 'parallel-account-entry-v3','entry-progress-fast-read-v1',
                 'independent-account-lanes-v4','entry-events-v1','entry-account-continue-v1','entry-stop-priority-v1',
-                'entry-control-recovery-v1','entry-intent-delivery-v1','entry-status-order-v1','entry-exact-parent-close-v1',
-                *(['independent-account-engines-v5','entry-initial-sizing-only-v1'] if getattr(self,'isolated_entries',False) else []),
+                'entry-control-recovery-v1','entry-intent-delivery-v1','entry-status-order-v1','entry-exact-parent-close-v1','entry-account-controls-v1','entry-parent-partial-close-v1',
+                *(['entry-exact-parent-protection-v1','minute-chart-bars-v1','entry-parent-partial-take-v1'] if getattr(self,'isolated_entries',False) else []),
+                *(['independent-account-engines-v5','entry-initial-sizing-only-v1','management-active-v1'] if getattr(self,'isolated_entries',False) else []),
                 *ENTRY_PROTOCOL_CAPABILITIES] + (['lt-level-sync-v1'] if getattr(self,'lt_level_sync',None) else []) + (['account-enrollment','mt4-preparation'] if getattr(self,'account_registry',None) else [])
 
     def _health(self, account):
@@ -2002,9 +2071,22 @@ class Bridge:
                 stop = float(units.to_integral_value(rounding=ROUND_CEILING if buy else ROUND_FLOOR) * Decimal(str(tick_size)))
             else:
                 stop = float(payload['sl'])
+            # Explicit parent controls may originate from weighted averages
+            # or offsets with a fractional tick. Normalize on this account's
+            # actual broker grid, toward protection for SL. All distance and
+            # risk checks below use the resulting executable prices.
+            normalize = payload.get('normalizePrices', False)
+            if not isinstance(normalize, bool):
+                raise ValueError('Invalid protection price normalization')
+            if normalize and math.isfinite(stop) and stop > 0:
+                units = Decimal(str(stop)) / Decimal(str(tick_size))
+                stop = float(units.to_integral_value(rounding=ROUND_CEILING if buy else ROUND_FLOOR) * Decimal(str(tick_size)))
             if not math.isfinite(stop) or stop <= 0 or abs(stop/tick_size-round(stop/tick_size)) > 1e-6:
                 raise ValueError('Common stop does not match the broker price step')
             take = float(payload['tp']) if 'tp' in payload else None
+            if normalize and take is not None and math.isfinite(take) and take > 0:
+                units = Decimal(str(take)) / Decimal(str(tick_size))
+                take = float(units.to_integral_value(rounding=ROUND_CEILING if buy else ROUND_FLOOR) * Decimal(str(tick_size)))
             if take is not None and (not math.isfinite(take) or take < 0 or take and abs(take/tick_size-round(take/tick_size)) > 1e-6):
                 raise ValueError('Take profit does not match the broker price step')
             point = float(getattr(info, 'point', tick_size))
@@ -2311,6 +2393,17 @@ class Bridge:
         return json.loads(row[0]) if row else None
 
     def receipt(self, identifier):
+        takes=getattr(self.chunk_entries,'partial_takes',None)
+        take_receipt=takes.receipt(identifier) if takes else None
+        if take_receipt:return self.envelope(result=take_receipt)
+        # Parent recovery performs exact native reads outside the shared
+        # coordinator lock. It never sends or retries a broker modification.
+        try:
+            reconcile = getattr(self.chunk_entries, 'reconcile_account_controls', None)
+            if reconcile: reconcile(identifier)
+            self.chunk_entries.reconcile_protection_rejection(identifier)
+        except (OSError, ValueError, RuntimeError):
+            pass  # Return the original unknown receipt until proof is available.
         with self.lock:
             for table in ('chunk_entry_protections', 'chunk_entry_closures'):
                 saved = self.db.execute('SELECT result FROM '+table+' WHERE id=?', (identifier,)).fetchone()
@@ -2355,16 +2448,34 @@ class Bridge:
         return {**state, 'receipts':{x:self.receipt(x)['result'] for x in identifiers}}
 
     @serialized
-    def management_snapshot(self, identifiers=(), watch=()):
+    def management_snapshot(self, identifiers=(), watch=(), compact=False):
         """Native evidence only; formatting/history decoration runs outside RPC."""
         account=self.account()
         state=dict(self._health(account),orders=self._orders(account)['orders'])
         state['openingStates']={str(row['ticket']):self.opening_state(str(row['ticket']),row['symbol'],state['orders']) for row in watch}
-        state['_closeRules']=self.db.execute('SELECT * FROM close_rules ORDER BY rowid DESC LIMIT 100').fetchall()
-        state['_timeRules']=self.db.execute('SELECT * FROM time_rules ORDER BY rowid DESC LIMIT 100').fetchall()
+        state['_closeRules']=self._management_rule_rows('close_rules',state['orders'],compact)
+        state['_timeRules']=self._management_rule_rows('time_rules',state['orders'],compact)
+        if compact:state.update(managementView='active',ruleHistoryAvailable=True)
         state['receipts']={x:self.receipt(x)['result'] for x in identifiers}
         state['checkedAt']=time.time()*1000
         return state
+
+    def _management_rule_rows(self, table, orders, compact):
+        if table not in ('close_rules','time_rules'):raise ValueError('Invalid rule table')
+        if not compact:return self.db.execute('SELECT * FROM '+table+' ORDER BY rowid DESC LIMIT 100').fetchall()
+        # Omit only definite final history unrelated to current targets. Unknown
+        # states/results and every live target's rules survive, even when more
+        # than 100 later historical rows exist. No journal row is changed.
+        live=json.dumps([[str(row['ticket']),row['symbol']] for row in orders])
+        return self.db.execute('SELECT * FROM '+table+''' AS rule WHERE
+            state IS NULL OR state NOT IN ('completed','cancelled','rejected')
+            OR CASE WHEN json_valid(result) THEN
+                COALESCE(json_extract(result,'$.status'),'unknown') NOT IN ('ok','rejected') ELSE 1 END
+            OR CASE WHEN json_valid(payload) THEN EXISTS (
+                SELECT 1 FROM json_each(?) AS live
+                WHERE CAST(json_extract(rule.payload,'$.ticket') AS TEXT)=json_extract(live.value,'$[0]')
+                AND json_extract(rule.payload,'$.symbol')=json_extract(live.value,'$[1]')) ELSE 1 END
+            ORDER BY rowid DESC''',(live,)).fetchall()
 
     @serialized
     def entry_management(self, watch=()):
@@ -2577,10 +2688,10 @@ class Bridge:
                     reason='Второй терминал недоступен или восстанавливается')
         return dict(account=primary['account'], server=primary['server'], entries=self.entry_plan_views(states))
 
-    def management(self, identifiers=(), receipt_account=None, watch=()):
+    def management(self, identifiers=(), receipt_account=None, watch=(), compact=False):
         # One HTTP round trip; linked state is for management only, never quotes.
         primary_account=str(self.config['account'])
-        states = self.management_accounts(identifiers,receipt_account,watch)
+        states = self.management_accounts(identifiers,receipt_account,watch,**({'compact':True} if compact else {}))
         primary = states[primary_account]
         alerts = []
         groups = [(i,json.loads(p),json.loads(r)) for i,p,r in self.management_groups(states)]
@@ -2677,7 +2788,7 @@ def worker_result(method, result):
     return result
 
 
-CANDLE_READ_METHODS=frozenset(('account','candle_levels','candle_symbols','candle_snapshot'))
+CANDLE_READ_METHODS=frozenset(('account','candle_levels','candle_symbols','candle_snapshot','minute_bars'))
 QUOTE_READ_METHODS=frozenset(('account','snapshot','quote_frame','set_quote_mode'))
 
 def native_worker_method(bridge, method, args, candle_only=False, quote_only=False):
@@ -2971,6 +3082,9 @@ class AccountWorker:
                 outcome='ok'
                 if method in ('execute','entry_snapshot','entry_management','entry_positions','entry_admission','entry_context','entry_cancel_limit','entry_common_stop','management_snapshot') and isinstance(result,dict):
                     result={**result,'rpcTiming':dict(lockWaitMs=lock_ms,sendMs=send_ms,totalMs=round((time.perf_counter()-started)*1000,2))}
+                if method=='quote_frame' and isinstance(result,dict):
+                    result=dict(result,quoteTiming=dict(result.get('quoteTiming',{}),
+                        rpcMs=round((time.perf_counter()-started)*1000,3),lockWaitMs=lock_ms,sendMs=send_ms))
                 return result
             outcome='timeout'
             raise RuntimeError('Linked MT5 response unknown; inspect receipt')
@@ -3019,6 +3133,18 @@ class QuotePublisher:
         self.captures=0
         self.failures=0
         self.last_capture=None
+        self.socket_send_buffer=None
+        self.socket_buffer_errors=0
+
+    def configure_socket(self, connection):
+        # Keep the OS-managed send buffer. A tiny fixed buffer can introduce
+        # backpressure below the collector, especially over a forwarded TLS
+        # connection. Observe the actual size without changing socket policy.
+        try:
+            size=connection.getsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF)
+            with self.condition:self.socket_send_buffer=size
+        except OSError:
+            with self.condition:self.socket_buffer_errors+=1
 
     def subscribe(self):
         with self.condition:
@@ -3046,7 +3172,10 @@ class QuotePublisher:
         with self.condition:
             return dict(schema=1,subscribers=self.subscribers,captures=self.captures,
                         failures=self.failures,lastCaptureAt=self.last_capture,
-                        retainedFrames=int(self.latest is not None),backlogPolicy='latest-only')
+                        retainedFrames=int(self.latest is not None),backlogPolicy='latest-only',
+                        requestedSocketSendBufferBytes=None,socketSendBufferBytes=self.socket_send_buffer,
+                        socketBufferPolicy='os-default',
+                        socketBufferErrors=self.socket_buffer_errors)
 
     def run(self):
         due=None
@@ -3059,13 +3188,27 @@ class QuotePublisher:
                     else: self.condition.wait(timeout=max(0,due-time.perf_counter()))
                 if self.closed: return
             started=time.perf_counter()
+            producer_delay=max(0,(started-due)*1000) if due is not None else 0.
             if due is not None:
-                self.bridge.read_timings.record('quoteProducerDelay',max(0,(started-due)*1000))
+                self.bridge.read_timings.record('quoteProducerDelay',producer_delay)
             interval=self.bridge.quote_interval()
             try:
                 with (nullcontext() if getattr(self.bridge,'isolated_entries',False) else self.bridge.lock):
                     self.bridge.read_timings.record('quoteLockWait',(time.perf_counter()-started)*1000)
                     frame=self.bridge.read_timings.call('quoteCapture',self.bridge.quote_frame)
+                stages=frame.get('quoteTiming',{})
+                for key in ('nativeMs','accountInfoMs','terminalInfoMs','rpcMs','lockWaitMs','sendMs'):
+                    value=stages.get(key)
+                    if type(value) in (int,float) and math.isfinite(value) and value>=0:
+                        self.bridge.read_timings.record('quoteStage:'+key,value)
+                if all(type(stages.get(key)) in (int,float) for key in ('rpcMs','nativeMs','lockWaitMs','sendMs')):
+                    self.bridge.read_timings.record('quoteReplyOverhead',max(0,stages['rpcMs']-stages['nativeMs']-stages['lockWaitMs']-stages['sendMs']))
+                frame=dict(frame,publishedAt=time.time()*1000)
+                # Detailed stages travel only with a slow frame; bounded counters
+                # still observe every read without extra native/API polling.
+                if producer_delay>=250 or any(type(v) in (int,float) and v>=250 for v in stages.values()):
+                    frame['quoteTiming']=dict(stages,producerDelayMs=round(producer_delay,3))
+                else:frame.pop('quoteTiming',None)
                 interval=frame['intervalMs']/1000
                 with self.bridge.read_timings.span('quoteEncode'):
                     body=json.dumps(frame,allow_nan=False).encode()+b'\n'
@@ -3132,6 +3275,7 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
             try:
                 sequence=publisher.subscribe()
                 subscribed=True
+                publisher.configure_socket(self.connection)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/x-ndjson')
                 self.send_header('Transfer-Encoding', 'chunked')
@@ -3141,6 +3285,9 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                     sequence,body=publisher.next_frame(sequence)
                     if body is None: continue
                     with bridge.read_timings.span('quoteWrite'):
+                        # The retained JSON ends in }\n. Add the actual socket
+                        # handoff time without reparsing/refreshing a quote.
+                        body=body[:-2]+b',"writeStartedAt":'+str(round(time.time()*1000,3)).encode()+b'}\n'
                         self.wfile.write(('%x\r\n' % len(body)).encode() + body + b'\r\n')
                         self.wfile.flush()
             except (OSError, ValueError, TypeError):
@@ -3176,7 +3323,7 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                     return
                 payload = None
                 operations = ('/place','/cancel','/close','/modify','/schedule-close','/cancel-close')
-                if self.command == 'POST' and route_path in (*operations, '/quote-mode', '/account-discovery', '/account-register', '/entry-plan', '/entry-plan-admit', '/entry-plan-stop', '/entry-plan-continue', '/entry-plan-protection', '/entry-plan-close', '/candle-levels'):
+                if self.command == 'POST' and route_path in (*operations, '/quote-mode', '/account-discovery', '/account-register', '/entry-plan', '/entry-plan-admit', '/entry-plan-stop', '/entry-plan-continue', '/entry-plan-protection', '/entry-plan-close', '/entry-parent-take', '/candle-levels'):
                     length = int(self.headers.get('Content-Length', 0))
                     if not 0 < length <= 16384:
                         raise ValueError('Invalid body size')
@@ -3186,16 +3333,20 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                     selected_account = str(config['account']) if selected is bridge else match[1]
                     if bridge.chunk_entries.owned_entry(selected_account, payload.get('ticket')):
                         raise ValueError('Use whole-parent hybrid protection; individual child modification is blocked')
-                if selected is bridge and route_path in ('/entry-events','/entry-plans','/entry-readiness','/entry-plan','/entry-plan-admit','/entry-plan-stop','/entry-plan-continue','/entry-plan-protection','/entry-plan-close'):
+                if selected is bridge and route_path in ('/entry-events','/entry-plans','/entry-readiness','/entry-plan','/entry-plan-admit','/entry-plan-stop','/entry-plan-continue','/entry-plan-protection','/entry-plan-close','/entry-parent-take'):
                     if self.command=='GET' and route_path=='/entry-events':
                         query = parse_qs(route.query, keep_blank_values=True)
                         if set(query) != {'since'} or len(query['since']) != 1 or not re.fullmatch(r'[0-9]{1,16}', query['since'][0]):
                             raise ValueError('A bounded entry event revision is required')
                         result = dict(account=str(config['account']), server=config['server'],
                             **bridge.chunk_entries.entry_events(int(query['since'][0]), timeout=10))
-                    elif self.command=='POST' and route_path in ('/entry-plan-protection','/entry-plan-close'):
+                    elif self.command=='POST' and route_path in ('/entry-plan-protection','/entry-plan-close','/entry-parent-take'):
                         try:
-                            method=bridge.chunk_entries.protection if route_path=='/entry-plan-protection' else bridge.chunk_entries.close_position
+                            if route_path=='/entry-parent-take':
+                                takes=getattr(bridge.chunk_entries,'partial_takes',None)
+                                if takes is None:raise ValueError('Parent partial take protocol unavailable')
+                                method=takes.command
+                            else:method=bridge.chunk_entries.protection if route_path=='/entry-plan-protection' else bridge.chunk_entries.close_position
                             values=method(payload)
                         except (ValueError,TypeError,KeyError) as error:
                             values={'result':dict(status='rejected',reason=str(error),id=payload.get('id') if isinstance(payload,dict) else None,
@@ -3257,7 +3408,13 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                         result=bridge.envelope(registration=registry.register(payload))
                     else: raise ValueError('Unsupported account enrollment request')
                 elif self.command=='GET' and route_path=='/management':
-                    watch=json.loads(parse_qs(route.query).get('watch',['[]'])[0])
+                    query=parse_qs(route.query,keep_blank_values=True)
+                    view=query.get('view',['full'])
+                    if len(view)!=1 or view[0] not in ('full','active'):raise ValueError('Invalid management view')
+                    compact=view[0]=='active'
+                    if compact and (selected is not bridge or not getattr(bridge,'isolated_entries',False)):
+                        raise ValueError('Active management view requires coordinator capability')
+                    watch=json.loads(query.get('watch',['[]'])[0])
                     if not isinstance(watch,list) or len(watch)>100 or any(not isinstance(x,dict) or set(x)!= {'account','ticket','symbol'}
                         or str(x['account']) not in {str(config['account']),*bridge.linked} or not re.fullmatch(r'[1-9][0-9]{0,19}',str(x['ticket']))
                         or x['symbol'] not in config['symbols'] for x in watch): raise ValueError('Invalid watched opening list')
@@ -3269,7 +3426,7 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                         receipt_account = parse_qs(route.query).get('receiptAccount',[str(config['account'])])[0]
                         if receipt_account!=str(config['account']) and receipt_account not in bridge.linked:
                             raise ValueError('Receipt account is not configured')
-                        result = bridge.management(identifiers,receipt_account,watch)
+                        result = bridge.management(identifiers,receipt_account,watch,**({'compact':True} if compact else {}))
                     else:
                         result = selected.call('local_management')
                         result['receipts'] = {x:selected.call('receipt',x)['result'] for x in identifiers}
@@ -3292,7 +3449,8 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                                '/diagnostics':('diagnostics',()), '/snapshot':('snapshot',(parse_qs(route.query).get('symbol',[''])[0],)),
                                '/orders':('decorated_orders',()), '/candle-levels':('candle_levels',()),
                                '/candle-symbols':('candle_symbols',(parse_qs(route.query).get('names',[''])[0],)),
-                               '/candle-snapshot':('candle_snapshot',(parse_qs(route.query).get('symbol',[''])[0],))}
+                               '/candle-snapshot':('candle_snapshot',(parse_qs(route.query).get('symbol',[''])[0],)),
+                               '/minute-bars':('minute_bars',(parse_qs(route.query).get('symbol',[''])[0],int(parse_qs(route.query).get('limit',['10'])[0])))}
                     with (nullcontext() if getattr(bridge,'isolated_entries',False) else bridge.lock):
                         if self.command=='GET' and route_path in methods:
                             method,args = methods[route_path]
@@ -3511,6 +3669,9 @@ class CoordinatorBridge(Bridge):
     def candle_snapshot(self, symbol):
         return self._candle_call('candle_snapshot',symbol)
 
+    def minute_bars(self, symbol, count=10):
+        return self._candle_call('minute_bars',symbol,count)
+
     def _quote_call(self, method, *args):
         # Display reads own a separate SDK process and RPC pipe. Never fall
         # back to an execution worker, even while this client is recovering.
@@ -3589,12 +3750,13 @@ class CoordinatorBridge(Bridge):
                 {str(self.config['account']):self.primary_worker,**self.linked}.items() if callable(getattr(worker,'rpc_snapshot',None))})
         return result
 
-    def management(self, identifiers=(), receipt_account=None, watch=()):
+    def management(self, identifiers=(), receipt_account=None, watch=(), compact=False):
         # Native snapshots describe a worker, while this endpoint describes
         # the coordinator protocol. Never downgrade the Mac capability cache
         # to the worker's legacy entry engine after an ordinary UI refresh.
-        return dict(super().management(identifiers,receipt_account,watch),
+        return dict(super().management(identifiers,receipt_account,watch,compact=compact),
                     capabilities=self._capabilities(),linkedAccounts=list(self.linked),
+                    parentTakes=self.chunk_entries.partial_takes.list(),
                     entryProgress=self.chunk_entries.progress_observer.snapshot() if self.chunk_entries.progress_observer else None)
 
     def observe_native(self, account, value):
@@ -3623,7 +3785,7 @@ class CoordinatorBridge(Bridge):
                 self.entry_progress_file,self.chunk_entries.list)
             self.chunk_entries.progress_observer.start()
 
-    def management_accounts(self, identifiers=(), receipt_account=None, watch=()):
+    def management_accounts(self, identifiers=(), receipt_account=None, watch=(), compact=False):
         # UI snapshots never feed native execution or volume reservations.
         workers = {str(self.config['account']):self.primary_worker,**self.linked}
         executor = self.warm_group_executor()
@@ -3632,18 +3794,21 @@ class CoordinatorBridge(Bridge):
             for account,worker in workers.items():
                 selected = [row for row in watch if str(row['account'])==account]
                 wanted = list(identifiers) if receipt_account==account else []
-                signature = json.dumps([wanted,selected],sort_keys=True)
+                signature = json.dumps([wanted,selected,*(['active'] if compact else [])],sort_keys=True)
                 signatures[account] = signature
                 old = self.management_jobs.get(account)
                 if old and old[1].done():
                     self._cache_management(account,*old)
                     self.management_jobs.pop(account,None)
                 if account not in self.management_jobs:
-                    self.management_jobs[account] = (signature,executor.submit(self._read_management,account,worker,wanted,selected))
+                    self.management_jobs[account] = (signature,executor.submit(self._read_management,account,worker,wanted,selected,**({'compact':True} if compact else {})))
             jobs = {account:row[1] for account,row in self.management_jobs.items()}
         # Healthy accounts publish without waiting for a peer's native timeout.
         from concurrent.futures import wait
-        wait(list(jobs.values()),timeout=.02)
+        # Exact active-view proofs may finish just after the normal UI yield.
+        # Consume the same already-started reads within a bounded handoff;
+        # ordinary refreshes retain their 20 ms wait and add no native work.
+        wait(list(jobs.values()),timeout=.1 if compact and (watch or identifiers) else .02)
         states = {}
         with self.lock:
             for account,job in jobs.items():
@@ -3655,6 +3820,9 @@ class CoordinatorBridge(Bridge):
                 cached=self.management_cache.get(account)
                 ready=bool(exact and 0<=time.monotonic()-exact[1]<=2.5)
                 chosen=exact if ready else cached
+                if chosen and chosen[2].get('managementView','full')!=('active' if compact else 'full'):
+                    chosen=None
+                    ready=False
                 connected=bool(chosen and 0<=time.monotonic()-chosen[1]<=2.5)
                 age=round((time.monotonic()-chosen[1])*1000,3) if chosen else None
                 view=copy.deepcopy(chosen[2]) if chosen else dict(account=account,server=self.config['server'],orders=[])
@@ -3665,8 +3833,8 @@ class CoordinatorBridge(Bridge):
                     **({} if ready else dict(reason='Терминал недоступен' if failed else 'Проверяем состояние сделки',openingStates={},receipts={})))
         return states
 
-    def _read_management(self, account, worker, wanted, selected):
-        value=worker.call('management_snapshot',wanted,selected)
+    def _read_management(self, account, worker, wanted, selected, compact=False):
+        value=worker.call('management_snapshot',wanted,selected,*([True] if compact else []))
         # The native RPC and its account mutex have been released already.
         # Copy raw metadata briefly; JSON parsing and UI decoration hold no
         # native queue or coordinator lock.

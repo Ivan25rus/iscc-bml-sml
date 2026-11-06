@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "kind": "iscc-level-renderer",
-  "createdAtUTC": "2026-10-28T15:28:55.808422+00:00",
+  "createdAtUTC": "2026-11-06T05:38:28.340745+00:00",
   "files": {
     ".gitattributes": {
       "sha256": "a79691a93b46e49ce460c26ef22afcc03d6eca1e63bf2edbc20e96159510f6c9",
@@ -20,7 +20,7 @@
       "size": 4386
     },
     "BUILD-INFO.json": {
-      "sha256": "c807304fceb8657538b415025bc01e24440c572b75fc2384142c6fedbce77b4f",
+      "sha256": "46bb7be652544c62e221cef842850585f942f004c8a3e89990049dee0febbfaa",
       "size": 483
     },
     "CLAUDE.md": {
@@ -36,8 +36,8 @@
       "size": 1931
     },
     "README.md": {
-      "sha256": "0b9989fb087dd74fb978d6c14563183a742d25bb71aad02ee411c92bd8026b59",
-      "size": 9163
+      "sha256": "b0c63b2d8c196fcfafec30b91620f7fee5cfb210616c31e45e7a40b6a0b1e30b",
+      "size": 9838
     },
     "SETUP.html": {
       "sha256": "92805de5ef62c24a3bf50b08a41ae2df7abc59d9788e079a240ed6f1617e366b",
@@ -52,36 +52,40 @@
       "size": 7488
     },
     "install.py": {
-      "sha256": "35db2da33b15c6d203cae4c461471bb0d09d3a3a913b2c72375fb9e4af46bebd",
-      "size": 11649
+      "sha256": "8e809712d568025775245bf58f052bc7fc4ebfc4b8009536652b7799e03d4e6c",
+      "size": 11739
     },
     "module/candle-mappings.js": {
-      "sha256": "353c9a84964ebad67da99ff32738310e4e0d85754b28763c14d667814a41ccce",
-      "size": 2523
+      "sha256": "26da2b8f9884e64086d439d3d8f71564167cbd98ea4d6cda341096fd20644c6d",
+      "size": 3039
+    },
+    "module/candle-source-event.js": {
+      "sha256": "f77c8a23f23bc84ad04b9d13968f9580d36b1e839ad5af99b3da5f8735398901",
+      "size": 857
     },
     "module/candleLevels.js": {
-      "sha256": "82786090bd756d8743b32607d1478416a87491ac21fd369d3db60ccbce7c3b66",
-      "size": 26983
+      "sha256": "d911ccecafc0329ae938f4a8103689378858bb347a2d555ce7de187bdcae51e4",
+      "size": 35661
     },
     "module/config/candle-renderer-settings-descriptor.json": {
-      "sha256": "79ea7ac1d169c495112f31e5378453af7e296eee5281eed69bea6f1b340feed0",
-      "size": 1043
+      "sha256": "dc73fcd14a3fd64cb40bb900e14701b5f7d7edaab867c5973afd1f4facd6467e",
+      "size": 1254
     },
     "module/config/candle-renderer.json": {
       "sha256": "f846a78c1eb0841a68d1deccefc3de6af1196f01fc4181ca76f0cd78972f7ae1",
       "size": 112
     },
     "module/index.js": {
-      "sha256": "d266d61a12038303a3447a0eb2470e8c559256fa9d1a943a030d247f27f29877",
-      "size": 3817
+      "sha256": "6b9e36a3dab54b1b644530e5f77de9253d759c681aa22593d6a3d0f904b59149",
+      "size": 4081
     },
     "module/page.js": {
-      "sha256": "cc67540b05b9a2a9e7f31c395cdcd95e4bdf20706942887b4eebfe9471bfdd67",
-      "size": 13141
+      "sha256": "734736a59b6eb884bebb3017962619d4213f06affebbab03c6dbf333b4cfa007",
+      "size": 14811
     },
     "module/reader.js": {
-      "sha256": "a6816d550a138e369fa127f2b730518e336a528d16b3d5ef7dbc0bf6b53ef5a4",
-      "size": 6767
+      "sha256": "92a2d66e9a0377afafbd38f1580e15cca4e252e885bacf8f98f34ce2d140177b",
+      "size": 7869
     },
     "module/transport.js": {
       "sha256": "a18b0dc9e963cb2c1f2f5ebf4a22c5482bc14b3f2641489530d5c92e655fd20d",
@@ -96,12 +100,12 @@
       "size": 11820
     },
     "package.json": {
-      "sha256": "db7bf5b53a9128f93a234a278472921769a12c0275d3cca5101aa171acf4c80b",
+      "sha256": "9840195a311bc0c18777984a39d354090619457293f506257d92a0e332708351",
       "size": 301
     },
     "receiver/candle_levels.py": {
-      "sha256": "7e2a0739ac4e33bae47e5f9e1a6f4d4a29fd7f75c6c19f985d0500a13de6cba3",
-      "size": 22890
+      "sha256": "17cf748119feae231b5e1663732c90eef6b7b78142b9b18c56016f0b95378b17",
+      "size": 23794
     },
     "receiver/config.example.json": {
       "sha256": "89ae260ba229ece681072a6638f595b1b2700944b3e09c0af4b7cf4756149405",
@@ -115,9 +119,21 @@
       "sha256": "3ddccf17bdc75977063886090942048611aee970a475f50d31f7c063feb90514",
       "size": 19
     },
+    "tests/candle-independent-history.test.js": {
+      "sha256": "be01452fa3e43ce763213a45a673c3da229085a05aa820aff9c056c11683f510",
+      "size": 1839
+    },
+    "tests/candle-removal-event.test.js": {
+      "sha256": "d4bec871d9444eb4e635bac7597776358ffe1b42b096394e62ffa117012f7809",
+      "size": 2516
+    },
+    "tests/clock_fixture.py": {
+      "sha256": "193f202f5aa1bc31aa27276786f94f8b199995f4047b92337a107c2351f2cffa",
+      "size": 2276
+    },
     "tests/core.test.js": {
-      "sha256": "a86ff49725dc3f703a2dbcfc4ea4b5f4111f4c51625d7b18861c4def0deabea4",
-      "size": 32548
+      "sha256": "fa73fbf082caf19e3ca523b8541eaa1908bbad21301f95ccb17815662191d442",
+      "size": 32956
     },
     "tests/fixtures/candle-indicator-1.15.mq5": {
       "sha256": "251235a31a31c18631db2cc98e19c06a588ba26e4a3a23fdb2f4db826038037b",
@@ -128,16 +144,16 @@
       "size": 10821
     },
     "tests/reconciliation.test.js": {
-      "sha256": "6261a52ab08f83ae007182d8cf586663074ea82155bf6b6d4de89058674b82a2",
-      "size": 6703
+      "sha256": "ea49200b7ff7ae00a3fde9bb63c73b35bfa917d0ba27f240a09ec0bd3302d23b",
+      "size": 9927
     },
     "tests/renderer.test.js": {
-      "sha256": "9d46d10d047901a3313ab7bc1beda37658deb451b910bb02357a058ef4f6e3cb",
-      "size": 9633
+      "sha256": "95024c5d534ca0377410f4d8b5ca29d36012a0c01b58646927e9c8be37c13f6e",
+      "size": 11712
     },
     "tests/test_candles.py": {
-      "sha256": "6150446c7fc7a69f86eff0968287d0ea594542d524aab209a1ed5b8997c7c0d4",
-      "size": 16582
+      "sha256": "4c41fe1585823497c642a16366ab889d00081c0af7cb6e9eed507e42c231dc55",
+      "size": 28947
     },
     "tests/test_chart_policy.py": {
       "sha256": "4dde01a9f4dabad4d72c923af02c6959a0bc2f7a4e0f39291a086251d054e40c",

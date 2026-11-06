@@ -1,6 +1,6 @@
 const { createHash } = require('crypto');
 
-const { DEFAULT_SOURCES, sourceMap, brokerName } = require('./candle-mappings');
+const { DEFAULT_SOURCES, sourceMap, sourceLayouts, brokerName } = require('./candle-mappings');
 const GROUP_KEYS = { USTEC: 'TV → MT5 · USTEC', SPX500: 'TV → MT5 · SPX500' };
 const OWNER = 'tv-mt5-candles';
 
@@ -61,16 +61,23 @@ function candleKey(symbol, tf, time) { return `${symbol}|${tf}|${time}`; }
 
 class CandleLevelSync {
   constructor({ getConfig = () => ({}), getAdapter, publish = async () => {}, persist = async () => {},
-    initial = {}, onStatus = () => {}, onNeedBars = () => {}, clock = Date.now } = {}) {
+    initial = {}, onStatus = () => {}, onNeedBars = () => {}, diagnose = () => {}, clock = Date.now } = {}) {
     this.getConfig = getConfig; this.getAdapter = getAdapter; this.publish = publish;
     this.persist = persist; this.onStatus = onStatus; this.onNeedBars = onNeedBars; this.clock = clock;
     this.records = new Map(); this.bars = new Map(); this.busy = false; this.closed = false;
     this.dirty = false; this.publishNeeded = false; this.lastError = null;
     this.networkFailures = 0; this.networkRetryAt = 0; this.mappingSignature = null;
-    this.inventories = new Map(); this.missingSources = new Map();
+    this.inventories = new Map(); this.missingSources = new Map(); this.openCharts = null;
+    this.awaitingSources = new Set();
+    this.diagnose=diagnose;this.delayStates=new Map();this.publishedDiagnostics=new Map();
     for (const row of initial.records || []) {
       if (row && /^[a-f0-9]{24}$/.test(row.id || '') && /^[A-Za-z0-9_.:-]{1,160}$/.test(row.sourceId || '')
         && Number.isSafeInteger(row.revision) && row.revision > 0) {
+        // One bounded retry after upgrading the exact-window history reader.
+        // The source anchor stays unchanged; the VPS must prove the price anew.
+        const recoverHistory=!row.removed && row.phase==='error' && row.historyReaderRecovery!==1
+          && row.windowed && row.side && row.endTime
+          && /Invalid or incomplete MT5 minute window coverage|MT5 M1 history for the exact TV window is unavailable/.test(row.reason || '');
         const migrate = !row.removed && !row.windowed;
         const phase = row.removed || (row.side && row.endTime) ? 'queued' :
           !row.timeframe || (row.phase === 'error' && !row.selectionError) ? 'error' : 'awaiting-tv';
@@ -79,17 +86,40 @@ class CandleLevelSync {
           && ['high','low'].includes(row.side) && Number.isSafeInteger(row.endTime) && row.endTime>row.time
           && Number.isFinite(row.price) && row.price>0 && row.brokerSymbol===row.symbol;
         this.records.set(row.sourceId, { ...row, phase, windowed: true, restoredPrice,
-          ...(migrate ? { revision: row.revision + 1, retire: true, price: null } : {}) });
+          ...(migrate ? { revision: row.revision + 1, retire: true, price: null } : {}),
+          ...(recoverHistory ? {phase:'queued',revision:row.revision+1,historyReaderRecovery:1,
+            restoredPrice:false,price:null,reason:null,nextAttemptAt:0,requestRetryAt:0,requestFailures:0,requestError:null} : {}) });
+        if(recoverHistory)this.dirty=true;
+        if (!row.removed) this.awaitingSources.add(row.sourceId);
       }
     }
     this.publishNeeded = this.records.size > 0;
   }
 
   enabled() { return !this.closed && this.getConfig().enabled !== false; }
+  trace(row,event,details={}) {
+    try{this.diagnose({at:this.clock(),event,...(row ? {id:row.id,revision:row.revision,symbol:row.symbol,
+      sourceId:row.sourceId,timeframe:row.timeframe,phase:row.phase} : {}),...details})?.catch?.(()=>{});}catch{}
+  }
+  observeDelays(only) {
+    for(const row of only ? [only] : this.records.values()) {
+      const previous=this.delayStates.get(row.id),now=this.clock();
+      const signature=JSON.stringify([row.revision,row.phase,row.reason,row.requestError]);
+      if(previous?.signature===signature)continue;
+      const sameRevision=previous?.revision===row.revision;
+      const startedAt=sameRevision?previous.startedAt:now;
+      this.trace(row,'phase',{previousPhase:sameRevision?previous.phase:null,
+        phaseElapsedMs:sameRevision?Math.max(0,now-previous.at):null,elapsedMs:Math.max(0,now-startedAt),
+        reason:String(row.requestError || row.reason || '').slice(0,500)});
+      this.delayStates.set(row.id,{signature,revision:row.revision,phase:row.phase,
+        at:sameRevision && previous.phase===row.phase?previous.at:now,startedAt});
+    }
+  }
   reconfigure() {
-    const map = sourceMap(this.getConfig()), signature = JSON.stringify(map);
+    const map = sourceMap(this.getConfig()), layouts = sourceLayouts(this.getConfig()), signature = JSON.stringify([map, layouts]);
     if (signature === this.mappingSignature) return;
     const initial = this.mappingSignature === null;
+    this.missingSources.clear(); this.inventories.clear();
     let changed = false;
     this.mappingSignature = signature;
     for (const [sourceId, old] of this.records) {
@@ -100,6 +130,7 @@ class CandleLevelSync {
       const row = { ...old, symbol: target || old.symbol, mappingDisabled: !target, removed: !target,
         revision: old.revision + 1, price: null, retire: true, phase: target && (!old.side || !old.endTime) ? 'awaiting-tv' : 'queued',
         reason: null, nextAttemptAt: 0, requestRetryAt: 0, requestFailures: 0, requestError: null };
+      if (!target) this.awaitingSources.delete(sourceId);
       if (target) {
         const marker = Object.fromEntries(['id','sourceId','sourceSymbol','symbol','timeframe','time','sourcePrice','tool','colorRgb']
           .filter(key => row[key] != null).map(key => [key, row[key]]));
@@ -112,7 +143,9 @@ class CandleLevelSync {
     if (!initial || changed) this.onNeedBars();
   }
   requiredBars() {
+    const layouts = sourceLayouts(this.getConfig());
     return [...this.records.values()].filter(row => !row.removed && row.sourceSymbol && row.timeframe
+      && (!layouts[row.sourceSymbol] || row.sourceLayout === layouts[row.sourceSymbol])
       && Number.isSafeInteger(row.time) && row.time > 0 && (!row.side || !row.endTime))
       .map(row => ({ symbol: row.sourceSymbol, interval: row.timeframe, time: row.time }));
   }
@@ -123,13 +156,24 @@ class CandleLevelSync {
     for (const entry of snapshot.sources.slice(0, 2000)) {
       if (!Array.isArray(entry) || entry.length !== 2 || !entry[1]
         || !Number.isFinite(entry[1].serverUpdateTime) || entry[1].serverUpdateTime <= 0) continue;
-      this.acceptSource(entry[0], entry[1]);
+      this.acceptSource(entry[0], entry[1], { scope: snapshot.inventory?.scope });
     }
     this.reconcileInventory(snapshot.inventory, snapshot.readStartedAt);
+  }
+  acceptOpenCharts(scopes, readStartedAt) {
+    const now = this.clock(), observedAt = Number(readStartedAt);
+    const complete = Array.isArray(scopes) && scopes.length <= 16
+      && scopes.every(scope => /^[A-Za-z0-9_-]{1,128}$/.test(scope || ''))
+      && new Set(scopes).size === scopes.length
+      && Number.isFinite(observedAt) && observedAt <= now && now - observedAt <= 30000;
+    const signature = complete ? JSON.stringify([...scopes].sort()) : null;
+    if (!this.openCharts || signature !== this.openCharts.signature) this.missingSources.clear();
+    this.openCharts = { complete, signature, scopes: new Set(complete ? scopes : []), observedAt };
   }
   reconcileInventory(inventory, readStartedAt) {
     if (!inventory || !/^[A-Za-z0-9_-]{1,128}$/.test(inventory.scope || '')) return;
     const now = this.clock(), observedAt = Number(readStartedAt);
+    const layouts = sourceLayouts(this.getConfig());
     if (!Number.isFinite(observedAt) || observedAt > now || now - observedAt > 30000) return;
     for (const [scope, entries] of this.inventories) {
       if (![...entries.values()].some(entry => now - entry.observedAt <= 30000)) this.inventories.delete(scope);
@@ -137,7 +181,18 @@ class CandleLevelSync {
     const symbols = new Map();
     if (inventory.complete === true && Array.isArray(inventory.symbols) && inventory.symbols.length <= 32) {
       for (const entry of inventory.symbols) {
-        if (entry?.complete !== true || !sourceMap(this.getConfig())[entry.symbol]
+        // A pending deletion belonging to another proven source symbol cannot
+        // invalidate this symbol's inventory after a chart symbol switch.
+        const foreignDeletionsOnly = entry?.complete === false && Array.isArray(entry.pendingSaveIds)
+          && entry.pendingSaveIds.length > 0 && entry.pendingSaveIds.length <= 2000
+          && entry.pendingSaveIds.every(id => {
+            const row = typeof id === 'string' && this.records.get(id);
+            return row && row.sourceSymbol && row.sourceSymbol !== entry.symbol
+              && (layouts[row.sourceSymbol] ? layouts[row.sourceSymbol] === inventory.scope
+                : row.chartScopes?.includes(inventory.scope))
+              && (row.sourceLayout === inventory.scope || row.chartScopes?.includes(inventory.scope));
+          });
+        if ((entry?.complete !== true && !foreignDeletionsOnly) || !sourceMap(this.getConfig())[entry.symbol]
           || !Array.isArray(entry.ids) || entry.ids.length > 2000
           || !entry.ids.every(id => typeof id === 'string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(id))) continue;
         symbols.set(entry.symbol, { ids: new Set(entry.ids), observedAt });
@@ -147,6 +202,8 @@ class CandleLevelSync {
     while (this.inventories.size > 64) this.inventories.delete(this.inventories.keys().next().value);
     for (const row of this.records.values()) {
       if (row.removed) { this.missingSources.delete(row.sourceId); continue; }
+      const authority = layouts[row.sourceSymbol];
+      if (authority && inventory.scope !== authority) continue;
       const current = symbols.get(row.sourceSymbol);
       if (current?.ids.has(row.sourceId)) {
         const origins = Array.isArray(row.chartScopes) ? row.chartScopes : [];
@@ -157,21 +214,32 @@ class CandleLevelSync {
         }
         this.missingSources.delete(row.sourceId); continue;
       }
-      // Legacy records have no proven origin. An unrelated or closed layout
-      // cannot establish that such a source was deleted.
-      if (row.chartScopesOverflow || !Array.isArray(row.chartScopes) || !row.chartScopes.length) continue;
-      const proofs = row.chartScopes.map(scope => this.inventories.get(scope)?.get(row.sourceSymbol));
+      // A fresh complete tab listing distinguishes closed origins from open
+      // origins that failed to load. At least one proven origin must remain open.
+      if (!authority && (row.chartScopesOverflow || !Array.isArray(row.chartScopes) || !row.chartScopes.length)) continue;
+      const tabs = this.openCharts;
+      if (tabs && (!tabs.complete || now - tabs.observedAt > 30000)) {
+        this.missingSources.delete(row.sourceId); continue;
+      }
+      const origins = authority ? (tabs && !tabs.scopes.has(authority) ? [] : [authority])
+        : tabs ? row.chartScopes.filter(scope => tabs.scopes.has(scope)) : row.chartScopes;
+      if (!origins.length) { this.missingSources.delete(row.sourceId); continue; }
+      const proofs = origins.map(scope => this.inventories.get(scope)?.get(row.sourceSymbol));
       if (proofs.some(proof => !proof || now - proof.observedAt > 30000 || proof.ids.has(row.sourceId)
         || proof.observedAt <= (row.localEditAt || 0) || now - (row.localEditAt || 0) < 30000)) {
         this.missingSources.delete(row.sourceId); continue;
       }
+      // Sequential tab reads must not cancel the first completed absence cycle
+      // while the next cycle is still collecting the other open origins.
+      if (tabs && proofs.some(proof => proof.observedAt < tabs.observedAt)) continue;
       const stamp = Math.min(...proofs.map(proof => proof.observedAt));
       const pending = this.missingSources.get(row.sourceId);
       if (!pending || pending.revision !== row.revision) {
         this.missingSources.set(row.sourceId, { revision: row.revision, observedAt: stamp }); continue;
       }
-      if (stamp - pending.observedAt >= 1000) this.acceptSource(row.sourceId, null, { local: true });
+      if (stamp - pending.observedAt >= 1000) this.acceptSource(row.sourceId, null, { local: true, scope: authority });
     }
+    if (symbols.size) this.publishNeeded = true;
   }
   serialize() { return { schema: 1, records: [...this.records.values()].map(row => ({ ...row })) }; }
   status() {
@@ -181,14 +249,30 @@ class CandleLevelSync {
       pending: rows.filter(row => !['ready', 'error'].includes(row.phase)).length + removals.length,
       pendingRemovals: removals.length,
       errors: all.filter(row => (!row.removed && row.phase === 'error') || row.requestError).length,
+      awaitingSource: this.awaitingSources.size,
+      sourceWarning: this.awaitingSources.size ? 'После запуска: ожидание сверки уровней на рабочем графике ТВ' : null,
       reason: this.lastError || all.find(row => row.requestError)?.requestError
         || all.find(row => row.reason && (!row.removed || row.phase === 'deleting'))?.reason || null };
   }
 
-  acceptSource(sourceId, source, { local = false } = {}) {
+  acceptRemovalEvent(sourceId, record) {
+    const row = this.records.get(sourceId);
+    const scope = require('./candle-source-event').removalScope(record);
+    if (!scope || !row || row.removed || row.mappingDisabled || row.sourceLayout !== scope
+      || sourceLayouts(this.getConfig())[row.sourceSymbol] !== scope) return false;
+    return this.acceptSource(sourceId, null, { local: true, scope });
+  }
+
+  acceptSource(sourceId, source, { local = false, scope } = {}) {
     if (!this.enabled() || !sourceId) return false;
     this.reconfigure();
     const old = this.records.get(sourceId);
+    const symbol = String(source?.symbol || old?.sourceSymbol || '').toUpperCase();
+    const authority = sourceLayouts(this.getConfig())[symbol];
+    if (authority && scope !== authority) {
+      if (local) this.onNeedBars();
+      return false;
+    }
     // Outgoing line updates may carry properties without an anchor. They are
     // patches, not evidence that a confirmed candle or its price disappeared.
     if(source && old && source.state && (!source.state.type || ['LineToolHorzLine','LineToolHorzRay'].includes(source.state.type))
@@ -218,7 +302,11 @@ class CandleLevelSync {
     const sameCandle = marker && old && !old.removed && ['high', 'low'].includes(old.side)
       && ['sourceSymbol', 'symbol', 'timeframe', 'time', 'sourcePrice', 'tool'].every(key => marker[key] === old[key]);
     const signature = JSON.stringify(marker || { removed: !source, reason });
+    this.awaitingSources.delete(sourceId);
     if (old?.signature === signature) {
+      if (authority && old.sourceLayout !== authority) {
+        old.sourceLayout = authority; this.dirty = true; this.publishNeeded = true;
+      }
       if(old.sourceRefreshPending) {
         delete old.sourceRefreshPending;delete old.sourceAnchorChanged;
         this.dirty=true;this.publishNeeded=true;
@@ -232,6 +320,7 @@ class CandleLevelSync {
     const row = { ...(old || {}), ...(marker || {}), sourceId,
       id: marker?.id || old?.id || createHash('sha256').update('tv-candle:' + sourceId).digest('hex').slice(0, 24),
       revision: (old?.revision || 0) + 1, sourceVersion: Math.max(version, old?.sourceVersion || 0), localEdit: local, signature,
+      ...(authority ? { sourceLayout: authority } : {}),
       ...(local ? { localEditAt: this.clock() } : {}),
       side: sameCandle ? old.side : null, endTime: sameCandle ? old.endTime : null,
       windowed: true, price: null, removed: mappingDisabled || !source || (!marker && !reason), mappingDisabled,
@@ -242,6 +331,9 @@ class CandleLevelSync {
     if (marker && (!sameCandle || !old.endTime)) this.identify(row);
     if (mappingDisabled) { row.phase = 'queued'; row.reason = null; }
     this.records.set(sourceId, row); this.dirty = true; this.publishNeeded = true;
+    this.delayStates.delete(row.id);this.publishedDiagnostics.delete(row.id);
+    this.trace(row,'source-observed',{sourceSavedAt:row.sourceVersion,sourceAgeMs:Math.max(0,this.clock()-row.sourceVersion)});
+    this.observeDelays(row);
     if (marker && row.phase === 'awaiting-tv') this.onNeedBars();
     this.onStatus(this.status());
     return true;
@@ -294,25 +386,50 @@ class CandleLevelSync {
 
   async save() {
     if (!this.dirty) return;
+    this.observeDelays();
     const state = this.serialize(); this.dirty = false;
     try { await this.persist(state); } catch (error) { this.dirty = true; throw error; }
   }
 
   currentLevels() {
     const levels = {};
+    const layouts = sourceLayouts(this.getConfig());
     for (const row of this.records.values()) {
       try { brokerName(row.symbol); } catch { continue; }
       levels[row.symbol] ||= [];
+      if (layouts[row.sourceSymbol] && row.sourceLayout !== layouts[row.sourceSymbol]) continue;
       if (!row.removed && !row.sourceAnchorChanged && (row.phase === 'ready' || row.restoredPrice) && Number.isFinite(row.price) && row.price > 0) levels[row.symbol].push(row.price);
     }
     return Object.fromEntries(Object.entries(levels).map(([symbol, prices]) => [symbol, [...new Set(prices)].sort((a, b) => a - b)]));
+  }
+
+  publicationLevels() {
+    const levels = this.currentLevels();
+    // Preserve the existing LT group until every restored source for that
+    // instrument is observed or its absence is proven. Do not republish stale
+    // recovery prices while the user is viewing the other instrument.
+    for (const sourceId of this.awaitingSources) {
+      const row = this.records.get(sourceId);
+      if (row && !row.removed) delete levels[row.symbol];
+    }
+    return levels;
   }
 
   async publishCurrent() {
     if (!this.publishNeeded) return;
     this.publishNeeded = false;
     try {
-      await this.publish(this.currentLevels(), () => this.currentLevels());
+      const startedAt=this.clock();
+      const published=await this.publish(this.publicationLevels(), () => this.publicationLevels());
+      this.trace(null,'lt-publication',{elapsedMs:Math.max(0,this.clock()-startedAt)});
+      for(const row of this.records.values()) {
+        if(row.phase!=='ready' || row.removed || !published?.[row.symbol]?.includes(row.price))continue;
+        const signature=`${row.revision}:${row.price}`;
+        if(this.publishedDiagnostics.get(row.id)===signature)continue;
+        this.publishedDiagnostics.set(row.id,signature);
+        const started=this.delayStates.get(row.id)?.startedAt;
+        this.trace(row,'lt-published',{price:row.price,elapsedMs:Number.isFinite(started)?Math.max(0,this.clock()-started):null});
+      }
     } catch (error) { this.publishNeeded = true; throw error; }
   }
 
@@ -350,7 +467,11 @@ class CandleLevelSync {
       this.reconfigure();
       await this.save(); await this.publishCurrent();
       if (this.networkRetryAt > this.clock()) return;
+      const layouts = sourceLayouts(this.getConfig());
       const work = [...this.records.values()].filter(row => (row.requestRetryAt || 0) <= this.clock()
+        && (row.removed || !this.awaitingSources.has(row.sourceId)
+          || (row.retire && (!row.side || !row.endTime || row.phase === 'error')))
+        && (row.removed || !layouts[row.sourceSymbol] || row.sourceLayout === layouts[row.sourceSymbol])
         && (row.retire || row.phase === 'queued'
         || (['waiting-close', 'waiting-history'].includes(row.phase) && row.nextAttemptAt <= this.clock())))
         .sort((left, right) => Number(right.removed) - Number(left.removed)).slice(0, 4);
@@ -384,7 +505,11 @@ class CandleLevelSync {
           }
           await this.save();
           if (row !== this.records.get(row.sourceId) || row.revision !== revision || !this.enabled()) continue;
+          const startedAt=this.clock();
+          this.trace(row,'vps-request',{action:payload.action});
           const reply = await adapter.request('/candle-levels', payload);
+          this.trace(row,'vps-reply',{elapsedMs:Math.max(0,this.clock()-startedAt),
+            remoteStatus:reply?.candleLevels?.levels?.find(remote=>remote.id===row.id && remote.revision===revision)?.status || null});
           if (row !== this.records.get(row.sourceId) || row.revision !== revision || !this.enabled()) continue;
           if (!Array.isArray(reply?.candleLevels?.levels)) throw Error('Некорректный ответ свечных уровней MT5');
           row.retire = false; row.requestFailures = 0; row.requestRetryAt = 0; row.requestError = null;
@@ -399,12 +524,15 @@ class CandleLevelSync {
         } catch (error) {
           if (row !== this.records.get(row.sourceId) || row.revision !== revision) continue;
           row.requestError = String(error.message || error);
+          this.trace(row,'vps-error',{reason:row.requestError.slice(0,500)});
           row.requestRetryAt = this.clock() + Math.min(30000, 1000 * 2 ** Math.min((row.requestFailures || 0) + 1, 5));
           row.requestFailures = (row.requestFailures || 0) + 1; this.dirty = true;
         }
       }
       if ([...this.records.values()].some(row => ['drawing', 'deleting'].includes(row.phase))) {
+        const startedAt=this.clock();
         const reply = await adapter.request('/candle-levels');
+        this.trace(null,'indicator-read',{elapsedMs:Math.max(0,this.clock()-startedAt),snapshotApplied:reply?.candleLevels?.snapshotApplied===true});
         if (this.enabled()) this.acceptReply(reply.candleLevels);
       }
       this.lastError = null;
@@ -412,6 +540,7 @@ class CandleLevelSync {
       await this.save(); await this.publishCurrent();
     } catch (error) {
       this.lastError = String(error.message || error);
+      this.trace(null,'sync-error',{reason:this.lastError.slice(0,500)});
       this.networkRetryAt = this.clock() + Math.min(30000, 1000 * 2 ** Math.min(++this.networkFailures, 5));
     }
     finally { this.busy = false; this.onStatus(this.status()); }
@@ -421,9 +550,9 @@ class CandleLevelSync {
   stop() { this.closed = true; clearInterval(this.timer); }
 }
 
-function updateManagedLevels(config, levels) {
+function updateManagedLevels(config, levels, { preserveUnspecified = false } = {}) {
   const groups = config.groups.map(group => ({ ...group, levels: group.levels.slice() }));
-  for (const group of groups) if (group.source === OWNER) group.levels = levels[group.ticker] || [];
+  for (const group of groups) if (group.source === OWNER && (!preserveUnspecified || Object.hasOwn(levels, group.ticker))) group.levels = levels[group.ticker] || [];
   for (const [symbol, prices] of Object.entries(levels)) {
     try { brokerName(symbol); } catch { continue; }
     const key = GROUP_KEYS[symbol] || `TV → MT5 · ${symbol}`;

@@ -1,5 +1,5 @@
 'use strict';
-const { snapshotCandlePage, candleWindowReader } = require('./page');
+const { snapshotCandlePage, candleWindowReader, readCandleHistory } = require('./page');
 const { createHash } = require('crypto');
 
 function localDebugger(value) {
@@ -51,11 +51,13 @@ async function targets(signal) {
   if (!response.ok) throw Error('Не удалось получить вкладки TradingView');
   const value = await response.json();
   if (!Array.isArray(value)) throw Error('Некорректный список вкладок TradingView');
-  return value.filter(row => chart(row.url) && localDebugger(row.webSocketDebuggerUrl)).slice(0, 16);
+  const charts=value.filter(row=>chart(row.url));
+  if(charts.length>16)throw Error('Слишком много открытых графиков для полной сверки');
+  return charts;
 }
-function startReader({ enabled, acceptSnapshot, acceptInventory = () => {}, sources, anchors, onError = () => {},
+function startReader({ enabled, acceptSnapshot, acceptInventory = () => {}, acceptOpenCharts=()=>{}, sourceLayouts=()=>({}), sources, anchors, onError = () => {},
   getTargets = targets, run = evaluate, intervalMs = 10000, setTimer = setTimeout, clearTimer = clearTimeout }) {
-  let closed = false, running = false, timer, controller;
+  let closed = false, running = false, timer, controller, refreshPending=false, historyCursor=0;
   const active = () => !closed && enabled();
   const seen = new Map(), installed = new Set(), inventories = new Map();
   const collector = snapshotCandlePage.toString(), calendar = candleWindowReader.toString();
@@ -63,15 +65,18 @@ function startReader({ enabled, acceptSnapshot, acceptInventory = () => {}, sour
   function schedule(delay) { clearTimer(timer); if (!closed) { timer = setTimer(tick, delay); timer.unref?.(); } }
   async function tick() {
     if (closed || running) return;
-    running = true; controller = new AbortController();
+    running = true; refreshPending=false; controller = new AbortController();
     try {
       if (!active()) { seen.clear(); installed.clear(); inventories.clear(); return; }
-      const charts = await getTargets(controller.signal);
+      const discoveredAt=Date.now(),allCharts = await getTargets(controller.signal);
+      if(!active())return;
+      await acceptOpenCharts([...new Set(allCharts.map(target=>target.url?.match(/\/chart\/([A-Za-z0-9_-]+)(?:\/|[?#]|$)/)?.[1]).filter(Boolean))],discoveredAt);
+      const charts=allCharts.filter(target=>target.webSocketDebuggerUrl);
       for (const target of charts) {
         if (!active()) break;
         try {
         const scope = target.url?.match(/\/chart\/([A-Za-z0-9_-]+)(?:\/|[?#]|$)/)?.[1], readStartedAt = Date.now();
-        const options = JSON.stringify({ selective: true, scope, sources: sources(), anchors: anchors(), ack: seen.get(target.id) });
+        const options = JSON.stringify({ selective: true, scope, sources: sources(), sourceLayouts:sourceLayouts(), anchors: anchors(), ack: seen.get(target.id) });
         let result;
         if (installed.has(target.id)) result = await run(target.webSocketDebuggerUrl, `(() => {
           const runtime = window.__isccAddonCandleRuntime;
@@ -107,11 +112,18 @@ function startReader({ enabled, acceptSnapshot, acceptInventory = () => {}, sour
           if (active()) onError(error);
         }
       }
+      const required=anchors();
+      if(active() && charts.length && required.length){
+        const anchor=required[(historyCursor++)%required.length];
+        const series=await run(charts[0].webSocketDebuggerUrl,
+          `(${readCandleHistory.toString()})(${JSON.stringify(anchor)},(${calendar}))`,{signal:controller.signal});
+        if(active() && series)await acceptSnapshot({sources:[],series:[series]});
+      }
       for (const id of installed) if (!charts.some(target => target.id === id)) { seen.delete(id); installed.delete(id); inventories.delete(id); }
-    } catch (error) { if (active()) onError(error); }
-    finally { running = false; controller = undefined; schedule(intervalMs); }
+    } catch (error) { if (active()) {await acceptOpenCharts(null,Date.now());onError(error);} }
+    finally { running = false; controller = undefined; schedule(refreshPending?250:intervalMs); }
   }
   schedule(1000);
-  return { refresh() { if (!running) schedule(250); }, stop() { closed = true; clearTimer(timer); controller?.abort(); seen.clear(); installed.clear(); inventories.clear(); } };
+  return { refresh() {if(closed)return;const pending=refreshPending;refreshPending=true;if(!running&&!pending)schedule(250);}, stop() { closed = true; clearTimer(timer); controller?.abort(); seen.clear(); installed.clear(); inventories.clear(); } };
 }
 module.exports = { startReader, chart, localDebugger, evaluate };

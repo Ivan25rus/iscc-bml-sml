@@ -53,18 +53,18 @@ function syncChunkPercentField(input,entry,draft,defaultPercent=20) {
 function createLevelOrderBody(row, key, $pointSize) {
   const setChanged = (target, property, value) => { if (target[property] !== value) target[property] = value; };
   const defaults = resolveLevelOrderDefaults(levelOrderCfg, row.ticker);
+  const maxLot = Number(defaults.maxLot ?? 0);
   const stopMode = row.stopMode ?? defaults.stopMode;
   const defaultRisk = orderCalc.defaultRiskUsd({symbol:row.ticker,
     instrumentType:row.instrumentType || detectInstrumentType(row.ticker)});
-  const saved = uiState.get(key) || {
+  const saved = require('./services/mt5-vps/cardDrafts').restoreDraft(uiState.get(key) || {
     level:row.level != null ? String(row.level) : '',
     risk:row.riskUsd != null ? String(row.riskUsd) : String(defaultRisk ?? ''),
     stopOffsetPts:String(row.stopOffsetPts ?? defaults.stopOffsetPts ?? ''),
     maxLot:String(row.maxLot ?? defaults.maxLot ?? 0),
     takeProfitPts:String(row.takeProfitPts ?? defaults.takeProfitPts ?? ''),
-    pointSize:String(row.pointSize ?? ''),
-    ...(row.followNearestLT && !row.chunkEntryId ? indexCardDrafts.get(indexSymbol(row.ticker)) : {})
-  };
+    pointSize:String(row.pointSize ?? '')
+  },indexCardDrafts.get(indexSymbol(row.ticker)),!isLiveIndexCard(row) || !!row.chunkEntryId || chunkCardLocked(key) || cardStates.has(key));
   let tracksLevel = row.followNearestLT || normalizeLevelPlaceholder(saved.level) === NEAREST_TRACKED_LEVEL_PLACEHOLDER;
   let trackedPreview = trackedLevelPreviews.get(trackedTickerKey(row.ticker));
   const allowsMarketEntry = isLiveIndexCard(row) && tracksLevel;
@@ -72,8 +72,8 @@ function createLevelOrderBody(row, key, $pointSize) {
   if ($pointSize) $pointSize.value = saved.pointSize || '';
 
   const line = el('div','quad-line level-order-line');
-  line.style.cssText = 'display:grid;grid-template-columns:repeat(5,1fr);align-items:center;gap:8px';
   const $level = inputNumber('Level','level');
+  $level.classList.add('card__level');
   $level.type = 'text';
   $level.readOnly = !!row.followNearestLT;
   $level.value = tracksLevel ? saved.displayedLevel || '' : saved.level;
@@ -84,13 +84,18 @@ function createLevelOrderBody(row, key, $pointSize) {
     ? 'Расстояние от цены входа до SL в шагах цены. Для USTEC 1600 = 16 пунктов индекса.'
     : 'Отступ SL от уровня в шагах цены.';
   $stopOffset.setAttribute('aria-label',stopMode === 'entry' ? 'SL от входа' : 'Стоп от уровня');
-  const $maxLot = inputNumber('Max lot','qty');
   const $tp = inputNumber('TP pts','tp');
   $risk.value = saved.risk;
   $stopOffset.value = saved.stopOffsetPts;
-  $maxLot.value = saved.maxLot;
   $tp.value = saved.takeProfitPts;
-  line.append($level,$risk,$stopOffset,$maxLot,$tp);
+  $level.placeholder='—';
+  $level.title=tracksLevel ? 'Ближайший уровень LT: переключается автоматически.' : 'Ручной уровень';
+  $level.setAttribute('aria-label','Уровень набора');
+  $risk.title='Риск в долларах на основном счёте.';
+  $tp.title='Тейк-профит в шагах цены.';
+  for(const [input,label] of [[$risk,'Риск в долларах'],[$tp,'Тейк-профит']])input.setAttribute('aria-label',label);
+  for(const input of [$risk,$stopOffset,$tp])input.placeholder='';
+  line.append($level,$risk,$stopOffset,$tp);
 
   const marketButtons = [];
   for (const [action,label,style] of [['MB','BML','bl'],['MS','SML','sl']]) {
@@ -111,6 +116,16 @@ function createLevelOrderBody(row, key, $pointSize) {
   chunkProgress.setAttribute('role','status');chunkProgress.setAttribute('aria-live','polite');
   const chunkAccounts = el('div','level-chunk-accounts');
   chunkAccounts.setAttribute('aria-label','Объём набора по счетам');
+  const chunkSummary=el('div','level-chunk-summary');
+  const $chunkProtection=btn('T|S','level-chunk-protection',event=>{
+    event?.stopPropagation?.();
+    if($toolbarMenu)$toolbarMenu.open=false;
+    const wanted=require('./services/mt5-vps/managementTarget').entryTarget(chunkEntriesByKey.get(key));
+    if(wanted)document.getElementById('mt5-manage-button')?.openTarget?.(wanted);
+  });
+  $chunkProtection.title='Перенести стоп и тейк этого набора · M1 за 30 минут';
+  $chunkProtection.setAttribute('aria-label','Стоп и тейк этого набора');$chunkProtection.hidden=true;
+  chunkSummary.append(chunkAccounts,$chunkProtection);
   const chunkDetail = el('div','level-chunk-reason');
   chunkDetail.setAttribute('role','status');
   const chunkActions = el('div','level-chunk-actions');
@@ -121,7 +136,7 @@ function createLevelOrderBody(row, key, $pointSize) {
   });
   $chunkStop.title = 'Остановить ненабранный объём. Открытые позиции и их SL сохраняются.';
   chunkActions.append($chunkStop);
-  chunkPanel.append(chunkProgress,chunkAccounts,chunkDetail,chunkActions);
+  chunkPanel.append(chunkProgress,chunkSummary,chunkDetail,chunkActions);
   let marketPreview = {valid:false,reason:''};
 
   function entryPrice() { return _normNum($level.value); }
@@ -136,7 +151,7 @@ function createLevelOrderBody(row, key, $pointSize) {
   }
   function validateMarket(action) {
     const level=_normNum($level.value),center=entryPrice(),info=instrumentInfoFor(row.ticker,row);
-    const risk=_normNum($risk.value),stopOffsetPts=_normNum($stopOffset.value),maxLot=_normNum($maxLot.value),takeProfitPts=_normNum($tp.value);
+    const risk=_normNum($risk.value),stopOffsetPts=_normNum($stopOffset.value),takeProfitPts=_normNum($tp.value);
     const specifications=info?.provider==='mt5-vps' && [info.tickSize,info.quantityStep,info.contractSize,info.maxQty].every(isPos);
     if (allowsMarketEntry && specifications && isPos(level)) prepareMarketEntry();
     const check=validateTrackedEntry({groups:marketGroups,symbol:row.ticker,level,entryPrice:center});
@@ -173,11 +188,10 @@ function createLevelOrderBody(row, key, $pointSize) {
     uiState.set(key,{
       level:tracksLevel ? NEAREST_TRACKED_LEVEL_PLACEHOLDER : $level.value,
       displayedLevel:tracksLevel ? $level.value : undefined,risk:$risk.value,stopOffsetPts:$stopOffset.value,
-      maxLot:$maxLot.value,takeProfitPts:$tp.value,pointSize:$pointSize?.value || '',
+      maxLot:String(maxLot),takeProfitPts:$tp.value,pointSize:$pointSize?.value || '',
       zoneMultiplier:1,
       manualEntry:false,stopExpanded:false,entryMode:'side-zone'
     });
-    if(allowsMarketEntry && !chunkCardLocked(key) && !cardStates.has(key))indexCardDrafts.set(indexSymbol(row.ticker),uiState.get(key));
   }
   const body = {
     type:'levelOrder',line,
@@ -192,13 +206,23 @@ function createLevelOrderBody(row, key, $pointSize) {
     setNote(note) {this._note=note;note.classList.add('card__note--quiet');note.hidden=true;},
     updateChunks() {
       const entry=chunkEntriesByKey.get(key),locked=!!entry,card=cardByKey(key);
+      if(!entry && chunkPanel.dataset.entryId) {
+        delete chunkPanel.dataset.entryId;
+        const draft=indexCardDrafts.get(indexSymbol(row.ticker));
+        for(const [field,input]of [['risk',$risk],['stopOffsetPts',$stopOffset],['takeProfitPts',$tp]])
+          if(Object.hasOwn(draft,field))input.value=draft[field];
+        persist();
+      }
       if (entry && entry.phase!=='arming' && chunkPanel.dataset.entryId!==entry.id) {
         chunkPanel.dataset.entryId=entry.id;
         if(entry.level!=null)$level.value=String(entry.level);
         if(entry.riskUsd!=null)$risk.value=String(entry.riskUsd);
         if(entry.stopOffsetPts!=null)$stopOffset.value=String(entry.stopOffsetPts);
+        $tp.value=entry.takeProfitPts==null ? '' : String(entry.takeProfitPts);
         persist();
       }
+      if(entry)setChanged($level,'title','Уровень набора: '+$level.value+'. Зафиксирован при запуске.');
+      else setChanged($level,'title',tracksLevel ? trackedLevelReason() || 'Ближайший уровень LT: переключается автоматически.' : 'Ручной уровень');
       const accounts=chunkAccountText(entry);
       const pendingLimit=entry?.children?.some(child=>child.type==='limit' && child.state==='pending');
       const laneFailed=Object.entries(entry?.lanePhases || {}).some(([account,value])=>value==='unknown'
@@ -226,6 +250,7 @@ function createLevelOrderBody(row, key, $pointSize) {
       setChanged(chunkProgress.dataset,'error',String(failed));
       setChanged(chunkActions.style,'visibility',locked ? 'visible' : 'hidden');
       const hasFills=Object.values(entry?.accounts || {}).some(account=>Number(account.filledVolume)>0);
+      setChanged($chunkProtection,'hidden',!require('./services/mt5-vps/managementTarget').entryTarget(entry));
       const canContinue=chunkContinueAccounts(entry).length>0;
       setChanged($chunkStop,'textContent',entry?._armUnconfirmed ? 'Снять неподтверждённый вход'
         : entry?.phase==='arming' ? 'Отменить вход'
@@ -286,13 +311,13 @@ function createLevelOrderBody(row, key, $pointSize) {
       if (['MB','MS'].includes(actionForValidation)) return validateMarket(actionForValidation);
       if (allowsMarketEntry) validateMarket();
       if (cardStates.has(key) || chunkCardLocked(key)) {
-        line.querySelectorAll('input').forEach(input=>{if(input.classList.contains('input--error'))input.classList.remove('input--error');});
+        [$level,...line.querySelectorAll('input')].forEach(input=>{if(input.classList.contains('input--error'))input.classList.remove('input--error');});
         this._btns?.querySelectorAll('button').forEach(button=>setChanged(button,'disabled',true));
         if(this._note){setChanged(this._note,'textContent','');setChanged(this._note.style,'visibility','hidden');}
         this.updateChunks();persist();return {valid:false,type:'levelOrder'};
       }
       const level=_normNum($level.value),levelPlaceholder=tracksLevel ? NEAREST_TRACKED_LEVEL_PLACEHOLDER : normalizeLevelPlaceholder($level.value);
-      const risk=_normNum($risk.value),stopOffsetPts=_normNum($stopOffset.value),maxLot=_normNum($maxLot.value),takeProfitPts=_normNum($tp.value);
+      const risk=_normNum($risk.value),stopOffsetPts=_normNum($stopOffset.value),takeProfitPts=_normNum($tp.value);
       const pointSize=_normNum($pointSize?.value),info=instrumentInfoFor(row.ticker,row);
       const pointSizeOk=!$pointSize || $pointSize.value==='' || isPos(pointSize);
       const tick=pointSizeOk && isPos(pointSize) ? pointSize : tickSize(row);
@@ -317,7 +342,7 @@ function createLevelOrderBody(row, key, $pointSize) {
         : !quoteOk(requested || 'LB') ? quotes[requested || 'LB']?.reason : !quoteOk('LS') ? quotes.LS.reason : '';
       line.classList.toggle('card--invalid',!valid && !marketPreview.valid);
       for(const [input,bad] of [[$level,!levelOk || !trackedReady && !marketPreview.valid],[$risk,!isPos(risk)],
-        [$stopOffset,!isSL(stopOffsetPts)],[$maxLot,!maxLotOk],[$tp,!tpOk],[$pointSize,!pointSizeOk]]) {
+        [$stopOffset,!isSL(stopOffsetPts)],[$tp,!tpOk],[$pointSize,!pointSizeOk]]) {
         input?.classList.toggle('input--error',!!bad);
       }
       this._btns?.querySelectorAll('[data-kind="LB"],[data-kind="LS"]').forEach(button=>{
@@ -351,7 +376,7 @@ function createLevelOrderBody(row, key, $pointSize) {
     const numeric=Number(result?.ok ? result.level : result?.source?.nearestLevel ?? nearest);
     if(Number.isFinite(numeric) && numeric>0)setChanged($level,'value',String(numeric));
     else if(result && !(result.unavailable || result.source?.unavailable))setChanged($level,'value','');
-    setChanged($level,'placeholder','Уровень LT');
+    setChanged($level,'placeholder','—');
     setChanged($level,'title',trackedLevelReason() || 'Ближайший уровень LT: переключается автоматически.');
     body.validate();
   };
@@ -359,10 +384,14 @@ function createLevelOrderBody(row, key, $pointSize) {
     if(row.followNearestLT){$level._applyTrackedLevelPreview(trackedLevelPreviews.get(trackedTickerKey(row.ticker)));return;}
     tracksLevel=normalizeLevelPlaceholder($level.value)===NEAREST_TRACKED_LEVEL_PLACEHOLDER;
     if(tracksLevel){$level.dataset.trackedTicker=row.ticker;$level._applyTrackedLevelPreview(trackedLevelPreviews.get(trackedTickerKey(row.ticker)));requestTrackedLevelPreview(row.ticker);}
-    else {delete $level.dataset.trackedTicker;$level.placeholder='Level';$level.title='Ручной уровень';}
+    else {delete $level.dataset.trackedTicker;$level.placeholder='—';$level.title='Ручной уровень';}
   });
-  for(const input of [$level,$risk,$stopOffset,$maxLot,$tp,$pointSize].filter(Boolean)) {
-    input.addEventListener('input',()=>{indexCardEdits.set(key,++indexCardEditRevision);markTouched(row.ticker);persist();body.validate();});
+  for(const input of [$level,$risk,$stopOffset,$tp,$pointSize].filter(Boolean)) {
+    input.addEventListener('input',()=>{
+      indexCardEdits.set(key,++indexCardEditRevision);markTouched(row.ticker);persist();
+      if(isLiveIndexCard(row) && !chunkCardLocked(key) && !cardStates.has(key))indexCardDrafts.set(indexSymbol(row.ticker),uiState.get(key));
+      body.validate();
+    });
   }
   if(tracksLevel){$level._applyTrackedLevelPreview(trackedPreview);requestTrackedLevelPreview(row.ticker);}
   return body;

@@ -27,7 +27,7 @@ function fixture(t,{journalFile}={}) {
     calls.push({route,payload:payload && copy(payload),options});
     if(route==='/management'){assert.equal(payload,undefined);return copy(state);}
     if(route.startsWith('/receipt?id=')){assert.equal(payload,undefined);return {result:receipts[decodeURIComponent(route.split('=')[1])] || null};}
-    assert.ok(['/entry-plan-protection','/entry-plan-close','/modify'].includes(route));
+    assert.ok(['/entry-plan-protection','/entry-plan-close','/entry-parent-take','/modify'].includes(route));
     if(reply)return reply(route,payload,options);
     const accounts=route==='/entry-plan-close' ? Object.keys(parent.accounts) : [payload.account,...(payload.mirrorAccounts || []).map(row=>row.account)];
     return {result:{id:payload.id,entryId:payload.entryId,status:'ok',accountResults:Object.fromEntries(accounts.map(account=>[account,{status:'ok',averagePrice:25005}]))},
@@ -35,6 +35,117 @@ function fixture(t,{journalFile}={}) {
   };
   return {adapter,config,row,plan,parent,state,calls,receipts,setReply:value=>{reply=value;},posts:()=>calls.filter(call=>call.payload)};
 }
+function independentFixture(t) {
+  const f=fixture(t);
+  f.adapter.capabilities=['entry-exact-parent-close-v1','entry-account-controls-v1'];
+  f.parent.accountExecution='independent-v5';f.parent.independentAccountControls=true;
+  for(const view of [f.state,...Object.values(f.state.accountStates)]) {
+    view.capabilities.push('entry-account-controls-v1');
+    for(const row of view.orders)row.entryPlan.independentAccountControls=true;
+  }
+  return f;
+}
+test('Separate partial take journals a price/percent condition without modifying native TP or closing a child',async t=>{
+  const f=independentFixture(t);f.adapter.capabilities.push('entry-parent-partial-take-v1');
+  f.setReply(async(route,payload)=>({result:{id:payload.id,entryId:payload.entryId,status:'ok',operation:payload.operation,
+    rule:{id:payload.operation==='arm'?payload.id:payload.ruleId,entryId:payload.entryId,symbol:'USTEC',targetPrice:25030,closePercent:50,
+      accounts:{[primary]:{state:'armed'},[follower]:{state:'armed'}}}}}));
+  const result=await f.adapter.configureParentTake(f.row,{operation:'arm',targetPrice:25030,closePercent:50});
+  assert.equal(result.status,'ok',result.reason);assert.equal(f.posts().length,1);
+  const post=f.posts()[0];assert.equal(post.route,'/entry-parent-take');assert.equal(post.payload.targetPrice,25030);
+  assert.equal(post.payload.closePercent,50);assert.equal(post.payload.tp,undefined);assert.equal(post.payload.ticket,undefined);
+  const record=f.adapter.commandJournal.records[0];assert.equal(record.operation,'entry-take');assert.equal(record.ticket,'entry:entry-1');
+  assert.equal(f.adapter.validateCommandReceipt(record.id,{...result,rule:{...result.rule,entryId:'wrong'}}),null);
+  assert.equal((await f.adapter.configureParentTake(f.row,{operation:'cancel',ruleId:result.rule.id})).status,'ok');
+  assert.equal(f.posts().length,2);
+});
+test('An old VPS or invalid partial-take percentage cannot become a child price rule or broker TP',async t=>{
+  const f=independentFixture(t);
+  assert.equal((await f.adapter.configureParentTake(f.row,{operation:'arm',targetPrice:25030,closePercent:50})).status,'rejected');
+  f.adapter.capabilities.push('entry-parent-partial-take-v1');
+  for(const value of [0,100,NaN,-1])assert.equal((await f.adapter.configureParentTake(f.row,{operation:'arm',targetPrice:25030,closePercent:value})).status,'rejected');
+  assert.equal(f.posts().length,0);
+});
+test('Parent partial close sends one durable percentage intent for every captured account and retains the open remainder',async t=>{
+  const f=independentFixture(t);f.adapter.capabilities.push('entry-parent-partial-close-v1');
+  f.adapter.chunkLifecycleEntries=new Map([[f.parent.id,copy(f.parent)]]);
+  f.setReply(async(route,payload)=>({result:{id:payload.id,entryId:payload.entryId,status:'ok',closePercent:50,
+    accountResults:{[primary]:{status:'ok',filledVolume:.2,remainingVolume:.3},[follower]:{status:'ok',filledVolume:.4,remainingVolume:.4}}},
+    entry:{...copy(f.parent),phase:'stopped',positionsConfirmed:true,hasOpenPositions:true,positionLifecycle:'open'}}));
+  const result=await f.adapter.closeEntryPosition({id:f.parent.id,symbol:'USTEC'},{closePercent:50});
+  assert.equal(result.status,'ok');assert.equal(result.entry.hasOpenPositions,true);
+  assert.equal(result.entry._controlReceipt.operation,'entry-partial-close');
+  assert.equal(f.posts().length,1);assert.equal(f.posts()[0].payload.closePercent,50);
+  assert.equal(f.posts()[0].payload.ticket,undefined);
+  const record=f.adapter.commandJournal.records[0];assert.equal(record.operation,'entry-partial-close');
+  assert.deepEqual(record.payload.capturedAccounts,[follower,primary]);
+  assert.equal(f.adapter.validateCommandReceipt(record.id,result),result);
+  assert.equal(f.adapter.validateCommandReceipt(record.id,{...result,closePercent:25}),null);
+});
+test('Parent partial close requires its protocol and exact percentage receipts; it never falls back to a child',async t=>{
+  const old=independentFixture(t);
+  assert.equal((await old.adapter.closeEntryPosition(old.parent,{closePercent:50})).status,'rejected');
+  assert.equal(old.posts().length,0);
+  for(const percent of [0,100,-1,NaN,'50']){
+    const f=independentFixture(t);f.adapter.capabilities.push('entry-parent-partial-close-v1');
+    assert.equal((await f.adapter.closeEntryPosition(f.parent,{closePercent:percent})).status,'rejected');
+    assert.equal(f.posts().length,0);
+  }
+  const f=independentFixture(t);f.adapter.capabilities.push('entry-parent-partial-close-v1');
+  f.adapter.chunkLifecycleEntries=new Map([[f.parent.id,copy(f.parent)]]);
+  assert.equal((await f.adapter.closeEntryPosition(f.parent,{closePercent:50})).status,'unknown');
+  assert.equal(f.posts().length,1); // The mock full-close receipt has no partial-close proof.
+});
+test('Mac links one parent with two positions against one for Nasdaq and SPX from either selected account',async t=>{
+  for(const symbol of ['USTEC','SPX500'])for(const split of [primary,follower])for(const selected of [primary,follower]) {
+    const f=independentFixture(t);f.parent.symbol=symbol;
+    for(const [account,view]of Object.entries(f.state.accountStates)) {
+      const base={...copy(view.orders[0]),symbol,lots:1};
+      view.orders=account===split ? [{...copy(base),lots:.3},{...copy(base),ticket:base.ticket+'9',lots:.7}] : [base];
+    }
+    f.state.orders=copy(f.state.accountStates[primary].orders);
+    const target=copy(f.state.accountStates[selected].orders[0]);
+    f.setReply(async(route,payload)=>{
+      assert.equal(route,'/entry-plan-protection');
+      return {result:{id:payload.id,entryId:f.plan.id,status:'ok',independentAccountControls:true,
+        accountResults:Object.fromEntries(Object.entries(f.state.accountStates).map(([account,view])=>[account,{status:'ok',positions:copy(view.orders)}]))},
+        entry:copy(f.parent)};
+    });
+    const result=await f.adapter.modifyEntryProtection(target,{sl:24990},{account:selected});
+    assert.equal(result.status,'ok',result.reason);
+    assert.equal(f.posts().length,1);assert.equal(f.posts()[0].route,'/entry-plan-protection');
+    assert.equal(f.posts()[0].payload.entryId,f.plan.id);assert.equal(f.posts()[0].payload.symbol,symbol);
+    assert.equal(f.posts()[0].payload.account,selected);
+    assert.deepEqual(f.posts()[0].payload.mirrorAccounts,[{account:selected===primary?follower:primary}]);
+    assert.equal(result.accountResults[split].positions.length,2);
+    assert.equal(result.accountResults[split===primary?follower:primary].positions.length,1);
+  }
+});
+test('Independent controls send new desired levels and close despite an unknown peer; legacy commands retain their barrier',async t=>{
+  const f=independentFixture(t);
+  f.setReply(async(_route,payload)=>({result:{id:payload.id,entryId:f.plan.id,status:'unknown',independentAccountControls:true,
+    accountResults:{[primary]:{status:'ok'},[follower]:{status:'unknown'}}},entry:copy(f.parent)}));
+  assert.equal((await f.adapter.modifyEntryProtection(f.row,{sl:24990})).status,'unknown');
+  assert.equal((await f.adapter.modifyEntryProtection(f.row,{sl:24991})).status,'unknown');
+  assert.equal(f.posts().length,2);assert.notEqual(f.posts()[0].payload.id,f.posts()[1].payload.id);
+  assert.equal(f.posts()[1].payload.sl,24991);
+  assert.ok(f.adapter.commandJournal.records.every(row=>row.payload.independentAccountControls===true));
+  f.adapter.chunkLifecycleEntries=new Map([[f.parent.id,copy(f.parent)]]);
+  assert.equal((await f.adapter.closeEntryPosition(f.parent)).status,'unknown');
+  assert.equal(f.posts().length,3);
+  f.adapter.commandJournal.records.push({id:'legacy',operation:'entry-protection',ticket:'entry:'+f.plan.id,payload:{entryId:f.plan.id},result:{status:'unknown'}});
+  assert.equal((await f.adapter.modifyEntryProtection(f.row,{sl:24992})).status,'unknown');
+  assert.equal(f.posts().length,3);
+});
+test('Independent protection policy uses the selected account and retains local uncertainty checks',t=>{
+  const f=independentFixture(t),row=f.state.accountStates[primary].orders[0];
+  f.state.accountStates[follower].connected=false;
+  const command={ticket:'entry:'+f.plan.id,payload:{entryId:f.plan.id,independentAccountControls:true},result:{status:'unknown'}};
+  const options={row,account:primary,linked:true,capabilities:f.state.capabilities,commands:[command],accountStates:f.state.accountStates};
+  assert.equal(entryProtectionBlock(options),'');assert.equal(managementBlock(options),'');
+  assert.ok(entryProtectionBlock({...options,row:{...row,entryPlan:{...row.entryPlan,phase:'unknown',protectionReady:false}}}));
+  assert.ok(entryProtectionBlock({...options,capabilities:[cap]}));
+});
 test('Close skips a broken unrelated receipt and retains exact pre-send timing',async t=>{
   const f=fixture(t),journal=f.adapter.commandJournal;
   journal.records.push({id:'old-unrelated',ticket:'entry:old',operation:'entry-close',payload:{entryId:'old'},result:{status:'unknown'}});

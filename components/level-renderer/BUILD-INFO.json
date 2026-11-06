@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "kind": "iscc-renderer-addon",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "indicatorVersion": "1.17",
   "fullAuthorPanelIncluded": false,
   "tradingReceiverIncluded": false,

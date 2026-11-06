@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
 import test_hybrid_protection as fixture
-from chunk_entry import IsolatedEntries, ChunkEntries, SingleAccountLane
+from chunk_entry import IsolatedEntries, ChunkEntries, SingleAccountLane, account_entry_sizes
 from mt5_bridge import CoordinatorBridge,worker_result
 
 
@@ -43,6 +43,60 @@ class IsolatedEngineTests(unittest.TestCase):
             paths=[engine.bridge.db.execute('PRAGMA database_list').fetchone()[2] for engine in f.engine.shards.values()]
             self.assertEqual(len(set(paths)),2)
             self.assertTrue(all(engine._load(f.payload['id'])[1]['initialSizingOnly'] for engine in f.engine.shards.values()))
+
+    def test_fractional_multiplier_rounds_parts_to_native_step_and_scales_risk(self):
+        for side in ('buy','sell'):
+            with self.subTest(side=side):
+                f=self.make(side)
+                f.payload.update(volume=.5,chunkVolume=.2,chunkPercent=50,riskUsd=13,
+                    stopOffsetPts=250,sl=24975. if side=='buy' else 25025.,
+                    mirrorAccounts=[dict(account='900000001',multiplier=1.6)])
+                f.primary.config['entryRiskLimitUsd']=13
+                f.payload['entryRiskLimitUsd']=13
+                for native in f.natives:
+                    native.info.volume_step=native.info.volume_min=.1
+                    native.group_budgets['cid:protection-one']=(.5 if native.account.login==900000002 else .8,
+                        13 if native.account.login==900000002 else 20.8)
+                f.engine.arm(f.payload)
+                state=self.until(f,lambda s:s['phase'] not in ('armed','running','paused','sending'))
+                self.assertEqual(state['phase'],'completed',state)
+                for account,target,budget in [('900000002',.5,13),('900000001',.8,20.8)]:
+                    details=state['accounts'][account]
+                    self.assertEqual(details['targetVolume'],target)
+                    self.assertEqual(details['filledVolume'],target)
+                    self.assertEqual(details['riskUsd'],budget)
+                    self.assertLessEqual(details['riskUsed'],budget+1e-8)
+                    parts=f.engine.shards[account]._load(f.payload['id'])[2]['accounts'][account]['parts']
+                    self.assertTrue(all(abs(v/.1-round(v/.1))<1e-8 for v in parts))
+                self.assertGreater(state['accounts']['900000001']['riskUsed'],13)
+                before=copy.deepcopy(state['children'])
+                f.engine.arm(f.payload)
+                self.assertEqual(f.state()['children'],before)
+                closed=f.engine.close_position(dict(id='half-scaled-parent',entryId=f.payload['id'],
+                    symbol='USTEC',closePercent=50,expiresAt=time.time()*1000+3000))['result']
+                self.assertEqual(closed['status'],'ok',closed)
+                self.assertEqual(closed['accountResults']['900000002']['filledVolume'],.2)
+                self.assertEqual(closed['accountResults']['900000002']['remainingVolume'],.3)
+                self.assertEqual(closed['accountResults']['900000001']['filledVolume'],.4)
+                self.assertEqual(closed['accountResults']['900000001']['remainingVolume'],.4)
+
+    def test_scaled_sizes_respect_account_step_minimum_percentage_and_original_intent(self):
+        payload=dict(volume=.8,chunkVolume=.32,chunkPercent=50,initialSizingOnly=True,
+            accountExecution='independent-v4',executionPolicy='hybrid-market-limit-v1')
+        original=copy.deepcopy(payload)
+        self.assertEqual(account_entry_sizes(payload,dict(quantityStep=.1,minQty=.1,maxQty=100)),(.8,.3))
+        self.assertEqual(account_entry_sizes(dict(payload,volume=.625,chunkVolume=.25),
+            dict(quantityStep=.1,minQty=.1,maxQty=100)),(.6,.2))
+        self.assertEqual(account_entry_sizes(dict(payload,chunkPercent=25),
+            dict(quantityStep=.1,minQty=.1,maxQty=100)),(.8,.2))
+        self.assertEqual(account_entry_sizes(payload,dict(quantityStep=.01,minQty=.01,maxQty=100)),(.8,.32))
+        self.assertEqual(account_entry_sizes(dict(payload,chunkVolume=.04),
+            dict(quantityStep=.1,minQty=.1,maxQty=100)),(.8,.1))
+        with self.assertRaisesRegex(ValueError,'smaller than the minimum'):
+            account_entry_sizes(dict(payload,volume=.08),dict(quantityStep=.1,minQty=.1,maxQty=100))
+        self.assertEqual(account_entry_sizes(dict(payload,initialSizingOnly=False),
+            dict(quantityStep=.1,minQty=.1,maxQty=100)),(.8,.32))
+        self.assertEqual(payload,original)
 
     def test_slow_admission_does_not_hold_peer_or_root_lock(self):
         f=self.make();entered=threading.Event();release=threading.Event();self.addCleanup(release.set)

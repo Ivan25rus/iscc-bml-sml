@@ -48,5 +48,5 @@ test('Hybrid protection and complete close use the primary coordinator even when
   assert.equal(delivered[0].channel,'mt5-vps:entry-control');assert.equal(delivered[0].result.entry,finalEntry);
   const result=await manage({sender:{send(){throw Error('Synthetic closed renderer');}}},{action:'entry-close',account:'900000001',target});
   assert.equal(result.status,'ok');assert.equal(result.entry,finalEntry);
-  app.emit('before-quit');
+  app.emit('will-quit');
 });

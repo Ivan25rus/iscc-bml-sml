@@ -41,11 +41,13 @@ function attach({ servicesApi, root, getEnabled = () => true, settings,
       if (!config.publishToLT) return;
       const lt = servicesApi.levelTrack;
       if (typeof lt?.update !== 'function') throw Error('ЛТ требует совместимого последовательного обновления групп');
-      await lt.update(value => updateManagedLevels(value, latest()));
+      await lt.update(value => updateManagedLevels(value, latest(),{preserveUnspecified:true}));
     }
   });
   reader = createReader({ enabled, acceptSnapshot: value => sync.acceptSnapshot(value),
     acceptInventory: (inventory, readStartedAt) => sync.reconcileInventory(inventory, readStartedAt),
+    acceptOpenCharts:(scopes,at)=>sync.acceptOpenCharts(scopes,at),
+    sourceLayouts:()=>require('./candle-mappings').sourceLayouts(config),
     sources: () => Object.keys(require('./candle-mappings').sourceMap(config)), anchors: () => sync.requiredBars(),
     onError: error => { sync.lastError = 'Чтение разметки TradingView: ' + error.message; onStatus(sync.status()); } });
   settings.onApply('candle-renderer', ({ config: next }) => {
@@ -54,6 +56,7 @@ function attach({ servicesApi, root, getEnabled = () => true, settings,
   sync.start();
   const api = {
     acceptSource(id, source, options) { return enabled() ? sync.acceptSource(id, source, options) : false; },
+    acceptRemovalEvent(id,record){return enabled()?sync.acceptRemovalEvent(id,record):false;},
     acceptBars(value) { if (enabled()) sync.acceptBars(value); },
     status: () => ({ ...status, ...sync.status() }),
     stop() { reader.stop(); sync.stop(); transport?.close(); }

@@ -79,7 +79,9 @@ function initService(api) {
     finally { watching = false; }
   },1000);
   warmthTimer.unref?.();
-  app.once('before-quit',() => { closing=true; runtimeActivity.stop(); require('timers').clearInterval(warmthTimer); adapter?.close(); for (const connection of accountAdapters.values()) connection.close(); });
+  // before-quit can be cancelled while the TV connector is stopping. Keep the
+  // authenticated quote stream alive until all windows have actually closed.
+  app.once('will-quit',() => { closing=true; runtimeActivity.stop(); require('timers').clearInterval(warmthTimer); adapter?.close(); for (const connection of accountAdapters.values()) connection.close(); });
   require('../brokerage/brokerageAdapters')['mt5-vps'] = () => api.mt5VPS.getAdapter();
   const enrollment=require('./accountEnrollment').createAccountEnrollment({
     getAdapter:()=>api.mt5VPS.getAdapter(),isTradingBusy:()=>Boolean(api.execution?.isTradingBusy?.())
@@ -155,16 +157,26 @@ function initService(api) {
       const connection = forAccount(account);
       const primary = api.mt5VPS.getAdapter();
       const identifiers = connection.commandJournal.records.filter(x=>x.result.status==='unknown').slice(-20).map(x=>x.id);
-      const state = identifiers.length
-        ? await primary.request(`/management?receipts=${encodeURIComponent(identifiers.join(','))}&receiptAccount=${encodeURIComponent(connection.config.account)}`)
-        : await primary.managementState({maxAgeMs:1000});
+      let state;
+      try {
+        state=identifiers.length
+          ? await primary.request(`/management?receipts=${encodeURIComponent(identifiers.join(','))}&receiptAccount=${encodeURIComponent(connection.config.account)}`)
+          : await primary.managementState({maxAgeMs:1000});
+      } catch(error) {
+        // The receiver may yield while its existing native read is finishing.
+        // One UI-only handoff avoids waiting for another 2-second poll.
+        // Network errors and unknown-command receipt reads are never retried.
+        if(identifiers.length || error.code!=='MT5_VIEW_PENDING')throw error;
+        await new Promise(resolve=>setTimeout(resolve,120));
+        state=await primary.managementState({maxAgeMs:0});
+      }
       acceptManagement(state);
       const health = state.accountStates[String(connection.config.account)];
       if (!health?.connected) throw Error(health?.reason || 'Нет связи с выбранным счётом');
       connection.managementLeaseUntil = Date.now()+10000;
       connection.maintainExecutionWarmth().catch(()=>{});
       await connection.commandJournal.reconcile(async id => connection.validateCommandReceipt(id,state.receipts[id]));
-      const parentCommands=primary.commandJournal.records.filter(command=>['entry-protection','entry-close'].includes(command.operation));
+      const parentCommands=primary.commandJournal.records.filter(command=>['entry-protection','entry-close','entry-partial-close','entry-take'].includes(command.operation));
       if(connection!==primary) {
         const pendingParents=new Set(parentCommands.filter(command=>command.result?.status==='unknown').slice(-20).map(command=>command.id));
         await primary.commandJournal.reconcile(async id=>pendingParents.has(id)
@@ -176,11 +188,15 @@ function initService(api) {
         const matched=(accountState.rules || []).find(candidate=>candidate.id===id);
         return matched?.result?.timings ? [[account,matched.result]] : [];
       }))}));
-      return {status:'ok',account:health.account,accounts:[config.account,...primary.remoteAccounts],followers:followers(config),timeExit:require('./timeExit').timeExitConfig(config),timeRules:health.timeRules || [],capabilities:health.capabilities || [],orders:health.orders,rules,
-        alerts:state.alerts || [],accountStates:state.accountStates,checkedAt:health.checkedAt,
+      return {status:'ok',account:health.account,accounts:[config.account,...primary.remoteAccounts],followers:followers(config),timeExit:require('./timeExit').timeExitConfig(config),timeRules:health.timeRules || [],capabilities:state.capabilities || health.capabilities || [],orders:health.orders,rules,
+        alerts:state.alerts || [],accountStates:state.accountStates,parentTakes:state.parentTakes || [],checkedAt:health.checkedAt,
         commands:[...new Map([...connection.commandJournal.records,...parentCommands].map(command=>[command.id,command])).values()]
           .sort((a,b)=>(b.at || 0)-(a.at || 0)).slice(0,100)};
     } catch (error) { return {status:'rejected',reason:error.message}; }
+  });
+  ipcMain.handle('mt5-vps:minute-bars',async(_evt,symbol)=>{
+    try{return {status:'ok',data:await api.mt5VPS.getAdapter().minuteBars(symbol)};}
+    catch(error){return {status:'rejected',reason:error.message};}
   });
   ipcMain.handle('mt5-vps:prepare-entry',async () => {
     try {
@@ -229,9 +245,11 @@ function initService(api) {
   ipcMain.handle('mt5-vps:manage', async (_evt, payload = {}) => {
     if(enrollment.busy)return {status:'rejected',reason:'Дождись завершения добавления счёта'};
     const connection = forAccount(payload.account);
-    if (payload.action === 'entry-close' && payload.target?.entryPlan) {
+    if(payload.action==='entry-take' && payload.target?.entryPlan)
+      return api.mt5VPS.getAdapter().configureParentTake(payload.target,payload.take);
+    if (['entry-close','entry-partial-close'].includes(payload.action) && payload.target?.entryPlan) {
       const result=await api.mt5VPS.getAdapter().closeEntryPosition({id:payload.target.entryPlan.id,symbol:payload.target.symbol}, {
-        clickAt:payload.target.clickAt
+        clickAt:payload.target.clickAt,...(payload.action==='entry-partial-close'?{closePercent:Number(payload.closePercent)}:{})
       });
       try {if(result.entry)_evt?.sender?.send('mt5-vps:entry-control',result);} catch { /* A closed view cannot change the durable command result. */ }
       return result;

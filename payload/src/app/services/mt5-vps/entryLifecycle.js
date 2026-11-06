@@ -126,6 +126,11 @@ function entryWatch(entry) {
 }
 function rememberEntry(adapter,entry) {
   if(!entry?.id)return;
+  const previous=adapter.chunkLifecycleEntries?.get(entry.id);
+  const confirmed=previous?._controlReceipt?.status==='ok'?previous._controlReceipt:previous?._lastConfirmedControl;
+  if(confirmed && confirmed.entryId===entry.id && previous.symbol===entry.symbol && previous.side===entry.side
+    && JSON.stringify(Object.keys(previous.accounts || {}).sort())===JSON.stringify(Object.keys(entry.accounts || {}).sort()))
+    entry={...entry,_lastConfirmedControl:confirmed};
   adapter.chunkLifecycleEntries ||= new Map();
   if(retainControlEntry(adapter.chunkLifecycleEntries.get(entry.id),entry))return;
   const closed=adapter.closedControlProofs?.get(entry.id);

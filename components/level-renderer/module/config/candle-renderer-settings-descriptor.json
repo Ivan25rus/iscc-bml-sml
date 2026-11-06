@@ -10,7 +10,8 @@
       "item": {
         "enabled": { "type": "boolean", "description": "Включена" },
         "sourceSymbol": { "type": "string", "description": "Полный символ TradingView" },
-        "mt5Symbol": { "type": "string", "description": "Точное имя MT5" }
+        "mt5Symbol": { "type": "string", "description": "Точное имя MT5" },
+        "sourceLayout": { "type": "string", "description": "ID рабочего графика TV для подтверждения удаления; определяется агентом локально" }
       }
     }
   }

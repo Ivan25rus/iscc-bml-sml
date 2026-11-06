@@ -8,6 +8,7 @@
       "description": "Default level order values",
       "maxLot": {
         "type": "number",
+        "step": "any",
         "description": "Максимальный лот одной части; 0 отключает дополнительный предел, процентное деление сохраняется"
       },
       "minLot": {
@@ -69,6 +70,7 @@
         },
         "maxLot": {
           "type": "number",
+          "step": "any",
           "description": "Максимальный лот одной части; 0 отключает дополнительный предел, процентное деление сохраняется"
         },
         "minLot": {

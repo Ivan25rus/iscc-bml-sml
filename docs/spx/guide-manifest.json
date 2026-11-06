@@ -2,7 +2,9 @@
   "version": "0.4.0",
   "kind": "spx-illustrated-guide",
   "sections": 16,
+  "images": 16,
   "screenshots": 16,
+  "generatedIllustrations": 0,
   "tradingCommandsSent": 0,
   "files": {
     "index.html": {
@@ -10,8 +12,8 @@
       "bytes": 36907
     },
     "README.md": {
-      "sha256": "e73b97bbf23e40812dc259c53213ba5032608c53a2e1e22d17c5a44a0b092880",
-      "bytes": 23904
+      "sha256": "e864d8c9452dca88f3ce6f946accc53b961e23f838748f0fa72f5ff8528b1c7b",
+      "bytes": 23935
     },
     "images/01-spx-stop-take.png": {
       "sha256": "8ec6c0fc52f1c336b1f04e5e2b0e84c1d2c1db0a3371b7df8f218ca85d91bc82",

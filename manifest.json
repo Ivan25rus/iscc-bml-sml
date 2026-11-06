@@ -72,8 +72,8 @@
       "size": 1981
     },
     "VALIDATION.md": {
-      "sha256": "9f88ccf79c3a55edebf224db918101cb7ac77a964283106520f89869e94cc639",
-      "size": 4738
+      "sha256": "f775050b6923d78409e1d8789261cc3283fad97e4de25fd93f47b744bbec98f3",
+      "size": 4746
     },
     "ci/README.md": {
       "sha256": "d48451e1fa2a978733e15762ab9818fd16073a03f15c66c214b78ca7632818a0",
@@ -256,12 +256,12 @@
       "size": 200
     },
     "docs/spx/README.md": {
-      "sha256": "e73b97bbf23e40812dc259c53213ba5032608c53a2e1e22d17c5a44a0b092880",
-      "size": 23904
+      "sha256": "e864d8c9452dca88f3ce6f946accc53b961e23f838748f0fa72f5ff8528b1c7b",
+      "size": 23935
     },
     "docs/spx/guide-manifest.json": {
-      "sha256": "b386e19dc97e724c8d2864a9009a8a7cea91cc33f4ed4dbef3f9d64c4132f8e7",
-      "size": 2818
+      "sha256": "f66f452f0daf8b3d293f89edc37473561d5f42e0a85aeaab7a56e200334ae66b",
+      "size": 2865
     },
     "docs/spx/images/01-spx-stop-take.png": {
       "sha256": "8ec6c0fc52f1c336b1f04e5e2b0e84c1d2c1db0a3371b7df8f218ca85d91bc82",

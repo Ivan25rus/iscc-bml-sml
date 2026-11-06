@@ -1,0 +1,77 @@
+{
+  "version": "0.4.0",
+  "kind": "spx-illustrated-guide",
+  "sections": 15,
+  "screenshots": 15,
+  "tradingCommandsSent": 0,
+  "files": {
+    "index.html": {
+      "sha256": "ef9cac856e04cfd284fb6cbc0b326413f9094fa7a7a1cc91ff6e44c4c27f97ce",
+      "bytes": 32904
+    },
+    "README.md": {
+      "sha256": "9f2ff88c5584d57d403747ff5126956faf60189e54db1f34f03363a1a3ac95b8",
+      "bytes": 20588
+    },
+    "images/01-spx-stop-take.png": {
+      "sha256": "8ec6c0fc52f1c336b1f04e5e2b0e84c1d2c1db0a3371b7df8f218ca85d91bc82",
+      "bytes": 116913
+    },
+    "images/02-spx-partial-take.png": {
+      "sha256": "0c96951578ad731f27320000be0a13745898f0a0f9d1d49f77527d4255b8a30a",
+      "bytes": 150670
+    },
+    "images/03-spx-entry-start.png": {
+      "sha256": "043d6f4f3ff745d2130ecc90010ea4a7071735d140cafce1001a970e4da569ec",
+      "bytes": 113339
+    },
+    "images/04-spx-entry-progress.png": {
+      "sha256": "38622685b4a731a3555a107f37c836fca580ea6a35952a1d3f922980c08f1e11",
+      "bytes": 116684
+    },
+    "images/05-spx-level-transfer.png": {
+      "sha256": "1967fb5a500698be7f7442043dbcc8332ce2faa7e3fd45631f341358e6e1f116",
+      "bytes": 98082
+    },
+    "images/06-spx-controls.jpg": {
+      "sha256": "012488e082059272b7f2f87a8e2a271c6cb371d97699fc908057a394ac5bc71a",
+      "bytes": 80357
+    },
+    "images/07-spx-breakeven.jpg": {
+      "sha256": "689ac915a546157c92c6d226afbc5576733cc707ed18cef6d3b6b8946065c370",
+      "bytes": 80226
+    },
+    "images/08-spx-no-take.jpg": {
+      "sha256": "5a1fc02b019a4216382ef98d3c2036f2f6985d0417ac956e7351f0281c4d5447",
+      "bytes": 75555
+    },
+    "images/09-spx-close-75.jpg": {
+      "sha256": "29fc90dbce5b1fd4978a3e43843f0c2b9eeae383205ed864891457484083e5d2",
+      "bytes": 78066
+    },
+    "images/10-spx-take-armed.jpg": {
+      "sha256": "383a06e13f4c0c7b9b57a7faa74e64a8eaa06c3f36b0eb15d4518a91ca10eb4e",
+      "bytes": 92520
+    },
+    "images/11-spx-closed.jpg": {
+      "sha256": "4ce9cc58c4cf147b70fb352fdea1848a51c923ef137f9737f1c02d1f2d42a898",
+      "bytes": 43726
+    },
+    "images/12-spx-unknown.jpg": {
+      "sha256": "cb7c61ece144cd0ab9b84594db4065407bd7ac526a7d7ef5caddba51f8b0a236",
+      "bytes": 84959
+    },
+    "images/13-spx-accounts-time.jpg": {
+      "sha256": "33eaa7c6f49fa61d9c99dd11dc45c63c779b169fc828171835662691e5483f57",
+      "bytes": 83583
+    },
+    "images/14-spx-feature-choice.jpg": {
+      "sha256": "17f04c091be8254cb22f00d405b33c46efc736a596ea0ce72d7ed76ae936dc7c",
+      "bytes": 228201
+    },
+    "images/15-spx-add-account.jpg": {
+      "sha256": "26eb45f87a4ad5c130ba30bb9359f3aeebc41fb8cbf66db7718620a4b10bb455",
+      "bytes": 94513
+    }
+  }
+}

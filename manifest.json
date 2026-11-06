@@ -20,8 +20,8 @@
       "size": 1097
     },
     "CHANGELOG.md": {
-      "sha256": "d726292c2e7072253798cb71446c5413f4700ec40f487be415aed0ae1d7025ee",
-      "size": 5508
+      "sha256": "5cf796a482bf0964fab8dbb6eae1614834f3c37afd978af09f16a94b38346702",
+      "size": 6001
     },
     "CHOICES.md": {
       "sha256": "7b73b142d39ca5c1a12421814ab57c48cd1e505556e2b59dcf535807707a4db2",
@@ -48,8 +48,8 @@
       "size": 1775
     },
     "README.md": {
-      "sha256": "621e71937659d0649b7e0905bc1b5c987fe092e9e12a6af4279a3a9c3cf47217",
-      "size": 13502
+      "sha256": "299b2efbec96f87a60642e9659da4b91b43a4494bfd6e243271e90472220eebe",
+      "size": 13845
     },
     "SETUP.html": {
       "sha256": "7984be0b53a0a7a5a15bad9b1fd6bd7aa9918bb3e1555f96459a4643aab327c9",
@@ -64,8 +64,8 @@
       "size": 4417
     },
     "VALIDATION.md": {
-      "sha256": "4495afcefd408f4e0c9ef8521e7a851f07c2d0bc2b7ced7ba5f7b30e1d2dc23d",
-      "size": 3545
+      "sha256": "6c65cdd6eecaf0a08ad39effc2ee157ea00770d29b5aa847331afcca417edc80",
+      "size": 4255
     },
     "ci/README.md": {
       "sha256": "d48451e1fa2a978733e15762ab9818fd16073a03f15c66c214b78ca7632818a0",
@@ -246,6 +246,78 @@
     "config.example.json": {
       "sha256": "71cb73bb6eea7fd22e970dfb0757064580d76c086da550408f5be404f6069f05",
       "size": 200
+    },
+    "docs/spx/README.md": {
+      "sha256": "9f2ff88c5584d57d403747ff5126956faf60189e54db1f34f03363a1a3ac95b8",
+      "size": 20588
+    },
+    "docs/spx/guide-manifest.json": {
+      "sha256": "fc67abca139cb0e43b3fbd331b28953675f893707d97cee7e1d566aa0eaae4d1",
+      "size": 2665
+    },
+    "docs/spx/images/01-spx-stop-take.png": {
+      "sha256": "8ec6c0fc52f1c336b1f04e5e2b0e84c1d2c1db0a3371b7df8f218ca85d91bc82",
+      "size": 116913
+    },
+    "docs/spx/images/02-spx-partial-take.png": {
+      "sha256": "0c96951578ad731f27320000be0a13745898f0a0f9d1d49f77527d4255b8a30a",
+      "size": 150670
+    },
+    "docs/spx/images/03-spx-entry-start.png": {
+      "sha256": "043d6f4f3ff745d2130ecc90010ea4a7071735d140cafce1001a970e4da569ec",
+      "size": 113339
+    },
+    "docs/spx/images/04-spx-entry-progress.png": {
+      "sha256": "38622685b4a731a3555a107f37c836fca580ea6a35952a1d3f922980c08f1e11",
+      "size": 116684
+    },
+    "docs/spx/images/05-spx-level-transfer.png": {
+      "sha256": "1967fb5a500698be7f7442043dbcc8332ce2faa7e3fd45631f341358e6e1f116",
+      "size": 98082
+    },
+    "docs/spx/images/06-spx-controls.jpg": {
+      "sha256": "012488e082059272b7f2f87a8e2a271c6cb371d97699fc908057a394ac5bc71a",
+      "size": 80357
+    },
+    "docs/spx/images/07-spx-breakeven.jpg": {
+      "sha256": "689ac915a546157c92c6d226afbc5576733cc707ed18cef6d3b6b8946065c370",
+      "size": 80226
+    },
+    "docs/spx/images/08-spx-no-take.jpg": {
+      "sha256": "5a1fc02b019a4216382ef98d3c2036f2f6985d0417ac956e7351f0281c4d5447",
+      "size": 75555
+    },
+    "docs/spx/images/09-spx-close-75.jpg": {
+      "sha256": "29fc90dbce5b1fd4978a3e43843f0c2b9eeae383205ed864891457484083e5d2",
+      "size": 78066
+    },
+    "docs/spx/images/10-spx-take-armed.jpg": {
+      "sha256": "383a06e13f4c0c7b9b57a7faa74e64a8eaa06c3f36b0eb15d4518a91ca10eb4e",
+      "size": 92520
+    },
+    "docs/spx/images/11-spx-closed.jpg": {
+      "sha256": "4ce9cc58c4cf147b70fb352fdea1848a51c923ef137f9737f1c02d1f2d42a898",
+      "size": 43726
+    },
+    "docs/spx/images/12-spx-unknown.jpg": {
+      "sha256": "cb7c61ece144cd0ab9b84594db4065407bd7ac526a7d7ef5caddba51f8b0a236",
+      "size": 84959
+    },
+    "docs/spx/images/13-spx-accounts-time.jpg": {
+      "sha256": "33eaa7c6f49fa61d9c99dd11dc45c63c779b169fc828171835662691e5483f57",
+      "size": 83583
+    },
+    "docs/spx/images/14-spx-feature-choice.jpg": {
+      "sha256": "17f04c091be8254cb22f00d405b33c46efc736a596ea0ce72d7ed76ae936dc7c",
+      "size": 228201
+    },
+    "docs/spx/images/15-spx-add-account.jpg": {
+      "sha256": "26eb45f87a4ad5c130ba30bb9359f3aeebc41fb8cbf66db7718620a4b10bb455",
+      "size": 94513
+    },
+    "docs/spx/index.html": {
+      "sha256": "ef9cac856e04cfd284fb6cbc0b326413f9094fa7a7a1cc91ff6e44c4c27f97ce",
+      "size": 32904
     },
     "features.json": {
       "sha256": "e5312be3cec89d991e6dcf0d595b9df40381c2117e13a010a0b511a22f258423",

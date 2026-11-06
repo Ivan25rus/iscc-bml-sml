@@ -176,13 +176,14 @@ def hybrid_receipt(value):
     return compact
 
 
-def public_record(state):
+def public_record(state, *, diagnostics=True):
     """Keep ledger details out of frequently polled authenticated responses."""
     result = {key: copy.deepcopy(state[key]) for key in PUBLIC_FIELDS if key in state}
     result['reason'] = str(state.get('reason', ''))[:512]
     if state.get('accountExecution') in ('independent-v4', 'independent-v5'):
         result['controlContract'] = ENTRY_STOP_PRIORITY_CAPABILITY
-    result['accounts'] = {account: {key: details[key] for key in PUBLIC_ACCOUNT_FIELDS if key in details}
+    result['accounts'] = {account: {key: details[key] for key in PUBLIC_ACCOUNT_FIELDS if key in details
+                                  and (diagnostics or key != 'entryTiming')}
                           for account, details in state.get('accounts', {}).items()}
     if independent_accounts(state):
         result['accountExecution'] = state['accountExecution']
@@ -1597,7 +1598,10 @@ class ChunkEntries:
     def _remember(self, state):
         with self.public_lock:
             self.public_sequence += 1
-            public = public_record(state)
+            # Detailed native/read traces remain in the exact durable GET.
+            # The panel never consumes them; copying/encoding them on every
+            # intermediate publication competes with quotes and native reads.
+            public = public_record(state, diagnostics=False)
             public.update(viewRevision=self.public_sequence,viewEpoch=self.public_epoch)
             size = len(json.dumps(public, separators=(',', ':'), allow_nan=False).encode())
             self.public_records[state['id']] = (self.public_sequence, public, size)

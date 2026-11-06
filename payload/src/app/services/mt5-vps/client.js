@@ -152,6 +152,11 @@ class MT5VPSAdapter extends ExecutionAdapter {
       this.agents.chartHistory ||= new https.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:1,scheduling:'fifo',...tls});
       agent=this.agents.chartHistory;
     }
+    if(!body && pathname==='/entry-events'){
+      // A ten-second long poll must not occupy a current-state read socket.
+      this.agents.entryEvents ||= new https.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:1,scheduling:'fifo',...tls});
+      agent=this.agents.entryEvents;
+    }
     const priorityPool=execution && body && (['/place','/entry-plan','/entry-plan-admit'].includes(pathname) ? 'entryOpening'
       : pathname==='/entry-plan-stop' ? 'entryStop' : pathname==='/entry-plan-continue' ? 'entryControl'
       : ['/entry-plan-close','/entry-plan-protection','/close','/modify','/cancel'].includes(pathname) ? 'entrySafety' : null);
@@ -186,6 +191,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
         method: body ? 'POST' : 'GET', ...tls, agent,
         headers: { authorization: `Bearer ${cfg.token}`, ...(body ? { 'content-type': 'application/json', 'content-length': body.length } : {'accept-encoding':'gzip'}) }
       }, response => {
+        timing.firstByteMs=Number((performance.now()-startedPerf).toFixed(2));
         response.on('error',fail);
         response.on('aborted',()=>fail(Error('MT5 VPS: ответ соединения прерван')));
         response.on('close',()=>{if(!response.complete)fail(Error('MT5 VPS: ответ соединения прерван'));});

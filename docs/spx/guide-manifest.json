@@ -8,12 +8,12 @@
   "tradingCommandsSent": 0,
   "files": {
     "index.html": {
-      "sha256": "6961a9ab4492fc969a0dffec83e5eb2f79c186aebab426bb83e9a16674a0421e",
-      "bytes": 36907
+      "sha256": "933a11717df167e985f51ec7363b0711bc3336e2e8cc5a0c7e38acb72ab204fc",
+      "bytes": 37775
     },
     "README.md": {
-      "sha256": "e864d8c9452dca88f3ce6f946accc53b961e23f838748f0fa72f5ff8528b1c7b",
-      "bytes": 23935
+      "sha256": "42378f6690131ca1e2df40919ccb3349e6cf3c84e08d4c040e493ea0b2769eac",
+      "bytes": 24687
     },
     "images/01-spx-stop-take.png": {
       "sha256": "8ec6c0fc52f1c336b1f04e5e2b0e84c1d2c1db0a3371b7df8f218ca85d91bc82",

@@ -16,16 +16,16 @@
       "size": 7831
     },
     "AGENT_INSTALL.md": {
-      "sha256": "ed295d433f73811b1d002bc1ce43e0c64afc669136bfe9bbce753a230308d41e",
-      "size": 20299
+      "sha256": "0b069e7cb0f36d80a8cf1a51c8cfcbf458c656c13cf1eb88e8c6c4bc23f456dd",
+      "size": 21453
     },
     "BUILD-INFO.json": {
       "sha256": "566dec16c37e075be85cf854a56d16760b4b9a4c595367768ff6be8408a03f5a",
       "size": 1298
     },
     "CHANGELOG.md": {
-      "sha256": "abd9a8ef6ae73ad6258624755d0a0b2016dc5a1bcf46b63b86667056a0fe4cab",
-      "size": 7107
+      "sha256": "3d9a083720f7315270569b1999249265aa9f3e4b644db0559a6ad61e2fb16f6b",
+      "size": 8420
     },
     "CHOICES.md": {
       "sha256": "047c841941aea297de9f8c29ab5d0dc8d73b99f18ada1142b39e7652742dce78",
@@ -48,32 +48,36 @@
       "size": 9370
     },
     "PUBLISH.md": {
-      "sha256": "8ebb600c5a18558fb9ab9cf464a42e6ae3ae2d79c1c093ddf12df8a92d71de8b",
-      "size": 1775
+      "sha256": "fc18c14e43a4a6cdfffadf0a21edead504cee55054b39417716af073ea92b217",
+      "size": 5140
     },
     "README.md": {
-      "sha256": "c2a0317ece2194337bd6231ccfa3eceb8df7697d0709f1cf54764a6c61181c39",
-      "size": 15835
+      "sha256": "7b0286b0ff17851c1fbc549d674c3f70567ed5bd9a7035a1cb4732f5208a5647",
+      "size": 17026
     },
     "SETUP.html": {
-      "sha256": "2a04cdcd4402fb2b18755273ee5a63eb269bf1b2af176dff6c132b6728d572ab",
-      "size": 10294
+      "sha256": "6271c41516b539759bef59cb66eca1b4e4294a7826b7de9c0a0fbe1ec9ecf829",
+      "size": 10532
     },
     "SOURCE-HASHES.json": {
-      "sha256": "7fdc4ecfbf2f984d5c9684ea323b56a1ae0ada6367afd3fcf828523ec333f3e1",
-      "size": 12557
+      "sha256": "93518fe0bdfe4ce9d60506682a7cf6be594bbba829804806273ace110bcd905d",
+      "size": 12776
     },
     "SOURCE_MAP.md": {
       "sha256": "a052e6f00ca61f3fd39c263cab779ed5e7e42f58755b6d6f31a4af426a32f02f",
       "size": 4417
     },
     "START_FOR_AGENT.txt": {
-      "sha256": "2d9b659d5d8df3d09ee661b86f9567def359caeacbd2f6b68475c02920cab5e5",
-      "size": 1981
+      "sha256": "df07608fcd04697ec08301dda2904792b430e855bd3a0ddc3b2cfcc366825eab",
+      "size": 2526
+    },
+    "UPDATE.md": {
+      "sha256": "021b58f449041be7a4d1887a26e77121cc9e20b7e93bfdcdab5da039633ea803",
+      "size": 8825
     },
     "VALIDATION.md": {
-      "sha256": "f775050b6923d78409e1d8789261cc3283fad97e4de25fd93f47b744bbec98f3",
-      "size": 4746
+      "sha256": "bcb7ff8bdd4819a2118dc0e2547b05d7b5fc0a4dae50f8e6e0c109225cec98d0",
+      "size": 3956
     },
     "ci/README.md": {
       "sha256": "d48451e1fa2a978733e15762ab9818fd16073a03f15c66c214b78ca7632818a0",
@@ -108,16 +112,20 @@
       "size": 11
     },
     "components/level-renderer/INSTALL.md": {
-      "sha256": "549fbb3b4b92b229ec74cc3ea37243d68c9b0b211a9a3ebcc5bf89679329d303",
-      "size": 7252
+      "sha256": "384becd26efa847b63b395e3df71eda1534948fc554c0f5e9485878f5c86ce4e",
+      "size": 7489
+    },
+    "components/level-renderer/INSTRUMENTS.md": {
+      "sha256": "5c0a3f3e3c4af4a0e1b92198a4236b141163006c6d5737a3f15fa1148c8093c0",
+      "size": 13912
     },
     "components/level-renderer/PUBLISH.md": {
       "sha256": "047b6665f455f82a40174c47c1d11bf61317b67e801eede3b5b25c54da539c6f",
       "size": 1931
     },
     "components/level-renderer/README.md": {
-      "sha256": "b0c63b2d8c196fcfafec30b91620f7fee5cfb210616c31e45e7a40b6a0b1e30b",
-      "size": 9838
+      "sha256": "771b458dbc5ac65dab672af877265d4010690aa12ae132a780d7b5c8157c2820",
+      "size": 10173
     },
     "components/level-renderer/SETUP.html": {
       "sha256": "92805de5ef62c24a3bf50b08a41ae2df7abc59d9788e079a240ed6f1617e366b",
@@ -136,8 +144,8 @@
       "size": 11739
     },
     "components/level-renderer/manifest.json": {
-      "sha256": "a7bbe1faabf96f035141b77645338c7de6191a18a6ad0977b370e4838b17c138",
-      "size": 5920
+      "sha256": "7a3c34ae400e03763b78ba8ba34036d6c1ef86f0093eb5f7e452bbf62997dd6f",
+      "size": 6056
     },
     "components/level-renderer/module/candle-mappings.js": {
       "sha256": "26da2b8f9884e64086d439d3d8f71564167cbd98ea4d6cda341096fd20644c6d",
@@ -256,11 +264,11 @@
       "size": 200
     },
     "docs/spx/README.md": {
-      "sha256": "e864d8c9452dca88f3ce6f946accc53b961e23f838748f0fa72f5ff8528b1c7b",
-      "size": 23935
+      "sha256": "42378f6690131ca1e2df40919ccb3349e6cf3c84e08d4c040e493ea0b2769eac",
+      "size": 24687
     },
     "docs/spx/guide-manifest.json": {
-      "sha256": "f66f452f0daf8b3d293f89edc37473561d5f42e0a85aeaab7a56e200334ae66b",
+      "sha256": "7e5486bf27e27bff2df8d84e97febe837248c921acf369d1122bde6c398d5272",
       "size": 2865
     },
     "docs/spx/images/01-spx-stop-take.png": {
@@ -328,16 +336,16 @@
       "size": 100129
     },
     "docs/spx/index.html": {
-      "sha256": "6961a9ab4492fc969a0dffec83e5eb2f79c186aebab426bb83e9a16674a0421e",
-      "size": 36907
+      "sha256": "933a11717df167e985f51ec7363b0711bc3336e2e8cc5a0c7e38acb72ab204fc",
+      "size": 37775
     },
     "features.json": {
       "sha256": "ced6c184bc294fc2a26e30728a2cfee9df20b1377c24ecd4a34f4ee75b7d3a97",
       "size": 2196
     },
     "index.html": {
-      "sha256": "2a04cdcd4402fb2b18755273ee5a63eb269bf1b2af176dff6c132b6728d572ab",
-      "size": 10294
+      "sha256": "6271c41516b539759bef59cb66eca1b4e4294a7826b7de9c0a0fbe1ec9ecf829",
+      "size": 10532
     },
     "module/featurePolicy.js": {
       "sha256": "66040f58a74f3816a158607644110275cbd4fc0a7956857d6ee15ccf1fe1932b",
@@ -412,8 +420,8 @@
       "size": 38940
     },
     "payload/src/app/services/mt5-vps/client.js": {
-      "sha256": "411e69ec2ca9aba7d9287900d7e9e0c64a6d1c72743a0c5e836ec2a09e16f19f",
-      "size": 69223
+      "sha256": "79e16e769bc8c438f4a82cfdc299098892461c31a90006328054e2202ec61f10",
+      "size": 69591
     },
     "payload/src/app/services/mt5-vps/commandJournal.js": {
       "sha256": "5b2ba80bed0e611ccf1c85acacbc5b7d656f5ef1bb5b3c87e685fb45892eed48",
@@ -564,16 +572,16 @@
       "size": 23796
     },
     "payload/vps/chunk_entry.py": {
-      "sha256": "979941c143fbf25fa5ea5b0c64e32ced0b94d2e6bd06f06e11f97b66ab07c8fa",
-      "size": 382873
+      "sha256": "cd5560276a33f76f9036665964858f9be95fc821c390611c043eef95d527e668",
+      "size": 383218
     },
     "payload/vps/entry_wait_totals.py": {
       "sha256": "0f30df5ba9e5fde8ff1fd8796fba506f1b6e54a47c2a138ad29975ffa72b5006",
       "size": 4623
     },
     "payload/vps/mt5_bridge.py": {
-      "sha256": "c85758d3dea53246788999974022bb38bb8e81c48e8a1bdf05f3b726c61442c6",
-      "size": 258446
+      "sha256": "0cb6ba906e76086103e4ce49358935d61a5fdd58e88ed5090e9354a0050bbbb9",
+      "size": 260705
     },
     "payload/vps/parent_close_plan.py": {
       "sha256": "5f26858ac65d32cc11485c957052ce49b594c74a226066ea3e4749b522059057",
@@ -686,6 +694,10 @@
     "tests/parent-close-preview.test.js": {
       "sha256": "14d77ed85936c32e07a833c2665bf990d0161e6c4221fef4018c657056c02ecf",
       "size": 1848
+    },
+    "tests/pipeline-latency-client.test.js": {
+      "sha256": "6551de276de84e2d22fe83c1086571635e494e5b31098b7a290f7aca4c8bb4f5",
+      "size": 1416
     },
     "tests/protection-fast-path.test.js": {
       "sha256": "23995fb2da1e7974d58fb9c0de1009c8432e976fe5d285fdcebb75dc720b58e6",
@@ -804,8 +816,8 @@
       "size": 10802
     },
     "tests/test_isolated_entry_engines.py": {
-      "sha256": "ffe9ecf6978ab65fa208d8f362676be576f6a5b8be559a38b35e6471cc6cbde1",
-      "size": 13859
+      "sha256": "7031bcc14dc2c46b97f04d65748c868b7e28056ff95a2935d58f587166d4cb17",
+      "size": 14217
     },
     "tests/test_market_limit_entry.py": {
       "sha256": "1015d0d89dad6fef7763a8ce5fc37ffffe2cce05af4c8deb0bd359583e4118e1",
@@ -834,6 +846,10 @@
     "tests/test_partial_protection_recovery.py": {
       "sha256": "c9bf8956a5a3e9f128fa9dd47c065937f396b9757ba2636db0b424a26a51ad8b",
       "size": 8914
+    },
+    "tests/test_pipeline_latency.py": {
+      "sha256": "792c8e369cad02fb24d4300d7c32d93a35fe4fab6cdadc45a3a9edadb1623294",
+      "size": 5410
     },
     "tests/test_prepare.py": {
       "sha256": "616c3d25165b39e363702e6a37833549288d04effac68449f04bade6e68122b7",

@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "kind": "iscc-level-renderer",
-  "createdAtUTC": "2026-11-06T08:01:40.880617+00:00",
+  "createdAtUTC": "2026-11-06T11:34:00.072222+00:00",
   "files": {
     ".gitattributes": {
       "sha256": "a79691a93b46e49ce460c26ef22afcc03d6eca1e63bf2edbc20e96159510f6c9",
@@ -28,16 +28,20 @@
       "size": 11
     },
     "INSTALL.md": {
-      "sha256": "549fbb3b4b92b229ec74cc3ea37243d68c9b0b211a9a3ebcc5bf89679329d303",
-      "size": 7252
+      "sha256": "384becd26efa847b63b395e3df71eda1534948fc554c0f5e9485878f5c86ce4e",
+      "size": 7489
+    },
+    "INSTRUMENTS.md": {
+      "sha256": "5c0a3f3e3c4af4a0e1b92198a4236b141163006c6d5737a3f15fa1148c8093c0",
+      "size": 13912
     },
     "PUBLISH.md": {
       "sha256": "047b6665f455f82a40174c47c1d11bf61317b67e801eede3b5b25c54da539c6f",
       "size": 1931
     },
     "README.md": {
-      "sha256": "b0c63b2d8c196fcfafec30b91620f7fee5cfb210616c31e45e7a40b6a0b1e30b",
-      "size": 9838
+      "sha256": "771b458dbc5ac65dab672af877265d4010690aa12ae132a780d7b5c8157c2820",
+      "size": 10173
     },
     "SETUP.html": {
       "sha256": "92805de5ef62c24a3bf50b08a41ae2df7abc59d9788e079a240ed6f1617e366b",

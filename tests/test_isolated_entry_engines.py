@@ -187,6 +187,11 @@ class IsolatedEngineTests(unittest.TestCase):
         self.assertIsNone(coordinator.mt5)
         self.assertIn('independent-account-engines-v5',coordinator.health()['capabilities'])
         self.assertEqual(coordinator.snapshot('USTEC')['account'],900000002)
+        coordinator.management_accounts()
+        # A cold UI read intentionally yields after 20ms. Observe completion
+        # of those exact reads instead of assuming Windows scheduled both in
+        # that window; no extra native poll or relaxed freshness is needed.
+        for _,job in list(coordinator.management_jobs.values()):job.result(timeout=2)
         views=coordinator.management_accounts()
         self.assertTrue(views['900000002']['connected']);self.assertTrue(views['900000001']['connected'])
         self.assertIn('independent-account-engines-v5',coordinator.management()['capabilities'])

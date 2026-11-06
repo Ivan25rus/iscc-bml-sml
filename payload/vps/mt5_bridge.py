@@ -2680,7 +2680,9 @@ class Bridge:
             return dict(account=str(self.config['account']), server=self.config['server'],
                 entries=[dict(entry, lifecycleDeferred=True, positionsConfirmed=False) for entry in entries])
         if getattr(self, 'isolated_entries', False):
-            states = self.management_accounts()
+            # Match the Mac panel's active view. Alternating full/history and
+            # active signatures discarded usable evidence between UI polls.
+            states = self.management_accounts(compact=True)
             return dict(account=str(self.config['account']), server=self.config['server'],
                         entries=self.entry_plan_views(states))
         primary = self.entry_management()
@@ -3137,6 +3139,8 @@ class QuotePublisher:
         self.subscribers=0
         self.sequence=0
         self.latest=None
+        self.latest_frame=None
+        self.latest_at=None
         self.failed=False
         self.closed=False
         self.thread=None
@@ -3187,6 +3191,17 @@ class QuotePublisher:
                         socketBufferPolicy='os-default',
                         socketBufferErrors=self.socket_buffer_errors)
 
+    def fresh_snapshot(self, symbol):
+        # Display GETs can reuse the collector's exact immutable native read.
+        # Never renew its capture/tick time, use an execution worker, or accept
+        # a frame beyond one normal 100ms collection interval.
+        with self.condition:
+            if (self.closed or self.failed or self.latest_frame is None or self.latest_at is None
+                    or not 0 <= time.monotonic()-self.latest_at <= .1):
+                return None
+            value=self.latest_frame.get('snapshots',{}).get(symbol)
+        return copy.deepcopy(value) if value is not None else None
+
     def run(self):
         due=None
         while True:
@@ -3227,6 +3242,8 @@ class QuotePublisher:
                 self.bridge.frame_bytes+=len(body)
                 with self.condition:
                     self.latest=body
+                    self.latest_frame=frame
+                    self.latest_at=time.monotonic()-(time.time()*1000-frame['capturedAt'])/1000
                     self.failed=False
                     self.captures+=1
                     self.last_capture=frame['capturedAt']
@@ -3237,6 +3254,8 @@ class QuotePublisher:
                 # fresh after disconnection or an account/server mismatch.
                 with self.condition:
                     self.latest=None
+                    self.latest_frame=None
+                    self.latest_at=None
                     self.failed=True
                     self.failures+=1
                     self.sequence+=1
@@ -3698,6 +3717,11 @@ class CoordinatorBridge(Bridge):
         return client.call(method,*args)
 
     def snapshot(self, symbol):
+        publisher=getattr(self,'quote_publisher',None)
+        value=publisher.fresh_snapshot(symbol) if publisher else None
+        if value is not None:
+            self.read_timings.record('quoteSnapshotReused',0)
+            return value
         return self._quote_call('snapshot',symbol)
 
     def quote_frame(self):
@@ -3811,7 +3835,13 @@ class CoordinatorBridge(Bridge):
                     self._cache_management(account,*old)
                     self.management_jobs.pop(account,None)
                 if account not in self.management_jobs:
-                    self.management_jobs[account] = (signature,executor.submit(self._read_management,account,worker,wanted,selected,**({'compact':True} if compact else {})))
+                    job=executor.submit(self._read_management,account,worker,wanted,selected,**({'compact':True} if compact else {}))
+                    self.management_jobs[account] = (signature,job)
+                    # Commit a completed read immediately, after its native
+                    # RPC/mutex was released. It need not wait for another
+                    # two-second panel poll before becoming visible.
+                    job.add_done_callback(lambda done,account=account,signature=signature:
+                        self._management_finished(account,signature,done))
             jobs = {account:row[1] for account,row in self.management_jobs.items()}
         # Healthy accounts publish without waiting for a peer's native timeout.
         from concurrent.futures import wait
@@ -3821,9 +3851,12 @@ class CoordinatorBridge(Bridge):
         wait(list(jobs.values()),timeout=.1 if compact and (watch or identifiers) else .02)
         states = {}
         with self.lock:
-            for account,job in jobs.items():
+            # A completion callback may have consumed a job before the jobs
+            # snapshot was taken. Every configured account still needs a view.
+            for account in workers:
+                job=jobs.get(account)
                 current = self.management_jobs.get(account)
-                if current and current[1] is job and job.done():
+                if job is not None and current and current[1] is job and job.done():
                     self._cache_management(account,*current)
                     self.management_jobs.pop(account,None)
                 exact=self.management_queries.get(account,{}).get(signatures[account])
@@ -3842,6 +3875,13 @@ class CoordinatorBridge(Bridge):
                     connectionState='connected' if connected else 'unavailable' if failed else 'checking',snapshotAgeMs=age,
                     **({} if ready else dict(reason='Терминал недоступен' if failed else 'Проверяем состояние сделки',openingStates={},receipts={})))
         return states
+
+    def _management_finished(self, account, signature, job):
+        with self.lock:
+            current=self.management_jobs.get(account)
+            if current and current[0]==signature and current[1] is job:
+                self._cache_management(account,signature,job)
+                self.management_jobs.pop(account,None)
 
     def _read_management(self, account, worker, wanted, selected, compact=False):
         value=worker.call('management_snapshot',wanted,selected,*([True] if compact else []))

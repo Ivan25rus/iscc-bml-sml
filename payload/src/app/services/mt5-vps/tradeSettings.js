@@ -9,10 +9,10 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true}={}) {
     const title=make('h2','Счета и время · MT5');title.style.cssText='font-size:18px;margin:0 0 12px';
     const style=make('style');style.textContent='#mt5-trade-settings fieldset{border:1px solid var(--border);border-radius:8px;padding:12px}#mt5-trade-settings input:not([type=checkbox]),#mt5-trade-settings button{box-sizing:border-box;padding:6px 8px;border:1px solid var(--border);border-radius:7px;color:var(--text);background:var(--bg,#111);font-size:13px}#mt5-trade-settings button{cursor:pointer}#mt5-trade-settings button:disabled{opacity:.45;cursor:default}';
     const status=make('p','Проверяю подключение…');status.style.fontSize='12px';
-    const copies=make('fieldset');make('legend','Лот к основному счёту',copies);
+    const copies=make('fieldset');make('legend','Объём связанных счетов',copies);
     const copiesRows=make('div','',copies);copiesRows.id='mt5-followers';
-    const copiesNote=make('p','×1 — тот же лот, ×0,7 — 70% от основного. Для новых сделок.',copies);copiesNote.style.fontSize='12px';
-    const saveCopies=make('button','Сохранить коэффициенты',copies);saveCopies.id='mt5-save-followers';
+    const copiesNote=make('p','Множитель — доля лота основного счёта. Риск, % баланса — отдельный расчёт БМЛ/СМЛ по выбранному стопу. Баланс фиксируется при запуске нового набора.',copies);copiesNote.style.fontSize='12px';
+    const saveCopies=make('button','Сохранить',copies);saveCopies.id='mt5-save-followers';
     const enrollment=make('fieldset');enrollment.style.marginTop='12px';make('legend','Добавить счёт · MT5 / MT4',enrollment);
     const discover=make('button','Найти терминалы на VPS',enrollment);discover.id='mt5-discover-accounts';
     const catalogStatus=make('p','Войди в новый счёт в отдельном терминале на VPS. Пароль остаётся в терминале.',enrollment);catalogStatus.style.fontSize='12px';
@@ -36,7 +36,7 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true}={}) {
     function controls() {
       // A background GET must never disable a focused editor. Only initial
       // loading and an explicit save lock inputs; drafts remain editable offline.
-      for(const field of dialog.querySelectorAll('input'))field.disabled=busy || !ready;
+      for(const field of dialog.querySelectorAll('input,select'))field.disabled=busy || !ready;
       saveCopies.disabled=busy || !ready || !capabilities.includes('scaled-accounts');
       exitSave.disabled=busy || !ready || !capabilities.includes('time-exit');refresh.disabled=busy || loading;
       discover.disabled=busy || loading || catalogBusy || catalogScanning || !capabilities.includes('account-enrollment');
@@ -67,16 +67,21 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true}={}) {
               const line=existing.get(account);
               if(!copiesDirty && !busy && !line.contains(document.activeElement)){
                 line.querySelector('input[type=checkbox]').checked=Boolean(configured?.enabled);
-                const factor=line.querySelector('input[type=number]'),next=String(configured?.multiplier ?? 1);
+                line.querySelector('select').value=configured?.riskPercent==null ? 'multiplier' : 'balance';
+                const factor=line.querySelector('input[type=number]'),next=String(configured?.riskPercent ?? configured?.multiplier ?? 1);
                 if(factor.value!==next)factor.value=next;
               }
               continue;
             }
-            const line=make('label','',copiesRows);line.dataset.copyAccount=String(account);line.style.cssText='display:flex;align-items:center;gap:8px;margin:8px 0';
+            const line=make('div','',copiesRows);line.dataset.copyAccount=String(account);line.style.cssText='display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0';
             const enabled=make('input','',line);enabled.type='checkbox';enabled.checked=Boolean(configured?.enabled);enabled.setAttribute('aria-label',`Копировать на счёт ${account}`);
-            make('span',`Счёт ${account} · ×`,line);
-            const factor=make('input','',line);factor.type='number';factor.min='0.001';factor.max='100';factor.step='any';factor.value=configured?.multiplier ?? 1;factor.style.width='80px';factor.setAttribute('aria-label',`Коэффициент лота ${account}`);
+            make('span',`Счёт ${account}`,line);
+            const mode=make('select','',line);mode.setAttribute('aria-label',`Расчёт объёма ${account}`);mode.style.cssText='max-width:100%;font-size:13px;color:var(--text);background:var(--bg,#111);border:1px solid var(--border);border-radius:7px;padding:6px';
+            for(const [value,text] of [['multiplier','Множитель лота'],['balance','Риск, % баланса']]){const option=make('option',text,mode);option.value=value;}
+            mode.value=configured?.riskPercent==null ? 'multiplier' : 'balance';
+            const factor=make('input','',line);factor.type='number';factor.min='0.001';factor.max='100';factor.step='any';factor.value=configured?.riskPercent ?? configured?.multiplier ?? 1;factor.style.width='80px';factor.setAttribute('aria-label',`Множитель или риск в процентах ${account}`);
             enabled.onchange=factor.oninput=()=>{copiesDirty=true;};
+            mode.onchange=()=>{copiesDirty=true;factor.value=mode.value==='balance' ? '0.2' : '1';};
           }
           let empty=copiesRows.querySelector('[data-empty-copies]');
           if(copiesRows.querySelector('[data-copy-account]'))empty?.remove();
@@ -97,7 +102,10 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true}={}) {
     }
     exitEnabled.onchange=exitTime.oninput=()=>{exitDirty=true;};
     exitSave.onclick=()=>save('mt5-vps:save-time-exit',{enabled:exitEnabled.checked,time:exitTime.value},'time');
-    saveCopies.onclick=()=>save('mt5-vps:save-followers',[...copiesRows.querySelectorAll('[data-copy-account]')].map(line=>({account:line.dataset.copyAccount,multiplier:Number(line.querySelector('input[type=number]').value),enabled:line.querySelector('input[type=checkbox]').checked})),'copies');
+    saveCopies.onclick=()=>save('mt5-vps:save-followers',[...copiesRows.querySelectorAll('[data-copy-account]')].map(line=>{
+      const balance=line.querySelector('select').value==='balance',value=Number(line.querySelector('input[type=number]').value);
+      return {account:line.dataset.copyAccount,multiplier:balance ? 1 : value,enabled:line.querySelector('input[type=checkbox]').checked,...(balance ? {riskPercent:value} : {})};
+    }),'copies');
     async function catalog(start=false) {
       if(catalogBusy)return;catalogBusy=true;controls();
       try {

@@ -553,6 +553,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
       if (!['buy','sell'].includes(order.side) || !['market','limit','stop'].includes(order.type) || ![tick,entry,qty,sl].every(v => Number.isFinite(v) && v > 0)) return { status:'rejected',provider:this.provider,reason:'Неверные параметры MT5' };
       const direction = order.side === 'buy' ? 1 : -1;
       const copies=followers(this.config).filter(row=>row.enabled);
+      if(copies.some(row=>row.riskPercent!=null))throw Error('Риск от баланса поддерживается в БМЛ/СМЛ');
       const request = {
         id: order.meta?.requestId || randomUUID(), symbol, side:order.side, type:order.type,
         volume:qty, price:entry, sl:entry-direction*sl,

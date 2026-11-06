@@ -94,7 +94,9 @@ function buildEntryRequest(adapter,plan,{requestId=randomUUID(),cardPayload}={},
     request.cid=cardPayload.cid;
   }
   const copies=followers(adapter.config).filter(row=>row.enabled);
-  if (copies.length) request.mirrorAccounts=copies.map(({account,multiplier})=>({account,multiplier}));
+  if(copies.some(row=>row.riskPercent!=null) && (request.accountExecution!=='independent-v5'
+    || !adapter.capabilities?.includes('entry-balance-risk-v1')))throw Error('Для риска от баланса обновите VPS и используйте БМЛ/СМЛ');
+  if (copies.length) request.mirrorAccounts=copies.map(({account,multiplier,riskPercent})=>({account,multiplier,...(riskPercent==null ? {} : {riskPercent})}));
   const riskLimit=require('./entryRisk').checkEntryRisk(adapter.config,request.riskUsd);
   if(riskLimit>0)request.entryRiskLimitUsd=riskLimit;
   if(adapter.capabilities?.includes(admission.CAPABILITY)) {

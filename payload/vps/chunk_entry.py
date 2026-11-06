@@ -31,7 +31,7 @@ PUBLIC_FIELDS = ('id', 'symbol', 'side', 'phase', 'trigger', 'volume', 'chunkVol
                  'childCount', 'createdAt', 'updatedAt', 'tickSize', 'stopMode', 'stopOffsetPts', 'fillPriority',
                  'entryMode', 'zoneRadius', 'zoneMultiplier', 'executionPolicy', 'protectionPending', 'protectionPause', 'closurePending', 'positionsClosed',
                  'hasOpenPositions', 'positionsConfirmed', 'positionLifecycle', 'cancelledBeforeAdmission', 'quoteWait', 'reconciliation', 'independentAccountControls')
-PUBLIC_ACCOUNT_FIELDS = ('multiplier', 'targetVolume', 'filledVolume', 'anchor', 'riskUsd', 'riskUsed', 'averagePrice', 'sl', 'tp', 'protectionOverride', 'entryStatus', 'entryReason', 'lastEntryCheckAt', 'entryTiming', 'userStopped', 'laneStopReason', 'stopCheckRejected', 'commonStopUncertain', 'riskRepairRequired', 'limitRetryAvailable', 'admissionWaiting', 'protectionPending', 'closurePending')
+PUBLIC_ACCOUNT_FIELDS = ('multiplier', 'riskPercent', 'balanceRisk', 'targetVolume', 'filledVolume', 'anchor', 'riskUsd', 'riskUsed', 'averagePrice', 'sl', 'tp', 'protectionOverride', 'entryStatus', 'entryReason', 'lastEntryCheckAt', 'entryTiming', 'userStopped', 'laneStopReason', 'stopCheckRejected', 'commonStopUncertain', 'riskRepairRequired', 'limitRetryAvailable', 'admissionWaiting', 'protectionPending', 'closurePending')
 PUBLIC_RESULT_FIELDS = ('status', 'providerOrderId', 'filledVolume', 'fillPrice', 'primaryAccount')
 PUBLIC_LIST_BUDGET = 512 * 1024
 HYBRID_MAX_MARKET_PARTS = 100
@@ -292,6 +292,48 @@ def valid_units(value, step, name):
     if abs(units - integer) > Decimal('0.0000001'):
         raise ValueError(name + ' does not match the lot step')
     return int(integer)
+
+
+def balance_risk_sizing(payload, account, metadata):
+    """Capture risk from the account already read by native admission; no I/O."""
+    if (payload.get('accountExecution')!='independent-v4' or payload.get('initialSizingOnly') is not True
+            or payload.get('executionPolicy')!='hybrid-market-limit-v1' or payload.get('stopMode') not in ('entry','level')):
+        raise ValueError('Balance risk requires independent BML/SML with a valid stop')
+    percent = number(payload.get('riskPercent'), 'Balance risk percent')
+    if percent>100:
+        raise ValueError('Balance risk percent must not exceed 100')
+    balance = number(getattr(account,'balance',None), 'Native account balance')
+    if getattr(account,'currency',None)!='USD':
+        raise ValueError('Balance risk requires a USD account')
+    tick = number(metadata.get('tickSize'), 'Price step')
+    if abs(tick-number(payload.get('tickSize'),'Captured price step'))>1e-8:
+        raise ValueError('Balance risk price step differs from the broker')
+    point = number(metadata.get('contractSize'), 'USD value per index point')
+    if payload['stopMode']=='entry':
+        distance = Decimal(str(number(payload.get('stopOffsetPts'),'Entry stop steps')))*Decimal(str(tick))
+    else:
+        if payload.get('entryMode')!='side-zone' or payload.get('side') not in ('buy','sell'):
+            raise ValueError('Balance level risk requires a captured BML/SML side zone')
+        lower,upper=market_price_bounds(payload)
+        distance=Decimal(str(upper))-Decimal(str(number(payload.get('sl'),'Stop price'))) if payload['side']=='buy' else Decimal(str(number(payload.get('sl'),'Stop price')))-Decimal(str(lower))
+        if distance<=0:
+            raise ValueError('Balance level stop must protect the whole entry zone')
+    budget = (Decimal(str(balance))*Decimal(str(percent))/100).quantize(Decimal('.01'),rounding=ROUND_FLOOR)
+    step = Decimal(str(number(metadata.get('quantityStep'),'Quantity step')))
+    minimum = number(metadata.get('minQty'),'Minimum lot')
+    maximum = number(metadata.get('maxQty'),'Maximum lot')
+    if maximum<minimum:
+        raise ValueError('Invalid broker volume limits')
+    floor = lambda value: float((value/step).to_integral_value(rounding=ROUND_FLOOR)*step)
+    total = floor(budget/(distance*Decimal(str(point))))
+    if budget<=0 or total<minimum-1e-8:
+        raise ValueError('Balance risk budget is smaller than the minimum lot')
+    part_percent = number(payload.get('chunkPercent'),'Hybrid chunk percent')
+    if part_percent>100:
+        raise ValueError('Hybrid chunk percent must not exceed 100')
+    chunk = min(total,maximum,max(minimum,floor(Decimal(str(total))*Decimal(str(part_percent))/100)))
+    return dict(riskPercent=percent,balance=balance,riskUsd=float(budget),volume=total,chunkVolume=chunk,
+                stopDistance=float(distance),pointValue=point,quantityStep=float(step),capturedAt=time.time()*1000)
 
 
 def account_entry_sizes(payload, spec):
@@ -1799,6 +1841,14 @@ class ChunkEntries:
             hybrid = payload.get('executionPolicy') == 'hybrid-market-limit-v1'
             captured_accounts = dict(((self.primary, 1.), *followers.items()))
             admission_reads = self._admission_reads(payload, captured_accounts)
+            balance_risk = None
+            if payload.get('riskPercent') is not None:
+                if len(captured_accounts)!=1 or payload.get('initialSizingOnly') is not True:
+                    raise ValueError('Balance risk must be resolved by one native account admission')
+                balance_risk = self.admission_batches.get(self.primary,{}).get('balanceRiskSizing')
+                if not isinstance(balance_risk,dict) or balance_risk.get('riskPercent')!=payload['riskPercent']:
+                    raise ValueError('Native balance risk sizing was not confirmed')
+                payload = dict(payload,**{key:balance_risk[key] for key in ('volume','chunkVolume','riskUsd')})
             for account, multiplier in ((self.primary, 1.), *followers.items()):
                 data, spec = admission_reads[account]
                 if hybrid:
@@ -1832,6 +1882,8 @@ class ChunkEntries:
                 accounts[account] = dict(multiplier=multiplier, targetVolume=0, filledVolume=0., anchor=None,
                                          riskUsd=rounded(payload['riskUsd'] * multiplier), riskUsed=0., pointValue=point,
                                          spec=spec, parts=[])
+                if balance_risk is not None:
+                    accounts[account].update(riskPercent=payload['riskPercent'],balanceRisk=copy.deepcopy(balance_risk))
                 snapshots[account] = price
             total, chunk = account_entry_sizes(payload, accounts[self.primary]['spec'])
             if payload.get('executionPolicy') == 'hybrid-market-limit-v1':
@@ -5772,6 +5824,13 @@ class IsolatedEntries(ChunkEntries):
                     raise ValueError('New entry exceeds its admission risk limit')
             followers = self.bridge.requested_followers(payload) if payload.get('mirrorAccounts') or payload.get('mirrorAccount') else {}
             accounts = {self.primary:1.,**followers}
+            balance_policies = {}
+            for row in payload.get('mirrorAccounts',[]):
+                if row.get('riskPercent') is not None:
+                    percent=number(row['riskPercent'],'Balance risk percent')
+                    if percent>100 or payload.get('stopMode') not in ('entry','level'):
+                        raise ValueError('Balance risk requires a valid percentage and stop')
+                    balance_policies[str(row['account'])]=percent
             current = [row for row in self.list() if row['phase'] in ACTIVE]
             if len(current)>=4 or any(row['symbol']==payload['symbol'] and row['side']==payload['side'] for row in current):
                 raise ValueError('An entry is already active in this direction, or the active entry limit was reached')
@@ -5782,6 +5841,8 @@ class IsolatedEntries(ChunkEntries):
                          accounts={account:dict(multiplier=multiplier,targetVolume=rounded(payload['volume']*multiplier),
                              filledVolume=0.,riskUsd=rounded(payload['riskUsd']*multiplier),riskUsed=0.,entryStatus='checking')
                              for account,multiplier in accounts.items()})
+            for account,percent in balance_policies.items():
+                state['accounts'][account].update(riskPercent=percent,targetVolume=0,riskUsd=0)
             with self.storage.lock:
                 self.storage.db.execute('INSERT INTO chunk_entries VALUES (?,?,?,?)',
                     (identifier,digest(payload),json.dumps(payload,allow_nan=False),json.dumps(state,allow_nan=False)))
@@ -5796,6 +5857,8 @@ class IsolatedEntries(ChunkEntries):
                 local.update(accountExecution='independent-v4',initialSizingOnly=True,accountLaneSlot=slot,
                              volume=rounded(payload['volume']*multiplier),chunkVolume=rounded(payload['chunkVolume']*multiplier),
                              riskUsd=rounded(payload['riskUsd']*multiplier))
+                if account in balance_policies:
+                    local['riskPercent']=balance_policies[account]
                 self._launch_admission(identifier,account,engine,local)
             return public_record(state)
 

@@ -149,7 +149,7 @@ function initService(api) {
       // Settings need capabilities/account ids, not ticket histories,
       // reconciliation, command journals or a management execution lease.
       return {status:'ok',account:config.account,accounts:[config.account,...primary.remoteAccounts],
-        followers:followers(config),timeExit:require('./timeExit').timeExitConfig(config),capabilities:health.capabilities || []};
+        followers:followers(config),timeExit:require('./timeExit').timeExitConfig(config),capabilities:state.capabilities || health.capabilities || []};
     } catch(error){return {status:'rejected',reason:error.message};}
   });
   ipcMain.handle('mt5-vps:orders', async (_evt, account) => {
@@ -218,6 +218,7 @@ function initService(api) {
       const next=followers({...config,followers:rows});
       const health=await primary.health();
       if (!health.capabilities?.includes('scaled-accounts')) throw Error('Обновите приёмник VPS');
+      if(next.some(row=>row.enabled && row.riskPercent!=null) && !health.capabilities?.includes('entry-balance-risk-v1'))throw Error('Обновите VPS для риска от баланса');
       if (next.some(row=>!health.linkedAccounts?.includes(row.account))) throw Error('Сначала подключите отдельный терминал и зарегистрируйте счёт на VPS');
       const changed={...config,followers:next,mirrorAccount:Number(next.find(row=>row.enabled)?.account || 0)};
       if (!settings.writeConfig('mt5-vps',changed)) throw Error('Не удалось сохранить настройки');

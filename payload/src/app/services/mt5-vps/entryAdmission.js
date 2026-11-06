@@ -3,6 +3,7 @@
 const CAPABILITY='atomic-entry-admission-v1';
 function requiredCapabilities(request) {
   const required=['chunked-breakout'];
+  if(request.mirrorAccounts?.some(row=>row.riskPercent!=null))required.push('entry-balance-risk-v1');
   if(request.fillPriority!==undefined)required.push('entry-fill-priority-v1');
   if(['zone','boundary','side-zone'].includes(request.entryMode)) {
     required.push('market-zone-entry');

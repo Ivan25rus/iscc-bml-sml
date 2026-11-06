@@ -5,6 +5,9 @@
   "receiverVersion": 39,
   "executionPolicy": "hybrid-market-limit-v1",
   "capabilitiesByFeature": {
+    "accountsBalanceRisk": [
+      "entry-balance-risk-v1"
+    ],
     "management": [
       "entry-exact-parent-protection-v1",
       "minute-chart-bars-v1"
@@ -18,6 +21,14 @@
   },
   "accountExecution": "independent-v5",
   "riskPolicy": "initial-sizing-fixed-target",
+  "followerSizingModes": [
+    "multiplier",
+    "balance-risk-percent"
+  ],
+  "balanceRiskStopModes": [
+    "entry",
+    "level"
+  ],
   "personalProgressIncluded": false,
   "mobileIncluded": false,
   "levelAlertsIncluded": false,

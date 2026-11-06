@@ -12,60 +12,68 @@
       "size": 233
     },
     "AGENTS.md": {
-      "sha256": "e528eaec5166b9ee1e29b065dcc9078d6b165c1825acd9cfd090ac56b581f774",
-      "size": 6903
+      "sha256": "3a39d631c4702875a6d50ddce0d47853229fef6eaa858da66ea84b8f6e888a6c",
+      "size": 7831
+    },
+    "AGENT_INSTALL.md": {
+      "sha256": "ed295d433f73811b1d002bc1ce43e0c64afc669136bfe9bbce753a230308d41e",
+      "size": 20299
     },
     "BUILD-INFO.json": {
-      "sha256": "bbf5c9c271275104e126adb59ad15e71cea3c243f1ebeb1e608eaa3cc8d05a5a",
-      "size": 1097
+      "sha256": "566dec16c37e075be85cf854a56d16760b4b9a4c595367768ff6be8408a03f5a",
+      "size": 1298
     },
     "CHANGELOG.md": {
-      "sha256": "5cf796a482bf0964fab8dbb6eae1614834f3c37afd978af09f16a94b38346702",
-      "size": 6001
+      "sha256": "abd9a8ef6ae73ad6258624755d0a0b2016dc5a1bcf46b63b86667056a0fe4cab",
+      "size": 7107
     },
     "CHOICES.md": {
-      "sha256": "7b73b142d39ca5c1a12421814ab57c48cd1e505556e2b59dcf535807707a4db2",
-      "size": 5563
+      "sha256": "047c841941aea297de9f8c29ab5d0dc8d73b99f18ada1142b39e7652742dce78",
+      "size": 6226
     },
     "CLAUDE.md": {
-      "sha256": "37184b19dc65aa07585ae52e8d83a5352a210305ef90bb3730ef4c8ec7af9b48",
-      "size": 592
+      "sha256": "e1495b4c0a14adef5152c8593803b49e9379276f46adccdbdded2db4e4afac9b",
+      "size": 945
     },
     "FEATURES.md": {
-      "sha256": "787ff58f5fa7319e0f53ced14adc111dc8bc290f48ddb54b0fe98a4a28b5252e",
-      "size": 5578
+      "sha256": "e3a4df0cd5ac50c02276a238b7a2a0365d2d3de0894690e92ff165e42e8d62ee",
+      "size": 6220
     },
     "INSTALL.md": {
-      "sha256": "c072b9fcd3ae917bf3300c696847a9af01e3ce9f67823760ec8a5bd58f542153",
-      "size": 9747
+      "sha256": "5283c76452174a35019ce2aa428a6059ada1e6d3fc820d5dc66f0e7cd7ed6ada",
+      "size": 10748
     },
     "INTEGRATION.md": {
-      "sha256": "c19d66f60d9784df4adc3a5e4a6a93b878ad045b52ad53bc3d0544824535f238",
-      "size": 7891
+      "sha256": "ed15f5b8dea987670b6642459561338add365bb69d0f1985ef9b76e35349c160",
+      "size": 9370
     },
     "PUBLISH.md": {
       "sha256": "8ebb600c5a18558fb9ab9cf464a42e6ae3ae2d79c1c093ddf12df8a92d71de8b",
       "size": 1775
     },
     "README.md": {
-      "sha256": "299b2efbec96f87a60642e9659da4b91b43a4494bfd6e243271e90472220eebe",
-      "size": 13845
+      "sha256": "c2a0317ece2194337bd6231ccfa3eceb8df7697d0709f1cf54764a6c61181c39",
+      "size": 15835
     },
     "SETUP.html": {
-      "sha256": "7984be0b53a0a7a5a15bad9b1fd6bd7aa9918bb3e1555f96459a4643aab327c9",
-      "size": 9745
+      "sha256": "2a04cdcd4402fb2b18755273ee5a63eb269bf1b2af176dff6c132b6728d572ab",
+      "size": 10294
     },
     "SOURCE-HASHES.json": {
-      "sha256": "22212f2bd5f4ac7e3d66dc80fe10e5f12b45ca23f8b0c4cd43f41ddd28313db4",
-      "size": 12335
+      "sha256": "7fdc4ecfbf2f984d5c9684ea323b56a1ae0ada6367afd3fcf828523ec333f3e1",
+      "size": 12557
     },
     "SOURCE_MAP.md": {
       "sha256": "a052e6f00ca61f3fd39c263cab779ed5e7e42f58755b6d6f31a4af426a32f02f",
       "size": 4417
     },
+    "START_FOR_AGENT.txt": {
+      "sha256": "2d9b659d5d8df3d09ee661b86f9567def359caeacbd2f6b68475c02920cab5e5",
+      "size": 1981
+    },
     "VALIDATION.md": {
-      "sha256": "6c65cdd6eecaf0a08ad39effc2ee157ea00770d29b5aa847331afcca417edc80",
-      "size": 4255
+      "sha256": "9f88ccf79c3a55edebf224db918101cb7ac77a964283106520f89869e94cc639",
+      "size": 4738
     },
     "ci/README.md": {
       "sha256": "d48451e1fa2a978733e15762ab9818fd16073a03f15c66c214b78ca7632818a0",
@@ -128,7 +136,7 @@
       "size": 11739
     },
     "components/level-renderer/manifest.json": {
-      "sha256": "620c4d2510fb99d471cee7c2a3079c7b5ade45076fa2bded83c49b7ab24e34b4",
+      "sha256": "a7bbe1faabf96f035141b77645338c7de6191a18a6ad0977b370e4838b17c138",
       "size": 5920
     },
     "components/level-renderer/module/candle-mappings.js": {
@@ -248,12 +256,12 @@
       "size": 200
     },
     "docs/spx/README.md": {
-      "sha256": "9f2ff88c5584d57d403747ff5126956faf60189e54db1f34f03363a1a3ac95b8",
-      "size": 20588
+      "sha256": "e73b97bbf23e40812dc259c53213ba5032608c53a2e1e22d17c5a44a0b092880",
+      "size": 23904
     },
     "docs/spx/guide-manifest.json": {
-      "sha256": "fc67abca139cb0e43b3fbd331b28953675f893707d97cee7e1d566aa0eaae4d1",
-      "size": 2665
+      "sha256": "b386e19dc97e724c8d2864a9009a8a7cea91cc33f4ed4dbef3f9d64c4132f8e7",
+      "size": 2818
     },
     "docs/spx/images/01-spx-stop-take.png": {
       "sha256": "8ec6c0fc52f1c336b1f04e5e2b0e84c1d2c1db0a3371b7df8f218ca85d91bc82",
@@ -304,28 +312,32 @@
       "size": 84959
     },
     "docs/spx/images/13-spx-accounts-time.jpg": {
-      "sha256": "33eaa7c6f49fa61d9c99dd11dc45c63c779b169fc828171835662691e5483f57",
-      "size": 83583
+      "sha256": "7d2f373b9774dba165783e1553944995364aedf0bc32ff3849516506b81f9ecc",
+      "size": 96938
     },
     "docs/spx/images/14-spx-feature-choice.jpg": {
-      "sha256": "17f04c091be8254cb22f00d405b33c46efc736a596ea0ce72d7ed76ae936dc7c",
-      "size": 228201
+      "sha256": "c0de7c8840020dc4e1b7200f80a4a2cea2e5c24559094a54fd277e9bd1c8ccc4",
+      "size": 244974
     },
     "docs/spx/images/15-spx-add-account.jpg": {
-      "sha256": "26eb45f87a4ad5c130ba30bb9359f3aeebc41fb8cbf66db7718620a4b10bb455",
-      "size": 94513
+      "sha256": "46c88d255608d6072fcfed1a4e716c89365de8dc47e76e4d6bd4bdda366e32f6",
+      "size": 99116
+    },
+    "docs/spx/images/16-spx-balance-risk.jpg": {
+      "sha256": "6281b7b8a523f3045d2b0f770ee54ef5768e31f74372daa901bf32b4c8aeb8d6",
+      "size": 100129
     },
     "docs/spx/index.html": {
-      "sha256": "ef9cac856e04cfd284fb6cbc0b326413f9094fa7a7a1cc91ff6e44c4c27f97ce",
-      "size": 32904
+      "sha256": "6961a9ab4492fc969a0dffec83e5eb2f79c186aebab426bb83e9a16674a0421e",
+      "size": 36907
     },
     "features.json": {
-      "sha256": "e5312be3cec89d991e6dcf0d595b9df40381c2117e13a010a0b511a22f258423",
-      "size": 2155
+      "sha256": "ced6c184bc294fc2a26e30728a2cfee9df20b1377c24ecd4a34f4ee75b7d3a97",
+      "size": 2196
     },
     "index.html": {
-      "sha256": "7984be0b53a0a7a5a15bad9b1fd6bd7aa9918bb3e1555f96459a4643aab327c9",
-      "size": 9745
+      "sha256": "2a04cdcd4402fb2b18755273ee5a63eb269bf1b2af176dff6c132b6728d572ab",
+      "size": 10294
     },
     "module/featurePolicy.js": {
       "sha256": "66040f58a74f3816a158607644110275cbd4fc0a7956857d6ee15ccf1fe1932b",
@@ -396,12 +408,12 @@
       "size": 2878
     },
     "payload/src/app/services/mt5-vps/chunkEntryClient.js": {
-      "sha256": "a833347820fd017cca95ac794c213f699339c7742d5828b90d97a4ee2456826e",
-      "size": 38611
+      "sha256": "e0a8b2d549d6a56976a6d76afa9b23c511e5e3c583fd0a1e2d208f911c1111d4",
+      "size": 38940
     },
     "payload/src/app/services/mt5-vps/client.js": {
-      "sha256": "94c62623e4bcc29ceafbf81d99cfad0f80a3ef57644289d6a7253c56ac18a168",
-      "size": 69083
+      "sha256": "411e69ec2ca9aba7d9287900d7e9e0c64a6d1c72743a0c5e836ec2a09e16f19f",
+      "size": 69223
     },
     "payload/src/app/services/mt5-vps/commandJournal.js": {
       "sha256": "5b2ba80bed0e611ccf1c85acacbc5b7d656f5ef1bb5b3c87e685fb45892eed48",
@@ -412,8 +424,8 @@
       "size": 1377
     },
     "payload/src/app/services/mt5-vps/entryAdmission.js": {
-      "sha256": "adac0e726ae6ffda163c3b5aeb046dd546f76ceee2e47b2371ce87b7380af2c8",
-      "size": 1822
+      "sha256": "e8270d8547c9c133532d4b5489c2f666a25358f6a63512aa74ce10e7b886730b",
+      "size": 1924
     },
     "payload/src/app/services/mt5-vps/entryControlState.js": {
       "sha256": "9e2bd55405155afe41a0a7d786e12f3066ffccc9e04a80f2ba226f2c75147807",
@@ -500,8 +512,8 @@
       "size": 3481
     },
     "payload/src/app/services/mt5-vps/sizing.js": {
-      "sha256": "cb7a00130fbbe2e82575fbba2bac307387cef864a28979a70c2681068c80edd6",
-      "size": 2999
+      "sha256": "8985e2ce6f9c691a249e8a2ed30d114c30e98874eb1000de010960c6fb36e797",
+      "size": 3313
     },
     "payload/src/app/services/mt5-vps/timeExit.js": {
       "sha256": "3be1edb26a66bb0b51081cba5080138637f115369e227aaee69c92a8a33455f0",
@@ -512,8 +524,8 @@
       "size": 2766
     },
     "payload/src/app/services/mt5-vps/tradeSettings.js": {
-      "sha256": "a41abaf879abb75685d29d54c10bd108f09523e1f7715c78ef3b61baad7fc885",
-      "size": 13877
+      "sha256": "90cc80418211349d47f6068cfb99cb3dc6bbeab2107b743067b5dad3d1b1798e",
+      "size": 15026
     },
     "payload/src/app/services/tradeRules/index.js": {
       "sha256": "aa4acf618e861d167ff8099fb8318354f4a596061764952835f98c4ff1f7ae15",
@@ -552,16 +564,16 @@
       "size": 23796
     },
     "payload/vps/chunk_entry.py": {
-      "sha256": "6aba8272e82cc33dc0720d25868216441d3b04b144a5afed7b82c8dcdd9dbb08",
-      "size": 378299
+      "sha256": "979941c143fbf25fa5ea5b0c64e32ced0b94d2e6bd06f06e11f97b66ab07c8fa",
+      "size": 382873
     },
     "payload/vps/entry_wait_totals.py": {
       "sha256": "0f30df5ba9e5fde8ff1fd8796fba506f1b6e54a47c2a138ad29975ffa72b5006",
       "size": 4623
     },
     "payload/vps/mt5_bridge.py": {
-      "sha256": "1b6f40d8e991f6f761d1e0d29bbf2aefc880fea4016e4232dc4a9be765e9af0f",
-      "size": 257606
+      "sha256": "c85758d3dea53246788999974022bb38bb8e81c48e8a1bdf05f3b726c61442c6",
+      "size": 258446
     },
     "payload/vps/parent_close_plan.py": {
       "sha256": "5f26858ac65d32cc11485c957052ce49b594c74a226066ea3e4749b522059057",
@@ -584,8 +596,8 @@
       "size": 2977
     },
     "reference/mt5-service-manifest.js.txt": {
-      "sha256": "f0c69663b25aaeab4c90e1f47897e2e65536e94e94a3595908430b23fd3715e0",
-      "size": 18817
+      "sha256": "5c6cd3af2b00c66a05b99e5e643f139ca4d4e176a4e7454b39f06bc471ec4a8b",
+      "size": 19035
     },
     "reference/renderer-functions.js.txt": {
       "sha256": "7ced7bebaf8d53288b6fd7c304e578ce165d7ab5e448ee56e03b3b1e8c64af89",
@@ -635,6 +647,10 @@
       "sha256": "a2101c0caee22cc5a44b9feb378884b35f4e65397cab86280fae8ec5030e3863",
       "size": 2199
     },
+    "tests/mt5-balance-risk.test.js": {
+      "sha256": "89b187fd5904e91c261eb0922b641ea94d66e83aff238cef0037470f0835e68f",
+      "size": 2103
+    },
     "tests/mt5-card-recovery.test.js": {
       "sha256": "b6d019fe6dd995638faab0b53314f325ec0aa899cb8c8947e2258231e6b768f9",
       "size": 5395
@@ -646,6 +662,10 @@
     "tests/mt5-close-reconciliation.test.js": {
       "sha256": "3726c713edc7d47c83d6c82f9f0cf49d6dae8f6c87937d67c9c6e34cddeb9b96",
       "size": 1537
+    },
+    "tests/mt5-entry-capability-scope.test.js": {
+      "sha256": "2d8da2ab993edf819b3a9c510080ad3b55c24b258f9eb108b570379caa6cf17e",
+      "size": 7977
     },
     "tests/mt5-entry-protection-client.test.js": {
       "sha256": "c212b50e3711646d439893254a8e0066f3b86d48e3ca325de742c8f98bbc6117",
@@ -694,6 +714,10 @@
     "tests/test_atomic_entry_admission.py": {
       "sha256": "fe813db534a75df489c3beeed4c4c3a0abdee13d2da7ba51c2e16cc37bf1110e",
       "size": 2582
+    },
+    "tests/test_balance_risk.py": {
+      "sha256": "eb88e8ad11d401301ded491e374804fead7268cb6b44e3128719eb4150f5979d",
+      "size": 8500
     },
     "tests/test_broker_opening_evidence.py": {
       "sha256": "02487edadf2ebf5cddd66b15ae91c4e3262ecb5b698fd2ba666a3747c3abd966",

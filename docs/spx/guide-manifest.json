@@ -1,17 +1,17 @@
 {
   "version": "0.4.0",
   "kind": "spx-illustrated-guide",
-  "sections": 15,
-  "screenshots": 15,
+  "sections": 16,
+  "screenshots": 16,
   "tradingCommandsSent": 0,
   "files": {
     "index.html": {
-      "sha256": "ef9cac856e04cfd284fb6cbc0b326413f9094fa7a7a1cc91ff6e44c4c27f97ce",
-      "bytes": 32904
+      "sha256": "6961a9ab4492fc969a0dffec83e5eb2f79c186aebab426bb83e9a16674a0421e",
+      "bytes": 36907
     },
     "README.md": {
-      "sha256": "9f2ff88c5584d57d403747ff5126956faf60189e54db1f34f03363a1a3ac95b8",
-      "bytes": 20588
+      "sha256": "e73b97bbf23e40812dc259c53213ba5032608c53a2e1e22d17c5a44a0b092880",
+      "bytes": 23904
     },
     "images/01-spx-stop-take.png": {
       "sha256": "8ec6c0fc52f1c336b1f04e5e2b0e84c1d2c1db0a3371b7df8f218ca85d91bc82",
@@ -62,16 +62,20 @@
       "bytes": 84959
     },
     "images/13-spx-accounts-time.jpg": {
-      "sha256": "33eaa7c6f49fa61d9c99dd11dc45c63c779b169fc828171835662691e5483f57",
-      "bytes": 83583
+      "sha256": "7d2f373b9774dba165783e1553944995364aedf0bc32ff3849516506b81f9ecc",
+      "bytes": 96938
     },
     "images/14-spx-feature-choice.jpg": {
-      "sha256": "17f04c091be8254cb22f00d405b33c46efc736a596ea0ce72d7ed76ae936dc7c",
-      "bytes": 228201
+      "sha256": "c0de7c8840020dc4e1b7200f80a4a2cea2e5c24559094a54fd277e9bd1c8ccc4",
+      "bytes": 244974
     },
     "images/15-spx-add-account.jpg": {
-      "sha256": "26eb45f87a4ad5c130ba30bb9359f3aeebc41fb8cbf66db7718620a4b10bb455",
-      "bytes": 94513
+      "sha256": "46c88d255608d6072fcfed1a4e716c89365de8dc47e76e4d6bd4bdda366e32f6",
+      "bytes": 99116
+    },
+    "images/16-spx-balance-risk.jpg": {
+      "sha256": "6281b7b8a523f3045d2b0f770ee54ef5768e31f74372daa901bf32b4c8aeb8d6",
+      "bytes": 100129
     }
   }
 }

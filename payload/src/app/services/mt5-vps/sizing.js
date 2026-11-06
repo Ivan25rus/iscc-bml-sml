@@ -6,7 +6,9 @@ function followers(config) {
     const account=String(row.account), multiplier=Number(row.multiplier);
     if (!/^[1-9][0-9]{0,15}$/.test(account) || seen.has(account) || !Number.isFinite(multiplier) || multiplier<=0 || multiplier>100) throw Error('Неверный счёт или коэффициент лота');
     seen.add(account);
-    return {account,multiplier,enabled:row.enabled!==false};
+    const riskPercent=row.riskPercent==null ? null : Number(row.riskPercent);
+    if(riskPercent!==null && (!Number.isFinite(riskPercent) || riskPercent<=0 || riskPercent>100))throw Error('Риск счёта: больше 0 и не больше 100% баланса');
+    return {account,multiplier,enabled:row.enabled!==false,...(riskPercent===null ? {} : {riskPercent})};
   });
 }
 function percentVolume(row, percent) {

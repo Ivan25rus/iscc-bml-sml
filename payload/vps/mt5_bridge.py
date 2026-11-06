@@ -372,13 +372,18 @@ class Bridge:
             raise ValueError('Account does not permit independent hedged entry')
         snapshot=self._entry_snapshot_for(payload['symbol'],account)
         spec={key:snapshot['metadata'][key] for key in ('quantityStep','minQty','maxQty')}
-        from chunk_entry import ChunkEntries, account_entry_sizes
+        from chunk_entry import ChunkEntries, account_entry_sizes, balance_risk_sizing
+        risk_sizing = None
+        if payload.get('riskPercent') is not None:
+            risk_sizing = balance_risk_sizing(payload, account, snapshot['metadata'])
+            payload = dict(payload, **{key:risk_sizing[key] for key in ('volume','chunkVolume','riskUsd')})
         _, chunk=account_entry_sizes(payload,spec)
         state=dict(accounts={str(account.login):dict(parts=[chunk])})
         request=ChunkEntries._child(SimpleNamespace(primary=str(account.login)),payload,state,0,payload['trigger'])
         self.open_request(request)
         self.validate_deadline(request)
-        return dict(identity=worker_result('account',account),snapshot=snapshot,spec=spec,checkedRequest=request)
+        return dict(identity=worker_result('account',account),snapshot=snapshot,spec=spec,checkedRequest=request,
+                    **({'balanceRiskSizing':risk_sizing} if risk_sizing is not None else {}))
 
     @property
     def broker_utc_offset_seconds(self):
@@ -1200,7 +1205,7 @@ class Bridge:
                 'independent-account-lanes-v4','entry-events-v1','entry-account-continue-v1','entry-stop-priority-v1',
                 'entry-control-recovery-v1','entry-intent-delivery-v1','entry-status-order-v1','entry-exact-parent-close-v1','entry-account-controls-v1','entry-parent-partial-close-v1',
                 *(['entry-exact-parent-protection-v1','minute-chart-bars-v1','entry-parent-partial-take-v1'] if getattr(self,'isolated_entries',False) else []),
-                *(['independent-account-engines-v5','entry-initial-sizing-only-v1','management-active-v1'] if getattr(self,'isolated_entries',False) else []),
+                *(['independent-account-engines-v5','entry-initial-sizing-only-v1','management-active-v1','entry-balance-risk-v1'] if getattr(self,'isolated_entries',False) else []),
                 *ENTRY_PROTOCOL_CAPABILITIES] + (['lt-level-sync-v1'] if getattr(self,'lt_level_sync',None) else []) + (['account-enrollment','mt4-preparation'] if getattr(self,'account_registry',None) else [])
 
     def _health(self, account):
@@ -1283,6 +1288,11 @@ class Bridge:
         seen={str(self.config['account'])}; result={}
         for row in rows:
             account=str(row['account']); multiplier=float(row.get('multiplier',1))
+            if row.get('riskPercent') is not None:
+                percent=row['riskPercent']
+                if (type(percent) not in (int,float) or not math.isfinite(percent) or not 0<percent<=100
+                        or payload.get('accountExecution')!='independent-v5' or payload.get('stopMode') not in ('entry','level')):
+                    raise ValueError('Balance risk requires independent BML/SML and a valid stop')
             if account in seen or account not in self.linked or not math.isfinite(multiplier) or not 0<multiplier<=100:
                 raise ValueError('Invalid follower account or multiplier')
             seen.add(account); result[account]=multiplier

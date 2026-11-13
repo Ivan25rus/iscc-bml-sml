@@ -25,3 +25,18 @@ test('Default reconciliation still reads all unknown commands',async()=>{
   await journal.reconcile(async id=>{seen.push(id);return {status:'rejected'};});
   assert.deepEqual(seen,['old','current']);assert.ok(journal.records.every(row=>row.result.status==='rejected'));
 });
+test('Read-only receipt refresh does not rewrite an identical unknown or replace a newer result',async()=>{
+  const journal=fixture(),seen=[];
+  const current=journal.records[1];
+  current.payload={independentAccountControls:true};
+  current.result={status:'unknown',independentAccountControls:true};
+  let saves=0;
+  journal.save=async()=>{saves++;};
+  await journal.reconcile(async id=>{seen.push(id);return {...current.result};},{id:'current'});
+  assert.deepEqual(seen,['current']);assert.equal(saves,0);
+  let finish;
+  const old=journal.reconcile(()=>new Promise(resolve=>{finish=resolve;}),{id:'current'});
+  await journal.reconcile(async()=>({status:'ok'}),{id:'current'});
+  finish({status:'rejected'});await old;
+  assert.deepEqual(current.result,{status:'ok'});assert.equal(saves,1);
+});

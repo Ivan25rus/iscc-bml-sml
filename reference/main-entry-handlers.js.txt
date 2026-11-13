@@ -6,11 +6,22 @@
       ? require('./services/mt5-vps/quoteSnapshot').conditionalEntrySnapshot(instrumentInfo,symbol,{instrumentType:detectInstrumentType(symbol),payload})
       : instrumentInfo.get({provider:'mt5-vps',symbol,instrumentType:detectInstrumentType(symbol),payload},{forceQuote:true}),
     orderCalculator:orderCalc,validateTrade:(order,quote,options)=>tradeRules.validate(order,normalizeQuoteForValidation(quote),options),
+    getQuantityLimit:card=>tradeRules.quantityLimit(card),
     log:row=>appendJsonl(EXEC_LOG,{t:nowTs(),...row})
   });
-  ipcMain.handle('level-order:arm-chunks',(_event,payload)=>chunkAdmission.arm(payload));
-  ipcMain.handle('level-order:chunk-entries',async()=>{
-    try {return {status:'ok',entries:await servicesApi.mt5VPS.getAdapter().listChunkEntries()};}
+  ipcMain.handle('level-order:arm-chunks',async(_event,payload)=>{
+    entryMilestones.start(payload);
+    const result=await chunkAdmission.arm(payload);
+    entryMilestones.result(payload?.requestId,result);
+    return result;
+  });
+  ipcMain.handle('level-order:chunk-entries',async(_event,preferredId)=>{
+    try {
+      if(preferredId!==undefined && (typeof preferredId!=='string' || !/^[A-Za-z0-9_.:-]{1,100}$/.test(preferredId)))
+        throw Error('Некорректный номер набора');
+      const entries=await servicesApi.mt5VPS.getAdapter().listChunkEntries(visibleEntryCards,preferredId);
+      return {status:'ok',entries:entryMilestones.observeMany(visibleEntryCards(entries))};
+    }
     catch(error){return {status:'rejected',reason:error.message};}
   });
   ipcMain.handle('level-order:chunk-events',async(_event,revision=0)=>{
@@ -18,11 +29,12 @@
     if(!adapter.capabilities?.includes('entry-events-v1'))return {supported:false};
     if(!Number.isSafeInteger(revision) || revision<0)throw Error('Неверный номер состояния набора');
     const value=await adapter.request('/entry-events?since='+revision,undefined,{readTimeoutMs:15000});
-    return {supported:true,status:'ok',revision:value.revision,entries:value.entries};
+    return {supported:true,status:'ok',revision:value.revision,entries:entryMilestones.observeMany(visibleEntryCards(value.entries))};
   });
   ipcMain.handle('level-order:stop-chunks',async(_event,payload={})=>{
     try {
       const result=await servicesApi.mt5VPS.getAdapter().stopChunkEntry(payload.entryId,{cancelContinueIds:payload.cancelContinueIds});
+      entryMilestones.result(payload.entryId,result?.entry ? result : null);
       appendJsonl(EXEC_LOG,{t:nowTs(),kind:'chunk-entry-stop',entryId:payload.entryId,result});
       return result;
     } catch(error){return {status:'rejected',reason:error.message};}

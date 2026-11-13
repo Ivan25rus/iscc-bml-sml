@@ -112,7 +112,7 @@ function createProtectionChart({document,onEdit,onHistoryRetry=()=>{},frames=doc
   const svg=document.createElementNS(NS,'svg');svg.setAttribute('viewBox',`0 0 ${WIDTH} ${HEIGHT}`);
   svg.setAttribute('preserveAspectRatio','none');svg.setAttribute('aria-label','График позиции: вход, текущая цена, стоп и тейк');
   const hint=document.createElement('div');hint.className='chart-hint';hint.textContent='Перетащи SL/TP · затем «Сохранить»';
-  hint.title='Перетаскивание фона сдвигает шкалу, колесо плавно приближает цену под мышью. Двойной щелчок возвращает «Авто». Цена меняется только при перетаскивании линии SL/TP; снятый уровень можно задать нажатием на графике.';
+  hint.title='Перетаскивание фона сдвигает шкалу, колесо приближает цену под мышью. Дальний SL/TP можно подтянуть за метку на краю графика. Во время перетаскивания уровня шкала зафиксирована.';
   const history=document.createElement('div');history.className='chart-history';history.setAttribute('role','status');
   const historyText=document.createElement('span'),historyRetry=document.createElement('button');
   historyRetry.type='button';historyRetry.textContent='Повторить';historyRetry.title='Загрузить реальные минутные бары';historyRetry.onclick=onHistoryRetry;
@@ -122,6 +122,10 @@ function createProtectionChart({document,onEdit,onHistoryRetry=()=>{},frames=doc
   function changeZoom(factor,anchor){
     const base=protectionScale({...model,bars},selected,1,framing[selected]);if(!base || !scale)return;
     viewports[selected]=zoomScale(scale,factor,anchor,Math.max(Number(model.tickSize)*2,(base.high-base.low)/64),(base.high-base.low)*1024);paint();
+  }
+  function selectLine(key){
+    if(scale)viewports[key]={...scale};
+    selected=key;
   }
   function node(tag,attributes={},text){
     const result=document.createElementNS(NS,tag);
@@ -167,7 +171,7 @@ function createProtectionChart({document,onEdit,onHistoryRetry=()=>{},frames=doc
     if(scale && !drag && !viewports[selected])autoScales[selected]=scale;
     const paintKey=JSON.stringify([width,selected,model.enabled,model.blocked,model.historyState?.loading,
       model.historyState?.error,values.sl,values.tp,values.partialTp,model.partialPercent,model.partialEnabled,model.entry,model.current,model.side,model.tickSize,
-      barRevision,scale?.low,scale?.high,!!pan,framing[selected]]);
+      barRevision,scale?.low,scale?.high,!!pan,!!viewports[selected],framing[selected]]);
     if(paintKey===lastPaintKey)return;
     lastPaintKey=paintKey;
     if(lastQuote)lastPaintAt=Date.now();
@@ -228,9 +232,9 @@ function createProtectionChart({document,onEdit,onHistoryRetry=()=>{},frames=doc
     for(const [key,value,label,color] of levels){
       const outside=Number(value)<scale.low || Number(value)>scale.high;
       const lineY=Math.max(TOP,Math.min(BOTTOM,y(value))),editable=key==='sl'||key==='tp'||key==='partialTp' && model.partialEnabled;
-      const group=node('g',editable?{'data-protection-line':key,'data-offscale':String(outside),role:outside?'button':'slider',tabindex:model.enabled?'0':'-1','aria-label':`${label} · ${value}${outside?' · вне шкалы; нажми для своего масштаба':''}`,'aria-valuenow':value,'aria-valuetext':String(value),'aria-orientation':'vertical',style:`color:${color}`} : {'data-price-line':key});
+      const group=node('g',editable?{'data-protection-line':key,'data-offscale':String(outside),role:'slider',tabindex:model.enabled?'0':'-1','aria-label':`${label} · ${value}${outside?' · вне шкалы; потяни метку внутрь графика':''}`,'aria-valuenow':value,'aria-valuetext':String(value),'aria-orientation':'vertical',style:`color:${color}`} : {'data-price-line':key});
       group.append(node('line',{x1:8,x2:right,y1:lineY,y2:lineY,stroke:color,'stroke-width':editable?1.3:.8,'stroke-dasharray':editable && !outside?'':'3 4','vector-effect':'non-scaling-stroke'}));
-      if(editable)group.append(node('line',{x1:8,x2:width-8,y1:lineY,y2:lineY,stroke:'transparent','stroke-width':18}));
+      if(editable)group.append(node('line',{x1:8,x2:right,y1:lineY,y2:lineY,stroke:'transparent','stroke-width':18}));
       const labelY=Math.max(10,Math.min(HEIGHT-10,labels.get(key)));
       if(Math.abs(labelY-lineY)>1)group.append(node('line',{x1:right,x2:right+3,y1:lineY,y2:labelY,stroke:color,'stroke-width':.5}));
       group.append(node('rect',{x:right+2,y:labelY-9,width:100,height:18,rx:4,fill:'var(--bg,#111)'}));
@@ -242,7 +246,13 @@ function createProtectionChart({document,onEdit,onHistoryRetry=()=>{},frames=doc
   }
   function pointerValue(event){
     const box=svg.getBoundingClientRect();
-    return box.height>0?priceAt((event.clientY-box.top)*HEIGHT/box.height-(drag?.offset || 0),drag?.scale || scale,model?.tickSize):null;
+    if(!(box.height>0))return null;
+    const y=drag ? drag.anchorY+(event.clientY-drag.clientY)*HEIGHT/box.height
+      : (event.clientY-box.top)*HEIGHT/box.height;
+    if(drag && (drag.edge===TOP && y<=TOP || drag.edge===BOTTOM && y>=BOTTOM))return null;
+    const value=priceAt(y,drag?.scale || scale,model?.tickSize);
+    if(value!==null && drag)drag.edge=null;
+    return value;
   }
   function panTo(event){
     const box=svg.getBoundingClientRect();if(!(box.height>0))return false;
@@ -250,22 +260,21 @@ function createProtectionChart({document,onEdit,onHistoryRetry=()=>{},frames=doc
     const low=Math.max(0,pan.scale.low+offset);viewports[selected]={low,high:low+pan.scale.high-pan.scale.low};return true;
   }
   svg.addEventListener('pointerdown',event=>{
-    if(event.button!==0 || !model?.enabled || !scale)return;
+    if(event.button!==0 || !model?.enabled || !scale || drag || pan)return;
     const hit=event.target.closest('[data-protection-line]'),key=hit?.dataset.protectionLine || selected;
-    const outside=hit?.dataset.offscale==='true';
-    if(outside){selected=key;zooms[key]=1;framing[key]='level';viewports[key]=autoScales[key]=null;paint();event.preventDefault();return;}
     if(!hit && positive(model[key])){
       pan={pointerId:event.pointerId,y:event.clientY,scale:{...scale},identity};
       try{svg.setPointerCapture(event.pointerId);}catch{}
       event.preventDefault();paint();return;
     }
-    if(hit && key!==selected){
-      viewports[key]={...scale};selected=key;paint();
-    }
     const value=hit?snapPrice(model[key],model.tickSize):pointerValue(event);if(value===null)return;
-    const box=svg.getBoundingClientRect(),lineY=TOP+(scale.high-value)/(scale.high-scale.low)*(BOTTOM-TOP);
-    const offset=hit && box.height>0?(event.clientY-box.top)*HEIGHT/box.height-lineY:0;
-    selected=key;drag={key,price:value,scale,identity,pointerId:event.pointerId,offset};
+    const box=svg.getBoundingClientRect();if(!(box.height>0))return;
+    const frozen={...scale},edge=hit?.dataset.offscale==='true' ? (Number(model[key])>frozen.high ? TOP : BOTTOM) : null;
+    const anchorY=edge ?? (hit ? TOP+(frozen.high-value)/(frozen.high-frozen.low)*(BOTTOM-TOP)
+      : (event.clientY-box.top)*HEIGHT/box.height);
+    if(hit)selectLine(key);
+    drag={key,price:value,original:hit ? value : null,scale:frozen,identity,pointerId:event.pointerId,
+      edge,anchorY,clientY:event.clientY};
     try{svg.setPointerCapture(event.pointerId);}catch{ /* Synthetic or cancelled pointer. */ }
     event.preventDefault();paint();
   });
@@ -285,29 +294,34 @@ function createProtectionChart({document,onEdit,onHistoryRetry=()=>{},frames=doc
     // The release can arrive before the queued frame or without a last move.
     const value=pointerValue(event);if(value!==null)drag.price=value;
     const final=drag;drag=null;cancelDragFrame();
-    if(final.identity===identity && model?.enabled){viewports[final.key]={...final.scale};onEdit(final.key,String(final.price));}
+    if(final.identity===identity && model?.enabled){
+      viewports[final.key]=final.scale;
+      if(final.price!==final.original)onEdit(final.key,String(final.price));
+    }
     paint();
   });
   const cancel=()=>{drag=pan=null;paint();};
   svg.addEventListener('pointercancel',cancel);svg.addEventListener('lostpointercapture',cancel);
   svg.addEventListener('wheel',event=>{
     if(!model?.enabled || !scale)return;
-    event.preventDefault();drag=pan=null;
+    event.preventDefault();if(drag)return;pan=null;
     const box=svg.getBoundingClientRect(),ratio=box.height>0?Math.max(0,Math.min(1,((event.clientY-box.top)*HEIGHT/box.height-TOP)/(BOTTOM-TOP))):.5;
     changeZoom(Math.exp(Math.max(-2,Math.min(2,event.deltaY*.002))),scale.high-ratio*(scale.high-scale.low));
   },{passive:false});
-  svg.addEventListener('dblclick',event=>{if(model?.enabled){event.preventDefault();drag=pan=null;resetView();}});
+  svg.addEventListener('dblclick',event=>{
+    if(!drag && model?.enabled && !event.target.closest('[data-protection-line]')){event.preventDefault();pan=null;resetView();}
+  });
   svg.addEventListener('keydown',event=>{
     if(event.key==='Escape' && (drag || pan)){cancel();event.preventDefault();event.stopPropagation();return;}
-    const key=event.target.closest('[data-protection-line]')?.dataset.protectionLine;
+    if(drag)return;
+    const hit=event.target.closest('[data-protection-line]'),key=hit?.dataset.protectionLine;
     if(key && model?.enabled && ['Enter',' '].includes(event.key)){
-      event.preventDefault();drag=null;selected=key;
-      if(event.target.closest('[data-protection-line]').dataset.offscale==='true'){zooms[key]=1;framing[key]='level';viewports[key]=autoScales[key]=null;}
+      event.preventDefault();selectLine(key);
       paint();return;
     }
     if(!key || !model?.enabled || !['ArrowUp','ArrowDown'].includes(event.key))return;
     const value=snapPrice(Number(model[key])+(event.key==='ArrowUp'?1:-1)*(event.shiftKey?10:1)*model.tickSize,model.tickSize);
-    if(value!==null){event.preventDefault();selected=key;onEdit(key,String(value));paint();svg.querySelector(`[data-protection-line=${key}]`)?.focus();}
+    if(value!==null){event.preventDefault();selectLine(key);onEdit(key,String(value));paint();svg.querySelector(`[data-protection-line=${key}]`)?.focus();}
   });
   const observer=document.defaultView?.ResizeObserver?new document.defaultView.ResizeObserver(()=>{if(element.getClientRects().length)paint();}):null;
   observer?.observe(svg);

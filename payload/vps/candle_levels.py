@@ -298,6 +298,13 @@ class CandleLevels:
 
     def files(self):
         if self.directory is None:
+            shared = self.config.get('_chartRecorderDirectory') or self.config.get('candleLevelsFileDirectory')
+            if shared:
+                path = pathlib.Path(shared)
+                if not path.is_absolute() or not path.is_dir():
+                    raise ValueError('Shared MT5 level directory is unavailable')
+                self.directory = path
+                return path
             info = self.mt5.terminal_info()
             if not info or not getattr(info, 'data_path', None):
                 raise ValueError('MT5 terminal data directory is unavailable')
@@ -388,7 +395,15 @@ class CandleLevels:
 
     def acknowledgements(self, generation, drawing):
         try:
-            file = self.files() / 'iscc-candle-levels-ack.csv'
+            directory = self.files()
+            if self.config.get('_chartRecorderDirectory'):
+                from chart_recorder import read_route
+                revision, account, server = read_route(directory)
+                if server != self.config['server']:
+                    return None
+                file = directory / f'iscc-candle-levels-ack-{account}-{revision}.csv'
+            else:
+                file = directory / 'iscc-candle-levels-ack.csv'
             stat = file.stat()
             if not 0 <= self.clock() - stat.st_mtime <= 5 or stat.st_size > 1024 * 1024:
                 return None
@@ -411,6 +426,8 @@ class CandleLevels:
                 price = float(row[4])
                 if math.isfinite(price) and abs(price - source['price']) <= max(1e-8, abs(price) * 1e-12):
                     found[row[0]] = True
+            if self.config.get('_chartRecorderDirectory') and read_route(directory) != (revision, account, server):
+                return None
             return found
         except (OSError, ValueError, UnicodeError, OverflowError):
             return None

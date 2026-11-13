@@ -28,6 +28,7 @@ from broker_opening_evidence import opening_order_evidence
 
 RULE_ACTIVE_INTERVAL = .05
 RULE_IDLE_INTERVAL = .1
+TIME_EXIT_FROZEN_RETRY_SECONDS = (1, 2, 4, 8, 15)
 RECEIVER_RETRY_SECONDS = 1
 BRIDGE_VERSION = 39
 ENTRY_PROTOCOL_CAPABILITIES = ('hybrid-entry-batch-v1', 'entry-admission-cancel-proof-v1', 'hybrid-quote-wait-v1', 'entry-cancel-proof-v1', 'entry-fill-priority-v1')
@@ -36,6 +37,9 @@ class EntryPriceRejected(ValueError):
     def __init__(self, message, details):
         super().__init__(message)
         self.entry_diagnostics = details
+
+class TerminalDisconnected(ValueError):
+    """The native terminal did not provide a connected account identity."""
 
 @lru_cache(maxsize=1)
 def runtime_build_identity():
@@ -225,10 +229,14 @@ class Bridge:
         self.rule_stop = threading.Event()
         # A crash after claiming a rule never rearms it, even if submission had
         # not started. Receipt reconciliation can prove a known outcome later.
-        for identifier, in ([] if config.get('_coordinatorOnly') else self.db.execute("SELECT id FROM close_rules WHERE state='firing'").fetchall()):
-            row = self.db.execute('SELECT result FROM requests WHERE id=?', ('rule:'+identifier,)).fetchone()
-            result = json.loads(row[0]) if row else {'status':'unknown', 'reason':'Receiver interrupted during trigger; inspect MT5'}
-            self.set_rule_state(identifier, 'completed' if result['status']=='ok' else result['status'], result)
+        for identifier, text, state in ([] if config.get('_coordinatorOnly') else self.db.execute(
+                "SELECT id,payload,state FROM close_rules WHERE state IN ('firing','unknown')").fetchall()):
+            result = self._price_rule_receipt(identifier, json.loads(text))
+            if result is not None:
+                self._finish_price_rule(identifier, result)
+            elif state == 'firing':
+                self.set_rule_state(identifier, 'unknown', {'status':'unknown',
+                    'reason':'Receiver interrupted during trigger; inspect MT5'})
         self.started = time.perf_counter()
         self.frames = self.frame_bytes = 0
         self.quote_work = 0.
@@ -246,16 +254,26 @@ class Bridge:
         self.time_rule_reconcile_cursor = 0
         self.terminal_probe_at = 0.
         self.terminal_reconnect_at = 0.
-        for identifier, text in ([] if config.get('_coordinatorOnly') else self.db.execute("SELECT id,payload FROM time_rules WHERE state IN ('opening','firing')").fetchall()):
+        for identifier, text, state in ([] if config.get('_coordinatorOnly') else self.db.execute(
+                "SELECT id,payload,state FROM time_rules WHERE state IN ('opening','firing','unknown')").fetchall()):
             payload=json.loads(text)
-            request_id=payload.get('commandId',identifier)
-            receipt=self.db.execute('SELECT result FROM requests WHERE id=?',(request_id,)).fetchone()
-            result=json.loads(receipt[0]) if receipt else {'status':'unknown','reason':'Receiver interrupted; inspect MT5'}
-            if result['status']=='ok':
-                if request_id==identifier: payload['ticket']=str(result['providerOrderId'])
-                else: payload.setdefault('actions',{})[request_id]=result
-                self.write_time_rule(identifier,payload,'armed',result)
-            else: self.write_time_rule(identifier,payload,'unknown',result)
+            command_id = payload.get('commandId')
+            if command_id:
+                action = self._time_rule_action_receipt(identifier, payload, command_id)
+                if action:
+                    operation, attempt, result = action
+                    self._finish_time_rule_action(identifier, payload, command_id, operation, attempt, result)
+                    continue
+            elif state == 'opening':
+                result = self._request_receipt(identifier)
+                if result and result['status'] == 'ok':
+                    payload['ticket'] = str(result['providerOrderId'])
+                    self.write_time_rule(identifier, payload, 'armed', result)
+                    continue
+            if state != 'unknown':
+                result = self._request_receipt(command_id or identifier)
+                self.write_time_rule(identifier, payload, 'unknown', result or
+                    {'status':'unknown','reason':'Receiver interrupted; inspect MT5'})
         from chunk_entry import ChunkEntries, EntryDiagnostics
         role='coordinator' if config.get('_coordinatorOnly') else 'mt5-'+str(config['account'])
         self.entry_diagnostics=EntryDiagnostics(pathlib.Path(database).resolve().parent/'logs'/'entry-diagnostics'/(role+'.jsonl'),config['account'])
@@ -318,7 +336,7 @@ class Bridge:
         account = measured(timing, 'accountInfoMs', self.read_timings.call, 'accountInfo', self.mt5.account_info)
         terminal = measured(timing, 'terminalInfoMs', self.read_timings.call, 'terminalInfo', self.mt5.terminal_info)
         if not account or not terminal or not terminal.connected:
-            raise ValueError('MT5 is disconnected')
+            raise TerminalDisconnected('MT5 is disconnected')
         if account.login != int(self.config['account']) or account.server != self.config['server']:
             raise ValueError('MT5 account or server mismatch')
         if account.currency != 'USD':
@@ -364,6 +382,15 @@ class Bridge:
             contextMs=round((time.perf_counter()-started)*1000, 3))
 
     @serialized
+    def entry_primary_sizing(self, payload):
+        from chunk_entry import primary_balance_risk_sizing
+        account = self.account()
+        if not self.config.get('tradingEnabled', False):
+            raise ValueError('Trading disabled; no entry admitted')
+        snapshot = self._entry_snapshot_for(payload['symbol'], account)
+        return primary_balance_risk_sizing(payload, account, snapshot['metadata'], self._risk_includes_credit(account))
+
+    @serialized
     def entry_admission(self, payload):
         """One account-local read/preflight batch; no intent or broker send."""
         account=self.account()
@@ -375,7 +402,8 @@ class Bridge:
         from chunk_entry import ChunkEntries, account_entry_sizes, balance_risk_sizing
         risk_sizing = None
         if payload.get('riskPercent') is not None:
-            risk_sizing = balance_risk_sizing(payload, account, snapshot['metadata'])
+            risk_sizing = balance_risk_sizing(payload, account, snapshot['metadata'],
+                                             include_credit=self._risk_includes_credit(account))
             payload = dict(payload, **{key:risk_sizing[key] for key in ('volume','chunkVolume','riskUsd')})
         _, chunk=account_entry_sizes(payload,spec)
         state=dict(accounts={str(account.login):dict(parts=[chunk])})
@@ -463,9 +491,19 @@ class Bridge:
     def quote_frame(self):
         started=time.perf_counter();timing={}
         account = self.account(timing)
-        snapshots = {symbol: self._snapshot(symbol, account) for symbol in self.config['symbols']}
+        snapshots, unavailable = {}, []
+        failure = None
+        for symbol in self.config['symbols']:
+            try:
+                snapshots[symbol] = self._snapshot(symbol, account)
+            except ValueError as error:
+                failure = error
+                unavailable.append(symbol)
+        if not snapshots:
+            raise failure or ValueError('No valid broker quotes in the frame')
         return {'account': account.login, 'server': account.server, 'snapshots': snapshots,
                 'capturedAt': time.time() * 1000, 'intervalMs': round(self.quote_interval() * 1000),
+                **({'unavailableSymbols':unavailable} if unavailable else {}),
                 'quoteTiming':dict(timing,nativeMs=round((time.perf_counter()-started)*1000,3))}
 
     def _snapshot(self, symbol, account):
@@ -523,14 +561,22 @@ class Bridge:
         return True
 
     @serialized
-    def execute(self, operation, payload, received=None):
+    def execute(self, operation, payload, received=None, native_opening_guard_after_claim=False):
         started = time.perf_counter()
         timing = {'receivedAt': received[0] if received else time.time()*1000,
                   'queueMs': round((started-received[1])*1000, 2) if received else 0.}
+        def reply(status):
+            if status.get('retryableConnection') is True:
+                # The durable refusal proves this authenticated worker sent
+                # nothing. A disconnected SDK cannot attest broker identity.
+                return dict(account=int(self.config['account']), server=self.config['server'],
+                            brokerIdentityVerified=False, result=status)
+            return self.envelope(result=status)
+
         def timed(status):
             timing['totalMs'] = round((time.perf_counter()-started)*1000 + timing['queueMs'], 2)
             reply_started=time.perf_counter()
-            response=self.envelope(result=status)
+            response=reply(status)
             if (operation=='place' and payload.get('type')=='market' and payload.get('positionProofRequested') is True and 'entryGuard' in payload
                     and status.get('status')=='ok' and status.get('filledVolume')==request['volume']
                     and re.fullmatch(r'[1-9][0-9]{0,19}',str(status.get('providerOrderId','')))):
@@ -562,15 +608,48 @@ class Bridge:
         if previous:
             if previous[0] != digest:
                 raise ValueError('Request ID was already used with different parameters')
-            return self.envelope(result=json.loads(previous[1]))
-        rejected = lambda message: timed({'status': 'rejected', 'reason': message})
-        account=measured(timing,'accountCheckMs',self.account,timing)
+            return reply(json.loads(previous[1]))
+        guarded_opening = operation == 'place' and 'entryGuard' in payload
+        def pre_send_refusal(reason, details=None, *, claimed=False, expired=False, disconnected=False):
+            status = {'status': 'rejected', 'reason': reason}
+            if guarded_opening or expired:
+                status.update(mutationStarted=False, finalPreMutationRejection=True)
+            if expired:
+                status['retryableExpiry'] = guarded_opening
+            if disconnected:
+                status['retryableConnection'] = True
+            if details is not None:
+                status['entryDiagnostics'] = details
+            # A lost IPC reply must still leave proof that this exact guarded
+            # command never reached order_send. Early refusals have no exit rule.
+            if claimed or guarded_opening:
+                try:
+                    stored = json.dumps(status)
+                    if claimed:
+                        self.db.execute('UPDATE requests SET result=? WHERE id=?', (stored, identifier))
+                        if operation == 'place' and 'closeAtUtc' in payload:
+                            self.db.execute('UPDATE time_rules SET state=?,result=? WHERE id=?', ('rejected', stored, identifier))
+                    else:
+                        self.db.execute('INSERT INTO requests VALUES (?,?,?)', (identifier, digest, stored))
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+                    raise
+            return timed(status)
+
+        try:
+            account=measured(timing,'accountCheckMs',self.account,timing)
+        except TerminalDisconnected as error:
+            if not guarded_opening:
+                raise
+            return pre_send_refusal(str(error), disconnected=True)
         if not self.config.get('tradingEnabled', False):
-            return rejected('MT5 receiver is in read-only mode')
+            return pre_send_refusal('MT5 receiver is in read-only mode')
         expires = float(payload.get('expiresAt', 0))
         remaining = expires - time.time() * 1000
         if not math.isfinite(remaining) or remaining <= 0 or remaining > 3000:
-            return rejected('Command expired or client clock is incorrect')
+            return pre_send_refusal('Command expired or client clock is incorrect',
+                                    expired=guarded_opening and expires > 0 and math.isfinite(remaining) and remaining <= 0)
         if operation in ('schedule-close', 'cancel-close'):
             try:
                 # Both records are committed atomically: retrying a lost reply
@@ -581,23 +660,22 @@ class Bridge:
                 return timed(status)
             except (ValueError, TypeError, KeyError) as error:
                 self.db.rollback()
-                return rejected(str(error))
+                return pre_send_refusal(str(error))
         try:
             if operation != 'place':
                 self.check_rule_unknown(payload)
-            request = measured(timing,'requestBuildMs',self.open_request,payload) if operation == 'place' else measured(timing,'requestBuildMs',self.control_request,operation,payload,timing)
             if operation=='place':
+                opening_options = (True,) if native_opening_guard_after_claim else ()
+                request = measured(timing, 'requestBuildMs', self.open_request, payload, *opening_options)
                 self.validate_deadline(payload)
                 if 'closeAtUtc' in payload and getattr(account,'margin_mode',2)!=2:
                     raise ValueError('Timed exit requires a hedging account with a separate position')
+            else:
+                request = measured(timing, 'requestBuildMs', self.control_request, operation, payload, timing)
         except (ValueError, TypeError, KeyError) as error:
-            details = getattr(error, 'entry_diagnostics', None)
-            if details is not None:
-                return timed(dict(status='rejected', reason=str(error), entryDiagnostics=details))
-            return rejected(str(error))
+            return pre_send_refusal(str(error), getattr(error, 'entry_diagnostics', None))
         if time.time() * 1000 >= expires:
-            return timed(dict(status='rejected',reason='Command expired before submission',mutationStarted=False,
-                finalPreMutationRejection=True,retryableExpiry=operation=='place' and 'entryGuard' in payload))
+            return pre_send_refusal('Command expired before submission', expired=True)
         unknown = {'status': 'unknown', 'reason': 'Submission recorded; verify receipt with MT5'}
         if operation != 'place':
             # A pending-order removal cannot close or change an already filled
@@ -615,36 +693,26 @@ class Bridge:
         self.db.commit()
         timing['ledgerBeforeMs'] = round((time.perf_counter()-ledger_started)*1000, 2)
         if time.time()*1000 >= expires:
-            status=dict(status='rejected',reason='Command expired before broker submission',mutationStarted=False,
-                finalPreMutationRejection=True,retryableExpiry=operation=='place' and 'entryGuard' in payload)
-            self.db.execute('UPDATE requests SET result=? WHERE id=?',(json.dumps(status),identifier))
-            if operation=='place' and 'closeAtUtc' in payload:
-                self.db.execute('UPDATE time_rules SET state=?,result=? WHERE id=?',('rejected',json.dumps(status),identifier))
-            self.db.commit()
-            return timed(status)
-        if operation=='place' and 'entryGuard' in payload:
+            return pre_send_refusal('Command expired before broker submission', claimed=True, expired=True)
+        if guarded_opening:
             try:
-                # Broker-terminal data is read again after the durable intent,
-                # immediately before sending. Never reuse a Mac quote here.
-                self.guard_chunk_request(payload,request)
+                # Read broker-terminal data after the durable intent,
+                # immediately before sending. Never reuse an earlier quote here.
+                quote_at = self.guard_chunk_request(payload, request)
                 self.account()
                 now=time.time()*1000
-                if now>=expires or ('closeAtUtc' in payload and now>=float(payload['closeAtUtc'])):
-                    raise ValueError('Chunk command expired during final validation')
+                expired = now >= expires or ('closeAtUtc' in payload and now >= float(payload['closeAtUtc']))
+                if not expired and not -.25 <= now/1000 - quote_at <= 1:
+                    raise ValueError('Chunk tick is stale; no submission')
+            except TerminalDisconnected as error:
+                return pre_send_refusal(str(error), claimed=True, disconnected=True)
             except (ValueError,TypeError,KeyError) as error:
-                status={'status':'rejected','reason':str(error)}
-                if str(error)=='Chunk command expired during final validation':
-                    status.update(mutationStarted=False,finalPreMutationRejection=True,retryableExpiry=True)
-                details = getattr(error, 'entry_diagnostics', None)
-                if details is not None:
-                    status['entryDiagnostics'] = details
-                self.db.execute('UPDATE requests SET result=? WHERE id=?',(json.dumps(status),identifier))
-                if 'closeAtUtc' in payload:
-                    self.db.execute('UPDATE time_rules SET state=?,result=? WHERE id=?',('rejected',json.dumps(status),identifier))
-                self.db.commit()
-                return timed(status)
+                return pre_send_refusal(str(error), getattr(error, 'entry_diagnostics', None), claimed=True)
+            if expired:
+                return pre_send_refusal('Chunk command expired during final validation', claimed=True, expired=True)
+        journal_committed = False
         try:
-            if operation == 'place' and 'entryGuard' in payload:
+            if guarded_opening:
                 unknown.update(submittedPrice=request['price'], sl=request['sl'], tp=request['tp'])
                 if payload['entryGuard'].get('supportReprice') is True:
                     unknown['supportRepriced'] = True
@@ -665,6 +733,7 @@ class Bridge:
             if result is None:
                 self.db.execute('UPDATE requests SET result=? WHERE id=?', (json.dumps(unknown), identifier))
                 self.db.commit()
+                journal_committed = True
                 return timed(unknown)
             if result.retcode in (self.mt5.TRADE_RETCODE_DONE, self.mt5.TRADE_RETCODE_PLACED,
                                    getattr(self.mt5, 'TRADE_RETCODE_NO_CHANGES', 10025)):
@@ -678,9 +747,45 @@ class Bridge:
                                     getattr(self.mt5, 'TRADE_RETCODE_CONNECTION', 10031),
                                     getattr(self.mt5, 'TRADE_RETCODE_DONE_PARTIAL', 10010)):
                 status = {**unknown, 'retcode': result.retcode, 'providerOrderId': str(result.order)}
+                if (guarded_opening and payload['type'] == 'market'
+                        and result.retcode == getattr(self.mt5, 'TRADE_RETCODE_DONE_PARTIAL', 10010)
+                        and request['type_filling'] == self.mt5.ORDER_FILLING_IOC
+                        and re.fullmatch(r'[1-9][0-9]{0,19}', status['providerOrderId'])):
+                    status['marketPartial'] = dict(symbol=request['symbol'], side=payload['side'],
+                                                   requestedVolume=request['volume'])
             else:
                 status = {'status': 'rejected', 'reason': str(result.comment), 'retcode': result.retcode}
                 self._specification_refused(payload.get('symbol'),result.retcode)
+                if guarded_opening and result.retcode in (getattr(self.mt5, 'TRADE_RETCODE_LIMIT_ORDERS', 10033),
+                                                         getattr(self.mt5, 'TRADE_RETCODE_LIMIT_VOLUME', 10034)):
+                    order, deal, volume = (getattr(result, field, None) for field in ('order', 'deal', 'volume'))
+                    if all(value in (None, '', '0', 0) for value in (order, deal, volume)):
+                        status['emptyCapacityRefusal'] = True
+                    else:
+                        # A capacity code cannot prove no fill if the same
+                        # native reply carries contradictory execution data.
+                        status = {**unknown, 'retcode':result.retcode,
+                                  'reason':'Capacity refusal contains native execution evidence; inspect receipt'}
+                        for value, field in ((order, 'providerOrderId'), (deal, 'providerDealId')):
+                            if re.fullmatch(r'[1-9][0-9]{0,19}', str(value)):
+                                status[field] = str(value)
+                        if type(volume) in (int, float) and math.isfinite(volume) and volume > 0:
+                            status['filledVolume'] = volume
+            if guarded_opening and payload['type'] == 'market':
+                deal = str(getattr(result, 'deal', ''))
+                done = result.retcode == self.mt5.TRADE_RETCODE_DONE
+                partial_ioc = (result.retcode == getattr(self.mt5, 'TRADE_RETCODE_DONE_PARTIAL', 10010)
+                               and request['type_filling'] == self.mt5.ORDER_FILLING_IOC)
+                if (done or partial_ioc) and re.fullmatch(r'[1-9][0-9]{0,19}', deal):
+                    if not re.fullmatch(r'[1-9][0-9]{0,19}', status.get('providerOrderId', '')):
+                        # A deal ID is not an order or position ticket. Keep the
+                        # reservation unknown until exact history links them.
+                        market = dict(symbol=request['symbol'], side=payload['side'], requestedVolume=request['volume'])
+                        status = {**unknown, 'retcode':result.retcode,
+                                  'marketDealOpening':dict(market, magic=request['magic'], filling=request['type_filling'])}
+                        if partial_ioc:
+                            status['marketPartial'] = market
+                    status['providerDealId'] = deal
             if operation != 'place':
                 status.update(operation=operation, ticket=str(payload['ticket']))
             elif 'closeAtUtc' in payload:
@@ -694,12 +799,18 @@ class Bridge:
                 self.db.execute('UPDATE time_rules SET payload=?,state=?,result=? WHERE id=?',
                     (json.dumps(deadline),'armed' if status['status']=='ok' else status['status'],json.dumps(status),identifier))
             self.db.commit()
+            journal_committed = True
             timing['ledgerAfterMs'] = round((time.perf_counter()-ledger_started)*1000, 2)
             return timed(status)
         except Exception:
+            if journal_committed:
+                # Response identity/proof may fail after the native result is
+                # durable. Leave the exact receipt for normal reconciliation.
+                raise
             if 'mt5_started' in locals() and 'mt5Ms' not in timing:
                 timing['mt5Ms'] = round((time.perf_counter()-mt5_started)*1000, 2)
             try:
+                self.db.rollback()
                 self.db.execute('UPDATE requests SET result=? WHERE id=?', (json.dumps(unknown), identifier))
                 self.db.commit()
             except Exception:
@@ -752,6 +863,40 @@ class Bridge:
                         (json.dumps(payload),state,json.dumps(result),identifier))
         self.db.commit()
 
+    @staticmethod
+    def _time_rule_command_id(identifier, operation, ticket, attempt=0):
+        identity = f'{identifier}:{operation}:{ticket}'
+        if attempt:
+            identity += f':retry:{attempt}'
+        return 'deadline:'+hashlib.sha256(identity.encode()).hexdigest()
+
+    def _time_rule_action_receipt(self, identifier, payload, command_id):
+        row = self.db.execute('SELECT r.result,t.ticket,t.symbol FROM requests r JOIN request_targets t ON r.id=t.id WHERE r.id=?',
+                              (command_id,)).fetchone()
+        if not row:
+            return None
+        result, ticket, symbol = json.loads(row[0]), row[1], row[2]
+        operation = result.get('operation')
+        if (operation not in ('cancel', 'close') or result.get('status') not in ('ok', 'rejected')
+                or symbol != payload['symbol'] or result.get('ticket') != ticket
+                or operation == 'cancel' and str(payload.get('ticket')) != ticket):
+            return None
+        for attempt in range(len(TIME_EXIT_FROZEN_RETRY_SECONDS)+1 if operation == 'cancel' else 1):
+            if command_id == self._time_rule_command_id(identifier, operation, ticket, attempt):
+                return operation, attempt, result
+        return None
+
+    def _finish_time_rule_action(self, identifier, payload, command_id, operation, attempt, result):
+        frozen = (operation == 'cancel' and result['status'] == 'rejected'
+                  and result.get('retcode') == getattr(self.mt5, 'TRADE_RETCODE_FROZEN', 10029))
+        if frozen and attempt < len(TIME_EXIT_FROZEN_RETRY_SECONDS):
+            result = dict(result, retryAfterUtc=time.time()*1000+TIME_EXIT_FROZEN_RETRY_SECONDS[attempt]*1000)
+        payload.setdefault('actions', {})[command_id] = result
+        # A rejected removal may have raced a fill. Re-read broker state
+        # before deciding whether a position must be closed or a retry is due.
+        state = 'armed' if result['status'] == 'ok' or operation == 'cancel' and result['status'] == 'rejected' else result['status']
+        self.write_time_rule(identifier, payload, state, result)
+
     def time_rules(self):
         return [dict(id=i,**json.loads(p),state=s,result=json.loads(r)) for i,p,s,r in
                 self.db.execute('SELECT * FROM time_rules ORDER BY rowid DESC LIMIT 100')]
@@ -789,7 +934,8 @@ class Bridge:
             linked=[row for row in rows if row['symbol']==symbol and row['__isPosition']
                     and position_id in (str(row['ticket']),str(row.get('identifier')))]
             if linked:return matched+[row for row in linked if row not in matched]
-        history=self.read_timings.call('orderHistory', self.mt5.history_orders_get, ticket=int(ticket))
+        history=(evidence['history'] if evidence is not None and 'history' in evidence else
+                 self.read_timings.call('orderHistory', self.mt5.history_orders_get, ticket=int(ticket)))
         if evidence is not None: evidence['history']=history
         position_id=self._remember_opening_link(ticket,symbol,history)
         for row in rows:
@@ -809,7 +955,7 @@ class Bridge:
             if len(self.opening_link_cache)>4096:self.opening_link_cache.pop(next(iter(self.opening_link_cache)))
         return position_id
 
-    def opening_state(self, ticket, symbol, rows, evidence=None):
+    def opening_state(self, ticket, symbol, rows, evidence=None, *, owned_close_ids=(), position_ticket=None):
         # Absence alone never proves a close. Link the opening order to its
         # position identifier and require a balanced deal history or cancellation.
         if not re.fullmatch(r'[1-9][0-9]{0,19}',str(ticket)) or symbol not in self.config['symbols']:
@@ -819,24 +965,31 @@ class Bridge:
         if matches:
             row=matches[0]
             return {'phase':'opened' if row['__isPosition'] else 'waiting','ticket':row['ticket']}
-        for text, in self.db.execute("SELECT r.result FROM requests r INDEXED BY request_unknown_ticket JOIN request_targets t ON r.id=t.id WHERE t.symbol=? AND CASE WHEN json_valid(r.result) THEN json_extract(r.result,'$.status') ELSE 'invalid' END IN ('unknown','invalid')",(symbol,)):
+        for identifier,text in self.db.execute("SELECT r.id,r.result FROM requests r INDEXED BY request_unknown_ticket JOIN request_targets t ON r.id=t.id WHERE t.symbol=? AND CASE WHEN json_valid(r.result) THEN json_extract(r.result,'$.status') ELSE 'invalid' END IN ('unknown','invalid')",(symbol,)):
             result=json.loads(text)
-            if result.get('status')=='unknown' and result.get('operation') != 'cancel':
+            if identifier not in owned_close_ids and result.get('status')=='unknown' and result.get('operation') != 'cancel':
                 return {'phase':'unknown','reason':'Unconfirmed management command'}
-        for text, in self.db.execute("SELECT result FROM requests WHERE CASE WHEN json_valid(result) THEN json_extract(result,'$.status') ELSE 'invalid' END IN ('unknown','invalid') AND (CASE WHEN json_valid(result) THEN json_extract(result,'$.ticket') END=? OR NOT json_valid(result))",(str(ticket),)):
+        targets=(str(ticket),str(position_ticket or ticket))
+        for identifier,text in self.db.execute("SELECT id,result FROM requests WHERE CASE WHEN json_valid(result) THEN json_extract(result,'$.status') ELSE 'invalid' END IN ('unknown','invalid') AND (CASE WHEN json_valid(result) THEN json_extract(result,'$.ticket') END IN (?,?) OR NOT json_valid(result))",targets):
             result=json.loads(text)
-            if result.get('status')=='unknown' and result.get('operation') != 'cancel' and str(result.get('ticket'))==str(ticket): return {'phase':'unknown','reason':'Unconfirmed management command'}
-        for text,result in self.db.execute("SELECT payload,result FROM groups WHERE CASE WHEN json_valid(result) THEN json_extract(result,'$.status') ELSE 'invalid' END IN ('unknown','invalid') AND (CASE WHEN json_valid(payload) THEN json_extract(payload,'$.payload.ticket') END=? OR NOT json_valid(payload) OR NOT json_valid(result))",(str(ticket),)):
+            if (identifier not in owned_close_ids and result.get('status')=='unknown'
+                    and result.get('operation') != 'cancel' and str(result.get('ticket')) in targets):
+                return {'phase':'unknown','reason':'Unconfirmed management command'}
+        for text,result in self.db.execute("SELECT payload,result FROM groups WHERE CASE WHEN json_valid(result) THEN json_extract(result,'$.status') ELSE 'invalid' END IN ('unknown','invalid') AND (CASE WHEN json_valid(payload) THEN json_extract(payload,'$.payload.ticket') END IN (?,?) OR NOT json_valid(payload) OR NOT json_valid(result))",targets):
             group=json.loads(text)
-            if json.loads(result).get('status')=='unknown' and str(group['payload'].get('ticket'))==str(ticket):
+            if json.loads(result).get('status')=='unknown' and str(group['payload'].get('ticket')) in targets:
                 return {'phase':'unknown','reason':'Unconfirmed linked command'}
         for table in ('close_rules','time_rules'):
             for identifier,text in self.db.execute("SELECT id,payload FROM "+table+" WHERE state IN ('unknown','firing','opening')"):
                 if table == 'time_rules' and self._unconfirmed_opening_rule(identifier, json.loads(text)):
                     continue
-                if str(json.loads(text).get('ticket'))==str(ticket): return {'phase':'unknown','reason':'Unconfirmed exit condition'}
+                if str(json.loads(text).get('ticket')) in targets: return {'phase':'unknown','reason':'Unconfirmed exit condition'}
         key=(str(ticket),symbol)
-        if key in self.closed_history_cache: return self.closed_history_cache[key]
+        cached=self.closed_history_cache.get(key)
+        # A generic closed phase may have arrived before its exact deal
+        # fields. It cannot satisfy this parent's recovery or mask a later proof.
+        if cached and (position_ticket is None or cached.get('openingProof')):
+            return cached
         # Reuse this read's evidence, not a cached active order: previously an
         # absent opening performed the same terminal history RPC twice.
         history=evidence['history'] if 'history' in evidence else self.read_timings.call('orderHistory', self.mt5.history_orders_get, ticket=int(ticket))
@@ -850,6 +1003,7 @@ class Bridge:
                 return {'phase':'unknown','reason':'Opening position still present with another ticket'}
             deals=self.read_timings.call('dealHistory', self.mt5.history_deals_get, position=int(position_id))
             if deals is None: return {'phase':'unknown','reason':'Cannot read broker deal history'}
+            evidence['deals'] = deals
             deals=[x for x in deals if x.symbol==symbol and int(x.position_id)==int(position_id)]
             incoming=sum(x.volume for x in deals if x.entry==0)
             outgoing=sum(x.volume for x in deals if x.entry in (1,3))
@@ -968,11 +1122,23 @@ class Bridge:
             # Cancel a pending remainder first; the next read resolves any fill.
             row=next((x for x in matches if not x['__isPosition']),matches[0])
             operation='close' if row['__isPosition'] else 'cancel'
-            command_id='deadline:'+hashlib.sha256((identifier+':'+operation+':'+str(row['ticket'])).encode()).hexdigest()
+            attempt = 0
+            command_id = self._time_rule_command_id(identifier, operation, row['ticket'])
+            while command_id in payload['actions']:
+                previous = payload['actions'][command_id]
+                retry_after = previous.get('retryAfterUtc')
+                if (operation != 'cancel' or previous['status'] != 'rejected'
+                        or previous.get('retcode') != getattr(self.mt5, 'TRADE_RETCODE_FROZEN', 10029)
+                        or retry_after is None or attempt >= len(TIME_EXIT_FROZEN_RETRY_SECONDS)):
+                    if previous['status'] == 'rejected':
+                        self.write_time_rule(identifier, payload, 'rejected', previous)
+                    break  # Never replay an already claimed action.
+                if time.time()*1000 < retry_after:
+                    break
+                attempt += 1
+                command_id = self._time_rule_command_id(identifier, operation, row['ticket'], attempt)
             if command_id in payload['actions']:
-                previous=payload['actions'][command_id]
-                if previous['status']=='rejected': self.write_time_rule(identifier,payload,'rejected',previous)
-                continue  # Never resend a claimed action.
+                continue
             request=dict(id=command_id,ticket=str(row['ticket']),symbol=symbol,expiresAt=time.time()*1000+2000)
             if operation=='close': request.update(volume=row['lots'],expectedVolume=row['lots'])
             try:
@@ -981,16 +1147,39 @@ class Bridge:
             except (ValueError,TypeError,KeyError): continue
             payload['commandId']=command_id
             self.write_time_rule(identifier,payload,'firing',{'status':'unknown','reason':'Timed exit claimed before submission'})
-            try: result=self.execute(operation,request)['result']
-            except Exception: result={'status':'unknown','reason':'Timed exit interrupted; inspect MT5'}
-            payload['actions'][command_id]=result
-            # A definite cancellation refusal may mean the limit filled during
-            # order_send. Read again before deciding; never retry its cancellation.
-            self.write_time_rule(identifier,payload,'armed' if result['status']=='ok' or operation=='cancel' and result['status']=='rejected' else result['status'],result)
+            try:
+                result = self.execute(operation, request)['result']
+            except Exception:
+                action = self._time_rule_action_receipt(identifier, payload, command_id)
+                result = action[2] if action else {'status':'unknown','reason':'Timed exit interrupted; inspect MT5'}
+            self._finish_time_rule_action(identifier, payload, command_id, operation, attempt, result)
 
     @staticmethod
     def position_identity(target):
         return [target.ticket, getattr(target, 'identifier', target.ticket), getattr(target, 'time_msc', 0), target.type, target.price_open]
+
+    def _price_rule_receipt(self, identifier, payload):
+        command = 'rule:'+identifier
+        row = self.db.execute('SELECT r.digest,r.result,t.ticket,t.symbol FROM requests r '
+                              'JOIN request_targets t ON t.id=r.id WHERE r.id=?', (command,)).fetchone()
+        if not row:
+            return None
+        digest, saved, ticket, symbol = row
+        # Use the exact legacy close payload. Neither a position with the
+        # same ticket nor another command's receipt can resolve this claim.
+        core = {**payload, 'id':command, 'operation':'close'}
+        expected = hashlib.sha256(json.dumps(core, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        result = json.loads(saved)
+        if (digest != expected or ticket != str(payload['ticket']) or symbol != payload['symbol']
+                or result.get('operation') != 'close' or result.get('ticket') != ticket
+                or result.get('status') not in ('ok','rejected')):
+            return None
+        if result['status'] == 'ok' and result.get('retcode') != self.mt5.TRADE_RETCODE_DONE:
+            return None
+        return result
+
+    def _finish_price_rule(self, identifier, result):
+        self.set_rule_state(identifier, 'completed' if result['status']=='ok' else result['status'], result)
 
     def rule_command(self, operation, payload):
         self.check_rule_unknown(payload)
@@ -1057,8 +1246,12 @@ class Bridge:
             try:
                 result = self.execute('close', {**payload, 'id':'rule:'+identifier, 'expiresAt':time.time()*1000+2000})['result']
             except Exception:
-                result = {'status':'unknown','reason':'Trigger interrupted; inspect MT5'}
-            self.set_rule_state(identifier, 'completed' if result['status']=='ok' else result['status'], result)
+                result = self._price_rule_receipt(identifier, payload)
+                if result is None:
+                    result = {'status':'unknown','reason':'Trigger interrupted; inspect MT5'}
+            if result.get('status') == 'ok' and result.get('retcode') != self.mt5.TRADE_RETCODE_DONE:
+                result = dict(result, status='unknown', reason='Native price-triggered close is not confirmed')
+            self._finish_price_rule(identifier, result)
 
     def rule_interval(self):
         active = self.config.get('tradingEnabled', False) and self.db.execute(
@@ -1069,6 +1262,8 @@ class Bridge:
     def maintain_terminal_connection(self, now=None):
         # The rule thread runs even under continuous HTTP/RPC traffic. Keep
         # recovery outside commands: never retry an order after reconnecting.
+        if self.native_command_waiting.is_set():
+            return
         now = time.monotonic() if now is None else now
         if now < self.terminal_probe_at:
             return
@@ -1076,9 +1271,12 @@ class Bridge:
         try:
             self.account()
             return
-        except ValueError as error:
-            if str(error) != 'MT5 is disconnected':
-                return  # Wrong account/server/USD must remain blocked.
+        except TerminalDisconnected:
+            pass
+        except ValueError:
+            return  # Wrong account/server/USD must remain blocked.
+        if self.native_command_waiting.is_set():
+            return
         if now < self.terminal_reconnect_at:
             return
         self.terminal_reconnect_at = now + 5
@@ -1109,8 +1307,9 @@ class Bridge:
                 diagnostic=self.entry_diagnostics.begin('rules-lock',reason='Waiting for native account lock')
                 try:
                     with self.lock:
-                        self.entry_diagnostics.step(diagnostic,'terminal-recovery')
-                        self.read_timings.call('terminalRecovery', self.maintain_terminal_connection)
+                        if not self.native_command_waiting.is_set():
+                            self.entry_diagnostics.step(diagnostic,'terminal-recovery')
+                            self.read_timings.call('terminalRecovery', self.maintain_terminal_connection)
                         interval = self.rule_interval()
                         self.entry_diagnostics.step(diagnostic,'price-rules')
                         self.read_timings.call('priceRules', self.evaluate_rules)
@@ -1203,15 +1402,28 @@ class Bridge:
                 'hybrid-native-reconcile-v1','hybrid-support-reprice-v1','atomic-entry-admission-v1','entry-progress-snapshots-v1','independent-account-entry-v2',
                 'parallel-account-entry-v3','entry-progress-fast-read-v1',
                 'independent-account-lanes-v4','entry-events-v1','entry-account-continue-v1','entry-stop-priority-v1',
-                'entry-control-recovery-v1','entry-intent-delivery-v1','entry-status-order-v1','entry-exact-parent-close-v1','entry-account-controls-v1','entry-parent-partial-close-v1',
+                'entry-control-recovery-v1','entry-stop-receipt-read-v1','entry-intent-delivery-v1','entry-status-order-v1','entry-exact-parent-close-v1','entry-account-controls-v1','entry-parent-partial-close-v1',
                 *(['entry-exact-parent-protection-v1','minute-chart-bars-v1','entry-parent-partial-take-v1'] if getattr(self,'isolated_entries',False) else []),
-                *(['independent-account-engines-v5','entry-initial-sizing-only-v1','management-active-v1','entry-balance-risk-v1'] if getattr(self,'isolated_entries',False) else []),
-                *ENTRY_PROTOCOL_CAPABILITIES] + (['lt-level-sync-v1'] if getattr(self,'lt_level_sync',None) else []) + (['account-enrollment','mt4-preparation'] if getattr(self,'account_registry',None) else [])
+                *(['independent-account-engines-v5','entry-initial-sizing-only-v1','management-active-v1','entry-balance-risk-v1','entry-primary-balance-risk-v1'] if getattr(self,'isolated_entries',False) else []),
+                *ENTRY_PROTOCOL_CAPABILITIES] + (['lt-level-sync-v1'] if getattr(self,'lt_level_sync',None) else []) + (['account-enrollment','mt4-preparation'] if getattr(self,'account_registry',None) else []) + (['chart-recorder-v1'] if getattr(self,'chart_recorder',None) else []) + (['tradehub-roles-v1'] if getattr(self,'tradehub_roles',None) else [])
+
+    def _risk_includes_credit(self, account):
+        accounts = self.config.get('riskCreditAccounts', [])
+        return isinstance(accounts, list) and str(account.login) in accounts
 
     def _health(self, account):
         account_info = {key:float(getattr(account, attr)) for key,attr in
             (('balance','balance'),('equity','equity'),('margin','margin'),('freeMargin','margin_free'))
             if type(getattr(account,attr,None)) in (int,float) and math.isfinite(getattr(account,attr))}
+        if self.config.get('riskCreditAccounts') and self._risk_includes_credit(account):
+            from chunk_entry import balance_risk_capital
+            account_info['riskIncludesCredit'] = True
+            try:
+                _, funding = balance_risk_capital(account, include_credit=True)
+                account_info.update(funding)
+            except ValueError:
+                # A missing or invalid credit reading cannot authorize an entry.
+                pass
         return dict(account=account.login,server=account.server,tradingEnabled=self.config.get('tradingEnabled', False), version=BRIDGE_VERSION, idleTimeoutSeconds=30,
             accountInfo=account_info,
             brokerUtcOffsetSeconds=self.broker_utc_offset_seconds,
@@ -1679,7 +1891,7 @@ class Bridge:
                 pass
         return result
 
-    def open_request(self, payload):
+    def open_request(self, payload, native_opening_guard_after_claim=False):
         symbol, side, kind = payload.get('symbol'), payload.get('side'), payload.get('type')
         if symbol not in self.config['symbols'] or side not in ('buy', 'sell') or kind not in ('market', 'limit', 'stop'):
             raise ValueError('Symbol, side or order type is not allowed')
@@ -1688,8 +1900,7 @@ class Bridge:
         sl, tp = float(payload.get('sl', 0)), float(payload.get('tp', 0))
         if not all(math.isfinite(x) for x in (volume, price, sl, tp)):
             raise ValueError('Non-finite order parameter')
-        # Mac owns entry, sizing and protection. MT5 returns broker validation
-        # from order_send; no quote lookup, recalculation or order_check here.
+        # Unguarded orders retain the entry and protection supplied by the Mac.
         order_type = getattr(self.mt5, 'ORDER_TYPE_' + side.upper() + ('' if kind == 'market' else '_' + kind.upper()))
         request = {
             'action': self.mt5.TRADE_ACTION_DEAL if kind == 'market' else self.mt5.TRADE_ACTION_PENDING,
@@ -1699,11 +1910,14 @@ class Bridge:
             'type_time': self.mt5.ORDER_TIME_GTC,
             'type_filling': self.mt5.ORDER_FILLING_FOK if kind == 'market' else self.mt5.ORDER_FILLING_RETURN}
         if 'entryGuard' in payload:
-            self.guard_chunk_request(payload, request)
+            if native_opening_guard_after_claim:
+                self.validate_chunk_guard(payload)
+            else:
+                self.guard_chunk_request(payload, request)
         return request
 
-    def guard_chunk_request(self, payload, request):
-        """Fresh terminal-side guard; a market fill itself can still slip."""
+    @staticmethod
+    def validate_chunk_guard(payload):
         guard=payload['entryGuard']
         required={'anchor','maxGap','maxRiskPrice','positions'}
         zone_fields = {'priceFloor','priceCeiling'}
@@ -1724,10 +1938,18 @@ class Bridge:
         anchor,gap,risk_price=(float(guard[key]) for key in ('anchor','maxGap','maxRiskPrice'))
         if not all(math.isfinite(x) for x in (anchor,gap,risk_price)) or anchor<=0 or risk_price<=0 or gap<0:
             raise ValueError('Invalid chunk price boundary')
+        return anchor, gap, risk_price
+
+    def guard_chunk_request(self, payload, request):
+        """Fresh terminal-side guard; a market fill itself can still slip."""
+        anchor, gap, risk_price = self.validate_chunk_guard(payload)
+        guard = payload['entryGuard']
+        pending = payload['type'] == 'limit'
         info=self.mt5.symbol_info(request['symbol'])
         tick=self.mt5.symbol_info_tick(request['symbol'])
         if not info or not tick: raise ValueError('No fresh chunk quote')
-        age=time.time()-self.tick_utc_seconds(tick)
+        tick_at = self.tick_utc_seconds(tick)
+        age=time.time()-tick_at
         if not math.isfinite(age) or age<-.25 or age>1:
             raise ValueError('Chunk tick is stale; no submission')
         bid,ask=float(tick.bid),float(tick.ask)
@@ -1756,7 +1978,7 @@ class Bridge:
         if direction*(price-anchor)>gap+1e-8 or direction*(price-risk_price)>1e-8:
             raise EntryPriceRejected('Chunk price moved outside entry or risk boundary',
                 dict(account=str(self.config['account']), symbol=request['symbol'], side=payload['side'],
-                    kind=payload['type'], bid=bid, ask=ask, tickUtcMs=self.tick_utc_seconds(tick)*1000,
+                    kind=payload['type'], bid=bid, ask=ask, tickUtcMs=tick_at*1000,
                     checkedAtMs=time.time()*1000, rejectionStage='native-entry-price-guard', mutationStarted=False))
         if 'priceFloor' in guard:
             lower,upper=(float(guard[key]) for key in ('priceFloor','priceCeiling'))
@@ -1765,7 +1987,7 @@ class Bridge:
             if price<lower-1e-8 or price>upper+1e-8:
                 raise EntryPriceRejected('Market price moved outside the entry zone',
                     dict(account=str(self.config['account']), symbol=request['symbol'], side=payload['side'],
-                        kind=payload['type'], bid=bid, ask=ask, tickUtcMs=self.tick_utc_seconds(tick)*1000,
+                        kind=payload['type'], bid=bid, ask=ask, tickUtcMs=tick_at*1000,
                         checkedAtMs=time.time()*1000, rejectionStage='native-entry-price-guard', mutationStarted=False))
             if pending:
                 edge = upper if buy else lower
@@ -1785,7 +2007,7 @@ class Bridge:
                         dict(account=str(self.config['account']), symbol=request['symbol'], side=payload['side'],
                              kind=payload['type'], bid=bid, ask=ask, submittedPrice=price,
                              zoneLower=lower, zoneUpper=upper, minimumDistance=minimum_distance,
-                             tickSize=tick_size, tickUtcMs=self.tick_utc_seconds(tick)*1000,
+                             tickSize=tick_size, tickUtcMs=tick_at*1000,
                              checkedAtMs=time.time()*1000, rejectionStage='final-native-price-guard', **{'mutationStarted': False}))
         if 'stopDistance' in guard:
             distance, budget = (float(guard[key]) for key in ('stopDistance','riskBudget'))
@@ -1834,7 +2056,7 @@ class Bridge:
                 dict(account=str(self.config['account']), symbol=request['symbol'], side=payload['side'],
                     kind=payload['type'], bid=bid, ask=ask, sl=request['sl'], tp=request['tp'],
                     minimumDistance=minimum, tickSize=float(info.trade_tick_size),
-                    tickUtcMs=self.tick_utc_seconds(tick)*1000, checkedAtMs=time.time()*1000,
+                    tickUtcMs=tick_at*1000, checkedAtMs=time.time()*1000,
                     rejectionStage='final-native-protection-guard', **{'mutationStarted':False}))
         previous=guard['positions']
         if not isinstance(previous,list) or len(previous)>200:
@@ -1857,13 +2079,14 @@ class Bridge:
         if not all(math.isfinite(x) and x>0 for x in (step,minimum,maximum,volume)) or volume<minimum-1e-8 or volume>maximum+1e-8 or abs(volume/step-round(volume/step))>1e-7:
             raise ValueError('Invalid chunk volume for this broker account')
         filling=info.filling_mode
-        # Full confirmation is required before the next chunk. IOC partial
-        # execution remains unknown and stops the whole parent strategy.
+        # An IOC partial stays unknown until exact terminal order and deal
+        # proof can distinguish its fill from an unresolved remainder.
         if pending: request['type_filling']=self.mt5.ORDER_FILLING_RETURN
         elif filling&1: request['type_filling']=self.mt5.ORDER_FILLING_FOK
         elif filling&2: request['type_filling']=self.mt5.ORDER_FILLING_IOC
         else: raise ValueError('No supported chunk market filling mode')
         request['price']=price
+        return tick_at
 
     def _entry_position_identity(self, target, payload):
         opening = str(payload.get('openingTicket', ''))
@@ -1923,6 +2146,31 @@ class Bridge:
     @serialized
     def entry_common_stop_receipt(self, payload):
         """Exact read only; never run a missing or unknown protection command."""
+        if set(payload) == {'entryId','stopRevision'}:
+            entry_id, revision = payload['entryId'], payload['stopRevision']
+            if (not isinstance(entry_id,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,100}',entry_id)
+                    or type(revision) is not int or not 1 <= revision <= 1000):
+                raise ValueError('Invalid legacy common stop identity')
+            account = self.account()
+            ids=['hybrid-sl:'+hashlib.sha256((entry_id+':'+str(index)+':'+str(account.login)).encode()).hexdigest()
+                 for index in range(revision,0,-1)]
+            receipts=[(identifier,signature,json.loads(result)) for identifier,signature,result in self.db.execute(
+                'SELECT s.id,s.digest,s.result FROM json_each(?) i JOIN entry_common_stops s ON s.id=i.value ORDER BY i.key',
+                (json.dumps(ids),))]
+            identifier,signature,result=receipts[0] if receipts else (None,None,None)
+            return dict(account=str(account.login),server=account.server,id=identifier,digest=signature,result=result,
+                        unresolved=any(row.get('status') not in ('ok','rejected') for _,_,row in receipts))
+        parent_id = payload.get('parentId')
+        if set(payload) == {'parentId'} and isinstance(parent_id, str) and re.fullmatch(r'parent-protection:[a-f0-9]{64}', parent_id):
+            account = self.account()
+            # Fresh-quote retries have bounded suffixes and require a prior
+            # definitive pre-mutation refusal. Read the last saved attempt.
+            ids = [parent_id, *(f'{parent_id}:q{attempt}' for attempt in range(1, 16))]
+            marks = ','.join('?' for _ in ids)
+            saved = dict(self.db.execute(f'SELECT id,result FROM entry_common_stops WHERE id IN ({marks})', ids))
+            latest = next((identifier for identifier in reversed(ids) if identifier in saved), None)
+            return dict(account=str(account.login), server=account.server, id=latest,
+                        result=json.loads(saved[latest]) if latest else None)
         identifier, signature = payload.get('id'), payload.get('digest')
         if (not isinstance(identifier,str) or not re.fullmatch(r'hybrid-sl:[a-f0-9]{64}',identifier)
                 or not isinstance(signature,str) or not re.fullmatch(r'[a-f0-9]{64}',signature)):
@@ -2094,6 +2342,14 @@ class Bridge:
             if not math.isfinite(stop) or stop <= 0 or abs(stop/tick_size-round(stop/tick_size)) > 1e-6:
                 raise ValueError('Common stop does not match the broker price step')
             take = float(payload['tp']) if 'tp' in payload else None
+            if 'takeDistance' in payload:
+                from chunk_entry import entry_take_price, number
+                if take is not None or symbol not in ('USTEC','SPX500') or 'breakeven' in payload:
+                    raise ValueError('Invalid weighted entry take profit policy')
+                distance = number(payload['takeDistance'], 'Entry take distance')
+                take = entry_take_price(average, direction, distance, tick_size)
+                if take <= 0 or direction*(take-average) <= 0:
+                    raise ValueError('Weighted entry take profit must be beyond the fill')
             if normalize and take is not None and math.isfinite(take) and take > 0:
                 units = Decimal(str(take)) / Decimal(str(tick_size))
                 take = float(units.to_integral_value(rounding=ROUND_CEILING if buy else ROUND_FLOOR) * Decimal(str(tick_size)))
@@ -2145,7 +2401,7 @@ class Bridge:
             weighted = payload.get('weightedEntryStop') is True
             if 'weightedEntryStop' in payload and (not weighted or symbol not in ('USTEC','SPX500')
                     or 'stopDistance' not in payload
-                    or take is not None):
+                    or 'tp' in payload):
                 raise ValueError('Invalid weighted Nasdaq entry stop policy')
             if final_risk > budget + 1e-8 or not weighted and initial_risk > budget + 1e-8:
                 raise ValueError('Common stop exceeds the reserved risk budget')
@@ -2218,8 +2474,27 @@ class Bridge:
         """Read only the captured opening, including a partial pending remainder."""
         if not re.fullmatch(r'[1-9][0-9]{0,19}', str(ticket)) or symbol not in self.config['symbols']:
             raise ValueError('Invalid captured limit ticket or symbol')
-        data = self._orders(self.account(), symbol)
-        return self._entry_limit_view(ticket, symbol, data)
+        _, view = self._read_entry_limit(ticket, symbol)
+        return view
+
+    def _entry_limit_snapshot(self, ticket, symbol, account=None):
+        if account is None:
+            account = self.account()
+        checked_at = time.time()*1000
+        proof = self._orders(account, symbol)
+        proof['checkedAt'] = checked_at
+        return proof, self._entry_limit_view(ticket, symbol, proof)
+
+    def _read_entry_limit(self, ticket, symbol):
+        proof, view = self._entry_limit_snapshot(ticket, symbol)
+        terminal = view['terminal']
+        if (terminal['phase'] == 'unknown' and terminal.get('reason') in (
+                'Opening not found in broker history', 'No balanced full exit in broker history',
+                'Opening outcome unconfirmed')):
+            # An accepted order can fill between positions_get and orders_get.
+            # Reread once and match the same opening. Absence still proves nothing.
+            return self._entry_limit_snapshot(ticket, symbol)
+        return proof, view
 
     def _entry_limit_view(self, ticket, symbol, data):
         evidence={}
@@ -2249,7 +2524,7 @@ class Bridge:
             raise ValueError('Invalid captured cancellation reservation')
         if len(watch)>200 or any(str(row.get('account'))!=str(account.login) or row.get('symbol')!=symbol for row in watch):
             raise ValueError('Invalid cancellation position watch')
-        before=self._entry_limit_view(ticket,symbol,self._orders(account,symbol))
+        proof,before=self._entry_limit_snapshot(ticket,symbol,account)
         timing=dict(preCheckMs=round((time.perf_counter()-started)*1000,3))
         for row in before['pending']+before['positions']:
             if (row['type']!=expected['side'] or any(abs(float(row[key])-float(expected[key]))>1e-8 for key in ('sl','tp'))):
@@ -2261,14 +2536,18 @@ class Bridge:
                 raise ValueError('Captured pending reservation changed')
             receipt=self.execute('cancel',request)['result']
         else:
-            receipt=dict(status='rejected',dispatchNotSent=True,reason='No pending remainder; exact broker state obtained')
+            receipt=dict(status='rejected',dispatchNotSent=True,reason='No pending remainder on initial read; no cancellation sent')
         timing['cancelFinishedMs']=round((time.perf_counter()-started)*1000,3)
         if receipt.get('status') not in ('ok','rejected'):
             return dict(receipt=receipt,view=None,timing=timing)
-        proof=self._orders(self.account(),symbol)
+        view=before
+        if before['pending']:
+            proof,view=self._read_entry_limit(ticket,symbol)
+        elif (before['terminal']['phase'] not in ('closed','cancelled')
+                and not (before['positions'] and abs(before['positions'][0]['lots']-expected['volume'])<=1e-8)):
+            # A partially filled position alone may be the old half of a torn read.
+            proof,view=self._entry_limit_snapshot(ticket,symbol)
         proof['openingStates']={str(row['ticket']):self.opening_state(str(row['ticket']),symbol,proof['orders']) for row in watch}
-        proof['checkedAt']=time.time()*1000
-        view=self._entry_limit_view(ticket,symbol,proof)
         timing['totalMs']=round((time.perf_counter()-started)*1000,3)
         return dict(receipt=receipt,view=view,proof=proof,timing=timing)
 
@@ -2293,6 +2572,9 @@ class Bridge:
         if operation == 'modify' and payload.get('target') not in ('position', 'order'):
             raise ValueError('Specify position or pending order')
         target = measured(timing,'targetReadMs',self.target,payload,position)
+        if (operation == 'close' and str(payload.get('id', '')).startswith('rule:') and 'identity' in payload
+                and self.position_identity(target) != payload['identity']):
+            raise ValueError('Price-triggered close position changed before submission')
         if 'entryStopGuard' in payload:
             guard = payload['entryStopGuard']
             if operation != 'modify' or not position or not isinstance(guard,dict) or set(guard) != {'volume','fillPrice','sl','tp'}:
@@ -2488,14 +2770,56 @@ class Bridge:
             ORDER BY rowid DESC''',(live,)).fetchall()
 
     @serialized
-    def entry_management(self, watch=()):
+    def entry_management(self, watch=(), close_preflight=False):
         """Fresh entry proof without UI-only historical group decoration."""
-        return self._entry_management_for(watch,self._entry_read_account())
+        account = self.account() if close_preflight else self._entry_read_account()
+        if close_preflight:
+            if getattr(account, 'margin_mode', None) != 2:
+                raise ValueError('Chunk entry requires a hedging account on every participating terminal')
+            if getattr(account, 'trade_allowed', True) is False or getattr(account, 'trade_expert', True) is False:
+                raise ValueError('Account does not permit algorithmic trading')
+        return self._entry_management_for(watch,account)
 
-    def _entry_management_for(self, watch, account):
+    @serialized
+    def entry_close_reconciliation(self, identifier, watch):
+        """Read exact exits despite this parent's own unresolved native close."""
+        from chunk_entry import native_parent_close_id
+        if (not isinstance(identifier,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,130}',identifier)
+                or not isinstance(watch,list) or not 1 <= len(watch) <= 512):
+            raise ValueError('Invalid exact close reconciliation')
+        account=self._entry_read_account()
+        targets, openings = {}, set()
+        for row in watch:
+            if (not isinstance(row,dict) or set(row) != {'account','ticket','positionTicket','symbol'}
+                    or str(row['account']) != str(account.login) or row['symbol'] not in self.config['symbols']
+                    or any(not isinstance(row[key],str) or not re.fullmatch(r'[1-9][0-9]{0,19}',row[key])
+                           for key in ('ticket','positionTicket'))):
+                raise ValueError('Invalid watched close identity')
+            native_id=native_parent_close_id(identifier,str(account.login),row['positionTicket'])
+            if native_id in targets or row['ticket'] in openings:
+                raise ValueError('Duplicate watched close identity')
+            targets[native_id]=(row['positionTicket'],row['symbol'])
+            openings.add(row['ticket'])
+        sql='SELECT r.id,r.result,t.ticket,t.symbol FROM requests r LEFT JOIN request_targets t ON r.id=t.id WHERE r.id IN ('
+        own_unknown=set()
+        for native_id,encoded,ticket,symbol in self.db.execute(sql+','.join('?' for _ in targets)+')',tuple(targets)):
+            result=json.loads(encoded)
+            if result.get('status') != 'unknown':
+                continue
+            if (result.get('operation') != 'close' or result.get('ticket') != ticket
+                    or targets[native_id] != (ticket,symbol)):
+                raise ValueError('Native close receipt identity mismatch')
+            own_unknown.add(native_id)
+        return self._entry_management_for(watch,account,owned_close_ids=own_unknown)
+
+    def _entry_management_for(self, watch, account, *, owned_close_ids=None):
         state = self._orders(account)
-        state['openingStates'] = {str(row['ticket']):self.opening_state(str(row['ticket']),row['symbol'],state['orders'])
-                                  for row in watch}
+        if owned_close_ids is None:
+            state['openingStates'] = {str(row['ticket']):self.opening_state(str(row['ticket']),row['symbol'],state['orders'])
+                                      for row in watch}
+        else:
+            state['openingStates'] = {row['ticket']:self.opening_state(row['ticket'],row['symbol'],state['orders'],
+                                      owned_close_ids=owned_close_ids,position_ticket=row['positionTicket']) for row in watch}
         state['checkedAt'] = time.time()*1000
         return state
 
@@ -2516,8 +2840,132 @@ class Bridge:
         return dict(account=account.login,server=account.server,orders=orders,checkedAt=time.time()*1000,
             openingStates={str(row['ticket']):self.opening_state(str(row['ticket']),row['symbol'],orders) for row in watch})
 
+    def _market_opening_from_deal(self, receipt, symbol):
+        marker = receipt.get('marketDealOpening')
+        deal_id = str(receipt.get('providerDealId', ''))
+        if (receipt.get('status') != 'unknown' or not isinstance(marker, dict) or marker.get('symbol') != symbol
+                or marker.get('side') not in ('buy', 'sell') or not re.fullmatch(r'[1-9][0-9]{0,19}', deal_id)):
+            return None
+        try:
+            timing = receipt['timings']['server']
+            started, returned = timing['mt5StartedAt']/1000, timing['mt5ReturnedAt']/1000
+            if not (math.isfinite(started) and math.isfinite(returned) and 0 < started <= returned <= started+120):
+                return None
+            # The SDK ticket argument selects by ORDER, not deal. Query only
+            # the measured send window and match the exact native deal ID.
+            offset = self.broker_utc_offset_seconds
+            if self.broker_clock_model == 'new-york-plus-hours':
+                local = datetime.fromtimestamp(started, timezone.utc).astimezone(new_york_zone())
+                offset = int(local.utcoffset().total_seconds()) + self.broker_clock_hours*3600
+            matches = []
+            for shift in dict.fromkeys((0, offset)):
+                rows = self.read_timings.call('dealHistory', self.mt5.history_deals_get,
+                    math.floor(started)+shift-5, math.ceil(returned)+shift+5, group=symbol)
+                if rows is None or len(rows)>512:
+                    return None
+                matches = [deal for deal in rows if str(deal.ticket)==deal_id]
+                if matches:
+                    break
+            if len(matches) != 1:
+                return None
+            deal = matches[0]
+            side = self.mt5.ORDER_TYPE_BUY if marker['side'] == 'buy' else self.mt5.ORDER_TYPE_SELL
+            ticket, position = str(deal.order), str(deal.position_id)
+            if (deal.symbol != symbol or deal.entry != 0 or deal.type != side or deal.magic != marker['magic']
+                    or not re.fullmatch(r'[1-9][0-9]{0,19}', ticket)
+                    or not re.fullmatch(r'[1-9][0-9]{0,19}', position)
+                    or not 0 < float(deal.volume) <= marker['requestedVolume']+1e-8
+                    or not math.isfinite(float(deal.price)) or deal.price <= 0):
+                return None
+            history = self.read_timings.call('orderHistory', self.mt5.history_orders_get, ticket=int(ticket))
+            if history is None or len(history) != 1:
+                return None
+            order = history[0]
+            states = (getattr(self.mt5, 'ORDER_STATE_FILLED', 4),)
+            if receipt.get('marketPartial'):
+                states += (getattr(self.mt5, 'ORDER_STATE_CANCELED', 2),)
+            if (str(order.ticket) != ticket or order.symbol != symbol or str(order.position_id) != position
+                    or order.type != side or order.magic != marker['magic'] or order.type_filling != marker['filling']
+                    or order.state not in states or not all(
+                        math.isfinite(float(value)) and abs(float(value)-expected) <= 1e-8
+                        for value, expected in ((order.volume_initial, marker['requestedVolume']),
+                                                (order.sl, receipt['sl']), (order.tp, receipt['tp'])))):
+                return None
+            return ticket, history
+        except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
+            return None
+
+    def _partial_market_proof(self, ticket, symbol, receipt, orders, evidence=None):
+        """Release an IOC reservation only after its exact order and deals agree."""
+        marker = receipt.get('marketPartial')
+        if (not isinstance(marker, dict) or receipt.get('status') not in ('unknown', 'ok')
+                or receipt.get('retcode') != getattr(self.mt5, 'TRADE_RETCODE_DONE_PARTIAL', 10010)
+                or str(receipt.get('providerOrderId')) != ticket or marker.get('symbol') != symbol
+                or marker.get('side') not in ('buy', 'sell')):
+            return None
+        try:
+            requested = float(marker['requestedVolume'])
+            sl, tp = float(receipt['sl']), float(receipt['tp'])
+            if not all(math.isfinite(value) for value in (requested, sl, tp)) or requested <= 0 or sl <= 0 or tp < 0:
+                return None
+            history = evidence['history'] if evidence is not None and 'history' in evidence else self.read_timings.call(
+                'orderHistory', self.mt5.history_orders_get, ticket=int(ticket))
+            if history is None or len(history) != 1:
+                return None
+            order = history[0]
+            side = self.mt5.ORDER_TYPE_BUY if marker['side'] == 'buy' else self.mt5.ORDER_TYPE_SELL
+            terminal_states = (getattr(self.mt5, 'ORDER_STATE_CANCELED', 2), getattr(self.mt5, 'ORDER_STATE_FILLED', 4))
+            position_id = str(order.position_id)
+            if (str(order.ticket) != ticket or order.symbol != symbol or order.type != side
+                    or order.type_filling != self.mt5.ORDER_FILLING_IOC or order.state not in terminal_states
+                    or not re.fullmatch(r'[1-9][0-9]{0,19}', position_id)
+                    or not all(math.isfinite(float(value)) and abs(float(value)-expected) <= 1e-8
+                               for value, expected in ((order.volume_initial, requested), (order.sl, sl), (order.tp, tp)))):
+                return None
+            if any(not row['__isPosition'] and row['symbol'] == symbol
+                   and (str(row['ticket']) == ticket or str(row.get('positionId')) == position_id) for row in orders):
+                return None
+            positions = [row for row in orders if row['__isPosition'] and row['symbol'] == symbol
+                         and (str(row['ticket']) in (ticket, position_id) or str(row.get('identifier')) == position_id)]
+            if len(positions) > 1 or positions and str(positions[0].get('identifier')) != position_id:
+                return None
+            deals = evidence['deals'] if evidence is not None and 'deals' in evidence else self.read_timings.call(
+                'dealHistory', self.mt5.history_deals_get, position=int(position_id))
+            if not deals or len(deals) > 512:
+                return None
+            closed = not positions
+            if closed:
+                proof = self._closed_opening_proof(ticket, symbol, position_id, deals, order)
+                if proof is None:
+                    return None
+                volume, price = proof['volume'], proof['fillPrice']
+            else:
+                # A partial close or another order on this position must not
+                # masquerade as the original partial opening.
+                ids = [int(deal.ticket) for deal in deals]
+                if len(set(ids)) != len(ids) or any(value <= 0 for value in ids) or any(
+                        deal.entry != 0 or deal.type != side or str(deal.order) != ticket
+                        or deal.symbol != symbol or str(deal.position_id) != position_id
+                        or not math.isfinite(float(deal.volume)) or float(deal.volume) <= 0
+                        or not math.isfinite(float(deal.price)) or float(deal.price) <= 0 for deal in deals):
+                    return None
+                volume = sum(float(deal.volume) for deal in deals)
+                price = sum(float(deal.price)*float(deal.volume) for deal in deals)/volume
+                position = positions[0]
+                if position['type'] != marker['side'] or not all(
+                        math.isfinite(float(position[key])) and abs(float(position[key])-expected) <= 1e-8
+                        for key, expected in (('lots', volume), ('open_price', price), ('sl', sl), ('tp', tp))):
+                    return None
+            if not 0 < volume < requested-1e-8 or not math.isfinite(price) or price <= 0:
+                return None
+            return dict(kind='exact-ioc-partial-v1', openingTicket=ticket, positionId=position_id,
+                        symbol=symbol, side=marker['side'], requestedVolume=requested,
+                        filledVolume=volume, fillPrice=price, sl=sl, tp=tp, closed=closed)
+        except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
+            return None
+
     @serialized
-    def entry_reconcile(self, items):
+    def entry_reconcile(self, items, passive=False):
         """Read exact durable replies and broker openings; never submit/replay."""
         if not isinstance(items, list) or not 1 <= len(items) <= 16:
             raise ValueError('A bounded exact reconciliation batch is required')
@@ -2530,26 +2978,42 @@ class Bridge:
                     or any(not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', str(value)) for value in item['cancelIds'])):
                 raise ValueError('Invalid exact reconciliation identity')
         account = self.account()
-        data = self._orders(account)
+        if passive and len({item['symbol'] for item in items}) != 1:
+            raise ValueError('Passive recovery requires a single exact symbol')
+        data = self._orders(account, items[0]['symbol']) if passive else self._orders(account)
         results, quotes = {}, {}
         for item in items:
             saved = self.db.execute('SELECT result FROM requests WHERE id=?', (item['id'],)).fetchone()
             receipt = json.loads(saved[0]) if saved else None
-            ticket = str((receipt or {}).get('providerOrderId') or item['ticket'] or '')
+            evidence = {}
+            if receipt and receipt.get('marketDealOpening') and not receipt.get('providerOrderId'):
+                deal_opening = self._market_opening_from_deal(receipt, item['symbol'])
+                ticket = ''
+                if deal_opening:
+                    ticket, evidence['history'] = deal_opening
+                    receipt = dict(receipt, providerOrderId=ticket)
+            else:
+                ticket = str((receipt or {}).get('providerOrderId') or item['ticket'] or '')
             row = dict(receipt=receipt, ticket=ticket, pending=[], positions=[], terminal={})
             if re.fullmatch(r'[1-9][0-9]{0,19}', ticket):
                 if item['ticket'] and str(item['ticket']) != ticket:
                     raise ValueError('Reconciled opening ticket changed')
-                matches = self.opening_rows(ticket, item['symbol'], data['orders'])
+                matches = self.opening_rows(ticket, item['symbol'], data['orders'], evidence)
+                evidence['matches'] = matches
                 row.update(pending=[value for value in matches if not value['__isPosition']],
                            positions=[value for value in matches if value['__isPosition']],
-                           terminal=self.opening_state(ticket, item['symbol'], data['orders']) if not matches else dict(phase='active'))
+                           terminal=self.opening_state(ticket, item['symbol'], data['orders'], evidence)
+                           if not matches else dict(phase='active'))
+                if receipt and receipt.get('marketPartial') and not row['pending']:
+                    proof = self._partial_market_proof(ticket, item['symbol'], receipt, data['orders'], evidence)
+                    if proof is not None:
+                        row['partialMarketProof'] = proof
             row['cancellations'] = {}
             for identifier in item['cancelIds']:
                 cancelled = self.db.execute('SELECT result FROM requests WHERE id=?', (identifier,)).fetchone()
                 row['cancellations'][identifier] = json.loads(cancelled[0]) if cancelled else None
             results[item['id']] = row
-            if item['symbol'] not in quotes:
+            if not passive and item['symbol'] not in quotes:
                 tick = self.mt5.symbol_info_tick(item['symbol'])
                 if tick is not None:
                     quotes[item['symbol']] = dict(bid=float(tick.bid), ask=float(tick.ask),
@@ -2565,7 +3029,8 @@ class Bridge:
         background observer remains read-only. This also restores the original
         unclaimed deadline after a timeout with an exact broker opening ID.
         """
-        if not isinstance(expected, dict) or set(expected) != {'id','ticket','symbol','type','side','volume','price','sl','tp'}:
+        fields = {'id','ticket','symbol','type','side','volume','price','sl','tp'}
+        if not isinstance(expected, dict) or set(expected) not in (fields, fields | {'partialVolume'}):
             raise ValueError('Invalid reconciled opening confirmation')
         identifier, ticket, symbol = str(expected['id']), str(expected['ticket']), expected['symbol']
         if (not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', identifier) or not re.fullmatch(r'[1-9][0-9]{0,19}',ticket)
@@ -2576,56 +3041,104 @@ class Bridge:
             value = expected[name]
             if type(value) not in (int,float) or not math.isfinite(value) or value < 0 or name != 'tp' and value == 0:
                 raise ValueError('Invalid reconciled opening bounds')
+        partial = expected.get('partialVolume')
+        if ('partialVolume' in expected and (expected['type'] != 'market' or type(partial) not in (int, float)
+                or not math.isfinite(partial) or not 0 < partial < expected['volume']-1e-8)):
+            raise ValueError('Invalid reconciled partial volume')
         self.account()
         saved = self.db.execute('SELECT result FROM requests WHERE id=?', (identifier,)).fetchone()
         original = json.loads(saved[0]) if saved else {}
+        original_result = original
+        evidence = {}
+        deal_only = original.get('marketDealOpening') and not original.get('providerOrderId')
+        if deal_only:
+            resolved = self._market_opening_from_deal(original, symbol)
+            marker = original['marketDealOpening']
+            if (resolved and resolved[0] == ticket and expected['type'] == 'market' and expected['side'] == marker['side']
+                    and all(abs(value-actual) <= 1e-8 for value, actual in (
+                        (marker['requestedVolume'], expected['volume']), (original['sl'], expected['sl']),
+                        (original['tp'], expected['tp'])))):
+                original = dict(original, providerOrderId=ticket)
+                evidence['history'] = resolved[1]
         if (str(original.get('providerOrderId')) != ticket or original.get('operation')
                 or original.get('status') not in ('unknown','ok')):
             raise ValueError('Reconciled opening contradicts its native journal')
+        if partial is None and original.get('marketPartial'):
+            raise ValueError('Partial market opening requires exact IOC reconciliation')
         if original['status'] == 'ok':
+            if partial is not None:
+                marker = original.get('marketPartial', {})
+                if (original.get('nativePartial') is not True or marker.get('symbol') != symbol
+                        or marker.get('side') != expected['side'] or not all(
+                            abs(float(value)-actual) <= 1e-8 for value, actual in (
+                                (marker['requestedVolume'], expected['volume']), (original['filledVolume'], partial),
+                                (original['fillPrice'], expected['price']), (original['sl'], expected['sl']),
+                                (original['tp'], expected['tp'])))):
+                    raise ValueError('Partial confirmation differs from its settled receipt')
             return original
-        rows = self.opening_rows(ticket, symbol, self._orders(self.account())['orders'])
-        pending = [row for row in rows if not row['__isPosition']]
-        positions = [row for row in rows if row['__isPosition']]
-        terminal = self.opening_state(ticket,symbol,[]) if not rows else {}
-        proof = terminal.get('openingProof', {})
-        if not rows and proof.get('kind') == 'exact-balanced-opening-v1':
-            positions = [dict(type=proof['side'],lots=proof['volume'],open_price=proof['fillPrice'],sl=proof['sl'],tp=proof['tp'])]
-        cancelled = not rows and expected['type']=='limit' and terminal.get('phase')=='cancelled'
-        if cancelled:
-            history = self.mt5.history_orders_get(ticket=int(ticket))
-            order = next((row for row in history or () if str(row.ticket)==ticket and row.symbol==symbol),None)
-            if (order is None or order.type != (self.mt5.ORDER_TYPE_BUY_LIMIT if expected['side']=='buy' else self.mt5.ORDER_TYPE_SELL_LIMIT)
-                    or any(not math.isfinite(float(getattr(order,field,float('nan'))))
-                           or abs(float(getattr(order,field))-expected[key])>1e-8
-                           for field,key in (('volume_initial','volume'),('price_open','price'),('sl','sl'),('tp','tp')))):
-                raise ValueError('Cancelled native opening does not match its reservation')
-        if (len(pending)>1 or len(positions)>1 or not (pending or positions or cancelled)
-                or expected['type']=='market' and (pending or len(positions)!=1)):
-            raise ValueError('Native opening is not positively confirmed')
-        volume = expected['volume'] if cancelled else sum(float(row['lots']) for row in pending+positions)
-        if abs(volume-expected['volume']) > 1e-8:
-            raise ValueError('Native opening volume differs from its full reservation')
-        for row in pending+positions:
-            if (row['type'] != expected['side'] or abs(float(row['sl'])-expected['sl'])>1e-8
-                    or abs(float(row['tp'])-expected['tp'])>1e-8
-                    or (not row.get('__isPosition', True) or expected['type']=='market')
-                        and abs(float(row['open_price'])-expected['price'])>1e-8):
-                raise ValueError('Native opening price, side or protection differs')
-        result = {**original, 'status':'ok', 'nativeReconciled':True, 'nativePreviousResult':original,
+        active = self._orders(self.account())['orders']
+        if partial is not None:
+            proof = self._partial_market_proof(ticket, symbol, original, active, evidence)
+            if (proof is None or proof['side'] != expected['side'] or not all(
+                    abs(proof[key]-actual) <= 1e-8 for key, actual in (
+                        ('requestedVolume', expected['volume']), ('filledVolume', partial), ('fillPrice', expected['price']),
+                        ('sl', expected['sl']), ('tp', expected['tp'])))):
+                raise ValueError('Exact terminal IOC partial fill is not confirmed')
+            volume, fill_price = proof['filledVolume'], proof['fillPrice']
+            terminal = dict(phase='closed') if proof['closed'] else {}
+            pending = []
+        else:
+            rows = self.opening_rows(ticket, symbol, active, evidence)
+            evidence['matches'] = rows
+            pending = [row for row in rows if not row['__isPosition']]
+            positions = [row for row in rows if row['__isPosition']]
+            if deal_only and any(str(row.get('identifier')) != str(evidence['history'][0].position_id) for row in positions):
+                raise ValueError('Native market position differs from its exact historical deal')
+            terminal = self.opening_state(ticket,symbol,active,evidence) if not rows else {}
+            proof = terminal.get('openingProof', {})
+            if not rows and proof.get('kind') == 'exact-balanced-opening-v1':
+                positions = [dict(type=proof['side'],lots=proof['volume'],open_price=proof['fillPrice'],sl=proof['sl'],tp=proof['tp'])]
+            cancelled = not rows and expected['type']=='limit' and terminal.get('phase')=='cancelled'
+            if cancelled:
+                history = self.mt5.history_orders_get(ticket=int(ticket))
+                order = next((row for row in history or () if str(row.ticket)==ticket and row.symbol==symbol),None)
+                if (order is None or order.type != (self.mt5.ORDER_TYPE_BUY_LIMIT if expected['side']=='buy' else self.mt5.ORDER_TYPE_SELL_LIMIT)
+                        or any(not math.isfinite(float(getattr(order,field,float('nan'))))
+                               or abs(float(getattr(order,field))-expected[key])>1e-8
+                               for field,key in (('volume_initial','volume'),('price_open','price'),('sl','sl'),('tp','tp')))):
+                    raise ValueError('Cancelled native opening does not match its reservation')
+            if (len(pending)>1 or len(positions)>1 or not (pending or positions or cancelled)
+                    or expected['type']=='market' and (pending or len(positions)!=1)):
+                raise ValueError('Native opening is not positively confirmed')
+            volume = expected['volume'] if cancelled else sum(float(row['lots']) for row in pending+positions)
+            if abs(volume-expected['volume']) > 1e-8:
+                raise ValueError('Native opening volume differs from its full reservation')
+            for row in pending+positions:
+                if (row['type'] != expected['side'] or abs(float(row['sl'])-expected['sl'])>1e-8
+                        or abs(float(row['tp'])-expected['tp'])>1e-8
+                        or (not row.get('__isPosition', True) or expected['type']=='market')
+                            and abs(float(row['open_price'])-expected['price'])>1e-8):
+                    raise ValueError('Native opening price, side or protection differs')
+            fill_price = float(positions[0]['open_price']) if expected['type']=='market' else None
+        result = {**original, 'status':'ok', 'nativeReconciled':True, 'nativePreviousResult':original_result,
             'nativeProof':dict(kind='exact-opening-state-v1',checkedAt=time.time()*1000,ticket=ticket,symbol=symbol,
                 volume=volume,terminal=terminal.get('phase'),pending=bool(pending))}
         if expected['type']=='market':
-            result.update(filledVolume=volume,fillPrice=float(positions[0]['open_price']))
+            result.update(filledVolume=volume,fillPrice=fill_price)
+        if partial is not None:
+            result['nativePartial'] = True
         self.db.execute('UPDATE requests SET result=? WHERE id=?',(json.dumps(result,allow_nan=False),identifier))
         deadline = self.db.execute('SELECT payload,state FROM time_rules WHERE id=?',(identifier,)).fetchone()
         if deadline and deadline[1] in ('opening','unknown'):
             rule = json.loads(deadline[0])
-            if rule.get('openingId')!=identifier or rule.get('actions') or rule.get('commandId') or str(rule.get('ticket'))!=ticket:
+            stored_ticket = str(rule.get('ticket', ''))
+            if (rule.get('openingId')!=identifier or rule.get('actions') or rule.get('commandId')
+                    or (stored_ticket != ticket and not (deal_only and stored_ticket in ('', '0')))):
                 self.db.rollback()
                 raise ValueError('Unknown deadline action cannot be reconciled as an opening')
-            self.db.execute('UPDATE time_rules SET state=?,result=? WHERE id=?',
-                ('completed' if terminal.get('phase') in ('closed','cancelled') else 'armed',json.dumps(result,allow_nan=False),identifier))
+            rule['ticket'] = ticket
+            self.db.execute('UPDATE time_rules SET payload=?,state=?,result=? WHERE id=?', (json.dumps(rule),
+                'completed' if terminal.get('phase') in ('closed','cancelled') else 'armed',json.dumps(result,allow_nan=False),identifier))
         self.db.commit()
         return result
 
@@ -2680,6 +3193,7 @@ class Bridge:
             return dict(account=str(self.config['account']), server=self.config['server'],
                 entries=[dict(entry, lifecycleDeferred=True, positionsConfirmed=False) for entry in entries])
         if getattr(self, 'isolated_entries', False):
+            self.chunk_entries.schedule_startup_controls()
             # Match the Mac panel's active view. Alternating full/history and
             # active signatures discarded usable evidence between UI polls.
             states = self.management_accounts(compact=True)
@@ -2757,27 +3271,34 @@ class Bridge:
         entries=self.chunk_entries.list()
         for entry in entries:
             live=[]
+            pending=[]
             for account in entry['accounts']:
-                rows=states.get(account,{}).get('orders',[])
+                state=states.get(account,{})
+                if not state.get('connected') or state.get('evidenceReady') is False:
+                    continue
                 identifiers=set()
                 for child in entry['children']:
                     position=child.get('positions',{}).get(account,{})
                     identifiers.update(str(position[key]) for key in ('ticket','openingTicket') if position.get(key))
                     result=child.get('result',{})
-                    outcome=result.get('accountResults',{}).get(account,result if account==str(self.config['account']) else {})
+                    primary=str(result.get('primaryAccount',self.config['account']))
+                    outcome=result.get('accountResults',{}).get(account,result if account==primary else {})
                     if outcome.get('providerOrderId'): identifiers.add(str(outcome['providerOrderId']))
-                for row in rows:
-                    if row.get('__isPosition') and row['symbol']==entry['symbol'] and identifiers.intersection((str(row['ticket']),str(row.get('identifier')))):
-                        live.append(dict(account=account,ticket=row['ticket'],volume=row['lots']))
+                for row in state.get('orders',[]):
+                    if row['symbol']==entry['symbol'] and identifiers.intersection((str(row['ticket']),str(row.get('identifier')))):
+                        rows=live if row.get('__isPosition') else pending
+                        rows.append(dict(account=account,ticket=row['ticket'],volume=row['lots']))
             entry['positionsConfirmed']=all(states.get(account,{}).get('connected')
                 and states[account].get('evidenceReady') is not False for account in entry['accounts'])
             entry['livePositions']=live
+            entry['livePendingOrders']=pending
             entry['hasOpenPositions']=bool(live) if entry['positionsConfirmed'] else None
         # Historical receipts stay durable in SQLite. Keep the frequently read
         # management response focused on active/uncertain entries and parents
         # that still own a live position; old completed histories cannot grow
         # every two-second UI update indefinitely.
-        return [entry for entry in entries if entry['phase'] not in ('completed','stopped') or entry['hasOpenPositions'] is not False]
+        return [entry for entry in entries if entry['phase'] not in ('completed','stopped')
+                or entry['hasOpenPositions'] is not False or entry['livePendingOrders']]
 
 
 def account_worker(connection, config, database):
@@ -2899,7 +3420,15 @@ class AccountWorker:
                 pendingAgeMs=round((time.monotonic()-self.rpc_pending_started)*1000,3) if self.rpc_pending_started is not None else None,
                 counts=dict(self.rpc_counts), recent=list(self.rpc_recent))
 
-    def _rpc_acquire(self, method, deadline):
+    def _rpc_acquire(self, method, deadline, *, idle=False):
+        if idle:
+            # Test queue and lock together. Acquiring the RLock first makes
+            # the read reentrant and lets it bypass a queued mutation.
+            with self.rpc_condition:
+                if self.rpc_urgent_waiters or self.lock._is_owned() or not self.lock.acquire(blocking=False):
+                    return False
+                self.rpc_owner = dict(method=method, started=time.monotonic(), at=time.time()*1000)
+                return True
         urgent = method=='execute' or method=='check_opening' or method.startswith('entry_')
         mutation = method in ('execute','entry_cancel_limit','entry_common_stop')
         reentrant = self.lock._is_owned()
@@ -3025,18 +3554,13 @@ class AccountWorker:
         """Low-priority read: do not queue behind an account trade or read."""
         if method != 'entry_reconcile':
             raise ValueError('Idle RPC is restricted to native reconciliation reads')
-        if not self.lock.acquire(blocking=False):
-            return dict(deferred=True)
-        try:
-            return self._call(method, args)
-        finally:
-            self.lock.release()
+        return self._call(method, args, idle=True)
 
     def call_dispatched(self, sent, abort, deadline, method, *args):
         """Confirm the actual pipe handoff before another native call can block Python."""
         return self._call(method, args, (sent, abort, deadline))
 
-    def _call(self, method, args, dispatch=None):
+    def _call(self, method, args, dispatch=None, *, idle=False):
         # Recovery creates a new connection; it never resends the old message.
         started=time.perf_counter()
         sent_to_worker=False
@@ -3056,7 +3580,11 @@ class AccountWorker:
             timeout = min(2., max(0.,dispatch[2]-time.monotonic())) if dispatch else 2.
             # Retain the original bounded wait and response deadline. Priority
             # changes admission order, never quote freshness or native guards.
-            acquired=self._rpc_acquire(method,time.monotonic()+timeout)
+            acquired = (self._rpc_acquire(method, time.monotonic()+timeout, idle=True) if idle
+                        else self._rpc_acquire(method, time.monotonic()+timeout))
+            if idle and not acquired:
+                outcome = 'deferred'
+                return dict(deferred=True)
             if not acquired: refused('Linked MT5 is busy; request was not sent')
             lock_ms=round((time.perf_counter()-started)*1000,2)
             if not self.available(): refused('Linked MT5 is reconnecting')
@@ -3092,7 +3620,7 @@ class AccountWorker:
                     raise EntryPriceRejected(error['reason'],error['entryDiagnostics'])
                 if error: raise ValueError(error)
                 outcome='ok'
-                if method in ('execute','entry_snapshot','entry_management','entry_positions','entry_admission','entry_context','entry_cancel_limit','entry_common_stop','management_snapshot') and isinstance(result,dict):
+                if method in ('execute','entry_snapshot','entry_management','entry_close_reconciliation','entry_positions','entry_admission','entry_context','entry_cancel_limit','entry_common_stop','management_snapshot') and isinstance(result,dict):
                     result={**result,'rpcTiming':dict(lockWaitMs=lock_ms,sendMs=send_ms,totalMs=round((time.perf_counter()-started)*1000,2))}
                 if method=='quote_frame' and isinstance(result,dict):
                     result=dict(result,quoteTiming=dict(result.get('quoteTiming',{}),
@@ -3109,10 +3637,10 @@ class AccountWorker:
         finally:
             elapsed=round((time.perf_counter()-started)*1000,3)
             with self.rpc_condition:
-                self.rpc_counts['calls']+=1
+                self.rpc_counts['calls']+=int(outcome != 'deferred')
                 self.rpc_counts['notSent']+=int(outcome=='not-sent')
                 self.rpc_counts['timeouts']+=int(outcome=='timeout')
-                if elapsed>=250 or outcome!='ok':
+                if elapsed>=250 or outcome not in ('ok', 'deferred'):
                     blocker=self.rpc_owner['method'] if self.rpc_owner and not acquired else self.rpc_pending_method if not sent_to_worker else None
                     self.rpc_recent.append(dict(method=method,outcome=outcome,sent=sent_to_worker,
                         waitMs=lock_ms if acquired else elapsed,totalMs=elapsed,blockedBy=blocker,at=time.time()*1000))
@@ -3352,7 +3880,7 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                     return
                 payload = None
                 operations = ('/place','/cancel','/close','/modify','/schedule-close','/cancel-close')
-                if self.command == 'POST' and route_path in (*operations, '/quote-mode', '/account-discovery', '/account-register', '/entry-plan', '/entry-plan-admit', '/entry-plan-stop', '/entry-plan-continue', '/entry-plan-protection', '/entry-plan-close', '/entry-parent-take', '/candle-levels'):
+                if self.command == 'POST' and route_path in (*operations, '/quote-mode', '/account-discovery', '/account-register', '/entry-plan', '/entry-plan-admit', '/entry-plan-stop', '/entry-plan-continue', '/entry-plan-protection', '/entry-plan-close', '/entry-parent-take', '/candle-levels', '/chart-recorder', '/tradehub-roles'):
                     length = int(self.headers.get('Content-Length', 0))
                     if not 0 < length <= 16384:
                         raise ValueError('Invalid body size')
@@ -3386,6 +3914,16 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                         with bridge.lock: result=bridge.envelope(entryReadiness=readiness)
                     elif self.command=='GET' and route_path=='/entry-plans':
                         result=bridge.entry_plans()
+                    elif self.command=='GET' and route_path=='/entry-plan-stop':
+                        query = parse_qs(route.query, keep_blank_values=True)
+                        if set(query) != {'id'} or len(query['id']) != 1:
+                            raise ValueError('A single exact entry stop ID is required')
+                        receipt = bridge.chunk_entries.stop_receipt(query['id'][0])
+                        if receipt is None:
+                            self.reply(404, {'error': 'Exact saved entry stop receipt is unavailable'})
+                            return
+                        result = dict(account=str(config['account']), server=config['server'], version=BRIDGE_VERSION,
+                            capabilities=bridge._capabilities(), **receipt)
                     elif self.command=='GET' and route_path=='/entry-plan':
                         query = parse_qs(route.query, keep_blank_values=True)
                         if set(query) != {'id'} or len(query['id']) != 1:
@@ -3425,6 +3963,16 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                         with bridge.lock: result=bridge.envelope(**values, version=BRIDGE_VERSION,
                             capabilities=bridge._capabilities(), **({'admissionContract':'atomic-entry-admission-v1'} if route_path=='/entry-plan-admit' else {}))
                     else: raise ValueError('Unsupported chunk entry request')
+                elif selected is bridge and route_path == '/chart-recorder':
+                    recorder = getattr(bridge, 'chart_recorder', None)
+                    if recorder is None or route.query or self.command not in ('GET', 'POST') or self.command == 'POST' and payload is None:
+                        raise ValueError('Настройка уровней и снимков недоступна')
+                    result = bridge.envelope(chartRecorder=recorder.state(payload))
+                elif selected is bridge and route_path == '/tradehub-roles':
+                    roles = getattr(bridge, 'tradehub_roles', None)
+                    if roles is None or route.query or self.command not in ('GET', 'POST') or self.command == 'POST' and payload is None:
+                        raise ValueError('Настройки ролей Trade Hub недоступны')
+                    result = bridge.envelope(tradeHubRoles=roles.state(payload))
                 elif selected is bridge and route_path in ('/account-catalog','/account-discovery','/account-register'):
                     registry=getattr(bridge,'account_registry',None)
                     if registry is None: raise ValueError('Account enrollment requires receiver update')
@@ -3593,9 +4141,9 @@ class CoordinatorBridge(Bridge):
     The parent retains group/control receipts and authenticated routing only.
     Worker recovery never closes terminals or replays an unknown mutation.
     """
-    NATIVE_METHODS = frozenset(('entry_snapshot','entry_context','entry_admission','entry_positions','lot_specs',
+    NATIVE_METHODS = frozenset(('entry_snapshot','entry_context','entry_admission','entry_primary_sizing','entry_positions','lot_specs',
         'execute','check_opening','entry_position_identity','entry_position_remainder','entry_common_stop','entry_common_stop_receipt',
-        'entry_protection_plan','entry_limit_state','entry_cancel_limit','entry_management','entry_reconcile',
+        'entry_protection_plan','entry_limit_state','entry_cancel_limit','entry_management','entry_close_reconciliation','entry_reconcile',
         'entry_confirm_reconciled','local_management','orders','close_rules'))
 
     def __init__(self, config, database, primary_worker):
@@ -3632,7 +4180,7 @@ class CoordinatorBridge(Bridge):
         migrated=bool(self.db.execute('SELECT 1 FROM coordinator_storage_migrations WHERE id=?',(marker,)).fetchone())
         # Copy coordinator-owned receipts once, atomically. Never move, delete
         # or update a native request, rule, protective receipt or trade record.
-        tables=('groups','chunk_entries','chunk_entry_stops','chunk_entry_cancels',
+        tables=('groups','chunk_entries','chunk_entry_stops','chunk_entry_stop_receipts','chunk_entry_cancels',
                 'chunk_entry_protections','chunk_entry_closures')
         source=None
         try:
@@ -3913,6 +4461,15 @@ class CoordinatorBridge(Bridge):
             self.management_errors[account]=type(error).__name__
 
 
+def native_request_database(config, file, account):
+    # The original primary's receipts keep their legacy path after promotion.
+    legacy = str(config.get('legacyPrimaryAccount', config['account']))
+    account = str(account)
+    if not re.fullmatch(r'[1-9][0-9]{0,19}', legacy) or not re.fullmatch(r'[1-9][0-9]{0,19}', account):
+        raise ValueError('Invalid account for the native command journal')
+    return file.with_name('requests.sqlite3' if account == legacy else 'requests-'+account+'.sqlite3')
+
+
 def start_account_workers(config, file, factory=None):
     factory=AccountWorker if factory is None else factory
     linked=config.get('linkedAccounts',[])
@@ -3923,11 +4480,11 @@ def start_account_workers(config, file, factory=None):
         accounts.add(account);paths.add(path)
     created=[]
     try:
-        primary=factory({**config,'linkedAccounts':[],'_primaryWorker':True},file.with_name('requests.sqlite3'))
+        primary=factory({**config,'linkedAccounts':[],'_primaryWorker':True},native_request_database(config,file,config['account']))
         created.append(primary);workers={}
         for row in linked:
             account=str(row['account'])
-            workers[account]=factory({**config,**row,'linkedAccounts':[]},file.with_name('requests-'+account+'.sqlite3'))
+            workers[account]=factory({**config,**row,'linkedAccounts':[]},native_request_database(config,file,account))
             created.append(workers[account])
         return primary,workers
     except Exception:
@@ -3940,6 +4497,19 @@ def serve(config_file):
     config = json.loads(file.read_text(encoding='utf-8'))
     if len(config.get('token', '')) < 32:
         raise ValueError('A strong receiver token is required')
+    chart_root = None
+    if os.name == 'nt' and config.get('candleLevelsFileDirectory') and os.environ.get('APPDATA'):
+        candidate = pathlib.Path(os.environ['APPDATA']) / 'MetaQuotes/Terminal/Common/Files/ISCC/ChartRecorder'
+        if (candidate / 'route.tsv').is_file():
+            from chart_recorder import read_route
+            try:
+                if read_route(candidate)[2] != config['server']:
+                    raise ValueError('Chart recorder server mismatch')
+            except (OSError, ValueError):
+                print('Invalid chart recorder selection; using legacy candle directory', flush=True)
+            else:
+                chart_root = candidate
+                config['_chartRecorderDirectory'] = str(candidate)
     primary_worker,workers=start_account_workers(config,file)
     try:bridge = CoordinatorBridge(config,file.with_name('requests.sqlite3'),primary_worker)
     except Exception:
@@ -3949,7 +4519,7 @@ def serve(config_file):
     from account_registry import AccountRegistry
     def registered_worker(row, wait=True):
         worker=AccountWorker({**config,**{key:row[key] for key in ('account','server','terminalPath')},'linkedAccounts':[]},
-                             file.with_name('requests-'+row['account']+'.sqlite3'))
+                             native_request_database(config,file,row['account']))
         if wait:
             deadline=time.monotonic()+5
             while not worker.available() and time.monotonic()<deadline: time.sleep(.05)
@@ -3959,6 +4529,18 @@ def serve(config_file):
         return worker
     bridge.account_registry=AccountRegistry(bridge,file.with_name('accounts-registry.json'),registered_worker)
     bridge.account_registry.restore()
+    if chart_root:
+        from chart_recorder import ChartRecorder
+        inbox = pathlib.Path(config['candleLevelsFileDirectory']) / 'DWX/StopAudit/EntryShots'
+        bridge.chart_recorder = ChartRecorder(chart_root, inbox, lambda: (str(config['account']), *tuple(bridge.linked)), config['server'])
+        bridge.chart_recorder.start()
+    if os.name == 'nt':
+        try:
+            from chart_recorder import TradeHubRoles
+            bridge.tradehub_roles = TradeHubRoles.from_config(config, lambda: (str(config['account']), *tuple(bridge.linked)),
+                getattr(bridge, 'chart_recorder', None))
+        except (ImportError, OSError, TypeError, ValueError) as error:
+            print('Trade Hub roles unavailable:', type(error).__name__, flush=True)
     bridge.warm_group_executor()
     bridge.start_rules()
 
@@ -3973,6 +4555,8 @@ def serve(config_file):
         server.serve_forever()
     finally:
         pass
+        if chart_root:
+            bridge.chart_recorder.stop.set()
         server.server_close()
         bridge.rule_stop.set()
         bridge.close_group_executor()

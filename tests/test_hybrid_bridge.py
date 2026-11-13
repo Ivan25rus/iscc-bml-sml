@@ -213,7 +213,7 @@ class HybridBridgeTests(unittest.TestCase):
     def test_support_policy_cannot_override_market_or_outer_limit_price(self):
         payload=self.support();payload['type']='market'
         self.assertEqual(self.bridge.execute('place',payload)['result']['status'],'rejected')
-        payload=self.support();payload['entryGuard'].pop('limitPolicy')
+        payload=self.support();payload['id']='unsupported-outer-limit';payload['entryGuard'].pop('limitPolicy')
         self.assertEqual(self.bridge.execute('place',payload)['result']['status'],'rejected')
         self.assertEqual(self.mt5.sent,[])
 

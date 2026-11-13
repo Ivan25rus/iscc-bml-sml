@@ -258,6 +258,15 @@ class EntryIndependenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):start_account_workers(config,pathlib.Path('config.json'),lambda *args:created.append(args))
         self.assertFalse(created)
 
+    def test_promoting_account_keeps_each_native_journal_at_its_original_path(self):
+        config=dict(account=900000003,legacyPrimaryAccount='900000002',terminalPath='new-terminal',
+                    linkedAccounts=[dict(account=900000002,terminalPath='old-terminal'),
+                                    dict(account=900000001,terminalPath='copy-terminal')])
+        primary,linked=start_account_workers(config,pathlib.Path('config.json'),lambda _,file:file)
+        self.assertEqual(primary.name,'requests-900000003.sqlite3')
+        self.assertEqual(linked['900000002'].name,'requests.sqlite3')
+        self.assertEqual(linked['900000001'].name,'requests-900000001.sqlite3')
+
     def test_existing_completed_parent_controls_and_exact_history_migrate_without_native_writes(self):
         f=support.IsolatedEngineTests.make(self);f.engine.arm(f.payload)
         support.IsolatedEngineTests.until(self,f,lambda state:state['phase']=='completed')

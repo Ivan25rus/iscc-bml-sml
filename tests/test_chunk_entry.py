@@ -95,7 +95,7 @@ class FakeBridge:
         return dict(account=self.login.login, server=self.login.server,
                     orders=copy.deepcopy(self.rows), openingStates={})
 
-    def entry_management(self, watch=()):
+    def entry_management(self, watch=(), close_preflight=False):
         return self.local_management((), watch)
 
     def _fill(self, payload):

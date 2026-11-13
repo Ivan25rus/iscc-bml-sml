@@ -10,8 +10,9 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
 import test_account_controls as controls
+import test_entry_independence as independence
 import test_isolated_entry_engines as isolated
-from chunk_entry import IsolatedEntries
+from chunk_entry import AccountPlanEntries,IsolatedEntries
 from mt5_bridge import create_server
 
 
@@ -51,6 +52,47 @@ class ParentTakeTests(unittest.TestCase):
             self.assertTrue(all((p.sl,p.tp)==before[p.ticket] for p in native.positions))
         counts=[len(n.sent) for n in f.natives];self.evaluate(f)
         self.assertEqual([len(n.sent) for n in f.natives],counts)
+
+    def test_take_keeps_the_account_that_never_entered_cancelled_without_read_or_close(self):
+        case=independence.EntryIndependenceTests();self.addCleanup(case.doCleanups)
+        f,root=case.model()
+        follower='900000001';primary='900000002'
+        legacy=dict(phase='running',accounts={follower:{}})
+        direction_rows=AccountPlanEntries._direction_rows
+        def block_follower(storage,payload,legacy_only=False):
+            return iter([(payload,legacy)]) if legacy_only else direction_rows(storage,payload)
+        with patch.object(AccountPlanEntries,'_direction_rows',side_effect=block_follower):
+            f.engine.arm(f.payload)
+        state=isolated.IsolatedEngineTests.until(self,f,lambda s:s['lanePhases'][primary]=='completed')
+        self.assertEqual(state['lanePhases'][follower],'stopped')
+        follower_calls=[]
+        root.linked[follower].before=lambda method,args:follower_calls.append(method)
+        takes=f.engine.partial_takes;command=self.command(f)
+        sent=[len(n.sent) for n in f.natives]
+        response=takes.command(command)
+        accounts=response['result']['rule']['accounts']
+        self.assertEqual(accounts[primary]['state'],'armed')
+        self.assertEqual(accounts[follower],dict(state='cancelled',reason='Account was not admitted to this parent'))
+        self.assertEqual(takes.command(command),response)
+        self.assertEqual(root.receipt(command['id'])['result'],response['result'])
+        self.assertEqual([len(n.sent) for n in f.natives],sent)
+        for native in f.natives:native.tick.bid=25011.;native.tick.ask=25011.2
+        rule=self.evaluate(f)
+        self.assertEqual(rule['accounts'][primary]['state'],'completed',rule)
+        self.assertEqual(rule['accounts'][follower],accounts[follower])
+        self.assertEqual(sum(p.volume for p in f.natives[0].positions),.5)
+        self.assertEqual(len(f.natives[1].sent),sent[1])
+        self.assertEqual(follower_calls,[])
+
+    def test_missing_lane_without_pre_admission_evidence_blocks_the_partial_take(self):
+        f,_=self.model();takes=f.engine.partial_takes;command=self.command(f)
+        sent=[len(n.sent) for n in f.natives]
+        with patch.object(f.engine.shards['900000001'],'_load',return_value=None):
+            with self.assertRaisesRegex(ValueError,'Account parent is not admitted: 900000001'):
+                takes.command(command)
+        self.assertEqual(takes.list(),[])
+        self.assertIsNone(takes.receipt(command['id']))
+        self.assertEqual([len(n.sent) for n in f.natives],sent)
 
     def test_cancel_and_idempotency_cannot_arm_twice(self):
         f,root=self.model();takes=f.engine.partial_takes;command=self.command(f)

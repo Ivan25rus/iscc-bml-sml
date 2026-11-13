@@ -296,6 +296,19 @@ test('Recent close proof cannot bypass an unknown parent command or treat a lost
   assert.equal((await g.adapter.closeEntryPosition({id:g.plan.id,symbol:'USTEC'})).status,'unknown');
   assert.equal(g.posts().length,1);
 });
+test('Independent close skips old independent receipt reads while keeping unresolved shared commands blocking',async t=>{
+  for(const [operation,expectedStatus] of [['entry-protection','ok'],['entry-close','ok'],['entry-take','unknown']]) {
+    const f=independentFixture(t);
+    f.adapter.chunkLifecycleEntries=new Map([[f.parent.id,copy(f.parent)]]);
+    f.adapter.commandJournal.records.push({id:'previous',ticket:'entry:'+f.plan.id,operation,
+      payload:{entryId:f.plan.id,independentAccountControls:true},result:{status:'unknown'}});
+    const result=await f.adapter.closeEntryPosition(f.parent);
+    assert.equal(result.status,expectedStatus,result.reason);
+    assert.equal(f.posts().length,expectedStatus==='ok' ? 1 : 0);
+    assert.equal(f.calls.some(call=>call.route.startsWith('/receipt?id=')),expectedStatus==='unknown');
+    assert.equal(f.adapter.commandJournal.records[0].result.status,'unknown');
+  }
+});
 test('Whole-parent protection uses captured accounts and fresh shared levels; no ticket, size, or current config multiplier reaches VPS',async t=>{
   const f=fixture(t);
   const result=await f.adapter.modifyEntryProtection(f.row,{sl:'24990'},{account:primary});

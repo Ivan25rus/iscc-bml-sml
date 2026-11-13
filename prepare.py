@@ -61,7 +61,8 @@ def selection(value):
 
 
 ROOTS = {
-    'bml-sml':['levelOrder/chunkAdmission.js','mt5-vps/cardRecovery.js','mt5-vps/cardDrafts.js','mt5-vps/runtimeActivity.js','tradeRules/index.js'],
+    'bml-sml':['levelOrder/chunkAdmission.js','mt5-vps/cardRecovery.js','mt5-vps/cardDrafts.js','mt5-vps/cardIdentity.js',
+               'mt5-vps/entryCloseControl.js','mt5-vps/runtimeActivity.js','tradeRules/index.js'],
     'management':['mt5-vps/management.js'],
     'accounts':['mt5-vps/tradeSettings.js','mt5-vps/accountEnrollment.js'],
     'time-exit':['mt5-vps/tradeSettings.js']}

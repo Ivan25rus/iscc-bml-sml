@@ -29,8 +29,8 @@ def command_budget(send=None, initial=True, commit_seconds=2.1):
         state['phase']=value
         if value=='sending':claims.append(copy.deepcopy(state));clock[0]+=commit_seconds
     lane._phase=phase
-    def call(account,method,operation,request):
-        captured.append(copy.deepcopy(request))
+    def call(account,method,operation,request,*native_options):
+        captured.append((copy.deepcopy(request),native_options))
         return dict(result=dict(status='rejected',reason='Test stops before a broker call'))
     lane._call=call
     state=dict(id='expiry-parent',createdAt=100000.,phase='running',accounts={'900000001':{}},children=[])
@@ -39,7 +39,8 @@ def command_budget(send=None, initial=True, commit_seconds=2.1):
         closeTimeZone='America/New_York',closeLocalDate='2026-10-30',closeLocalTime='15:59',cancelPendingAtDeadline=True)
     with patch('time.time',side_effect=lambda:clock[0]):
         (send or ChunkEntries._hybrid_send)(lane,payload,state,'limit',{'900000001':100.},{'900000001':.8},{'900000001':{}})
-    return dict(remainingMs=captured[0]['expiresAt']-clock[0]*1000,request=captured[0],claims=claims)
+    request,native_options=captured[0]
+    return dict(remainingMs=request['expiresAt']-clock[0]*1000,request=request,claims=claims,nativeOptions=native_options)
 
 
 class NativeExpiryTests(unittest.TestCase):
@@ -47,9 +48,12 @@ class NativeExpiryTests(unittest.TestCase):
         result=command_budget()
         self.assertEqual(result['remainingMs'],3000)
         self.assertEqual(result['claims'][0]['children'][0]['state'],'sending')
+        self.assertEqual(result['nativeOptions'],(None,True))
 
     def test_legacy_captured_policy_keeps_original_deadline(self):
-        self.assertAlmostEqual(command_budget(initial=False)['remainingMs'],900)
+        result=command_budget(initial=False)
+        self.assertAlmostEqual(result['remainingMs'],900)
+        self.assertEqual(result['nativeOptions'],())
 
     def test_only_proven_unsent_expiry_allows_a_new_checked_intent(self):
         payload=dict(initialSizingOnly=True,accountExecution='independent-v4')

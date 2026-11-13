@@ -1,7 +1,9 @@
 // Deadline conversion only. These timestamps never make a price usable.
 const {performance}=require('node:perf_hooks');
 function rememberServerClock(adapter,capturedAt,at=performance.now()) {
-  if(Number.isFinite(capturedAt))adapter.entryIntentClock={capturedAt,at};
+  const previous=adapter.entryIntentClock;
+  if(Number.isFinite(capturedAt) && (!previous || capturedAt>previous.capturedAt))
+    adapter.entryIntentClock={capturedAt,at};
 }
 function intentExpiry(adapter,ttl,wall=Date.now(),at=performance.now()) {
   const clock=adapter.entryIntentClock,age=at-clock?.at;

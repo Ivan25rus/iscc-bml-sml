@@ -4,7 +4,9 @@ const loadConfig = require('../../config/load');
 const { MT5VPSAdapter } = require('./client');
 const { CommandJournal } = require('./commandJournal');
 const events = require('../events');
-const {followers}=require('./sizing');
+const {followers,transferCopying}=require('./sizing');
+const {normalizePrimaryRisk,primaryRisk}=require('./primaryRisk');
+const {managementFreshness}=require('./managementFreshness');
 settings.register('mt5-vps', path.join(__dirname,'config/mt5-vps.json'), path.join(__dirname,'config/mt5-vps-settings-descriptor.json'));
 settings.onApply('mt5-vps', ({ changedPaths }) => ({restartRequiredPaths:changedPaths}));
 function readConfig() { return loadConfig('../services/mt5-vps/config/mt5-vps.json'); }
@@ -30,8 +32,9 @@ function initService(api) {
           const symbol = snapshot.symbol === connection.config.spxSymbol ? 'SPX500' : 'USTEC';
           api.instrumentInfo?.ingest?.({provider:'mt5-vps',symbol},snapshot);
         });
-        connection.on('quote:stale',() => {
-          for (const symbol of ['SPX500','USTEC']) api.instrumentInfo?.ingest?.({provider:'mt5-vps',symbol},{});
+        connection.on('quote:stale',symbols => {
+          const selected=symbols?.map(symbol=>symbol===connection.config.spxSymbol ? 'SPX500' : 'USTEC') || ['SPX500','USTEC'];
+          for (const symbol of selected) api.instrumentInfo?.ingest?.({provider:'mt5-vps',symbol},{});
         });
         adapter = connection;
         runtimeActivity.start(connection.config.enabled);
@@ -57,11 +60,60 @@ function initService(api) {
     const primary = api.mt5VPS.getAdapter();
     primary.remoteAccounts = Object.keys(state.accountStates).filter(value=>value!==String(primary.config.account));
     for (const [account,health] of Object.entries(state.accountStates)) {
+      if(primary.managementCache?.isCurrent(account,health)===false)continue;
       const connection = forAccount(account);
-      if (health.connected) connection.acceptManagementState(health,connection===primary ? state : health);
-      else connection.managementSnapshot = null;
+      if (healthyManagementAccount(health,account,primary.config.server))
+        connection.acceptManagementState(health,connection===primary ? state : health);
+      else if(health.connected===false && health.connectionState!=='checking')connection.managementSnapshot=null;
     }
-    primary.managementStateView=state;primary.managementStateAt=Date.now();
+  }
+  function healthyManagementAccount(health,account,server) {
+    return health?.connected===true && health.evidenceReady!==false && String(health.account)===String(account)
+      && health.server===server && Array.isArray(health.orders) && Array.isArray(health.capabilities);
+  }
+  function managementDisplayAccounts(state,primary) {
+    const display=managementFreshness(state,Date.now());
+    return Object.fromEntries(Object.entries(display.accountStates).map(([account,health])=>{
+      const native=forAccount(account).managementNativeState;
+      const older=primary.managementCache?.isCurrent(account,health)===false
+        || native?.managementEpoch===health.managementEpoch && Number.isFinite(native?.checkedAt)
+          && Number.isFinite(health.checkedAt) && health.checkedAt<native.checkedAt;
+      return [account,older ? {...health,connected:false,evidenceReady:false,reason:'Проверяем актуальность позиций счёта'} : health];
+    }));
+  }
+  let receiptRefresh, receiptRefreshAt=0;
+  const receiptAttempts=new WeakMap();
+  function refreshManagementReceipt(primary,connection,accountStates) {
+    const now=Date.now();
+    if(receiptRefresh || now-receiptRefreshAt<10000)return;
+    const views=Object.values(accountStates);
+    const flat=views.length>0 && views.every(view=>view.evidenceReady!==false && view.connected===true
+      && Array.isArray(view.orders) && view.orders.length===0);
+    const parents=new Set(views.flatMap(view=>view.orders || []).filter(row=>row.entryPlan?.id)
+      .map(row=>'entry:'+row.entryPlan.id));
+    const candidates=[];
+    for(const current of new Set([connection,primary])) {
+      const rows=accountStates[String(current.config.account)]?.orders || [];
+      const tickets=new Set(rows.map(row=>String(row.ticket)));
+      for(const record of current.commandJournal.records) {
+        if(record.result.status!=='unknown' || current.inFlight?.has(record.ticket))continue;
+        const active=tickets.has(record.ticket) || current===primary && parents.has(record.ticket);
+        const recent=now-record.at>=0 && now-record.at<=300000;
+        const last=receiptAttempts.get(record) || 0;
+        if((active || recent || flat) && now-last>=60000)candidates.push({current,record,active:active || recent,last});
+      }
+    }
+    candidates.sort((a,b)=>Number(b.active)-Number(a.active) || a.last-b.last || b.record.at-a.record.at);
+    const next=candidates[0];
+    if(!next)return;
+    const {current,record}=next;
+    receiptRefreshAt=now;
+    receiptAttempts.set(record,now);
+    // Keep receipt recovery off the position read, and do not change the
+    // coordinator's position-view signature to check an unrelated command.
+    receiptRefresh=Promise.resolve().then(()=>current.commandJournal.reconcile(async id=>
+      current.validateCommandReceipt(id,(await current.request(`/receipt?id=${encodeURIComponent(id)}`)).result),{id:record.id}))
+      .catch(()=>{}).finally(()=>{receiptRefresh=null;});
   }
   const warmthTimer = require('timers').setInterval(async () => {
     if (closing || watching || !adapter?.config.enabled) return;
@@ -96,21 +148,27 @@ function initService(api) {
     let connection;
     try {
       connection = api.mt5VPS.getAdapter();
-      const state=await connection.managementState({maxAgeMs:2000});
+      const state=await connection.managementState({maxAgeMs:2000,allowPartial:true});
       acceptManagement(state);
       const primary=state.accountStates?.[String(config.account)];
-      if(!primary?.connected)throw Error(primary?.reason || 'Нет связи с основным счётом');
+      if(!primary)throw Error('Нет состояния основного счёта');
       const copies=followers(config).filter(row=>row.enabled);
-      for(const row of copies)if(!state.accountStates?.[row.account]?.connected)
-        throw Error(state.accountStates?.[row.account]?.reason || 'Нет связи со счётом '+row.account);
+      const accounts=[{account:String(config.account)},...copies].map(({account})=>{
+        const health=state.accountStates?.[account];
+        const status=healthyManagementAccount(health,account,config.server) ? 'ready'
+          : health?.connectionState==='unavailable' ? 'unavailable' : 'checking';
+        return {account,status};
+      });
       connection.lastStatus={connected:true,message:`MT5 VPS · ${config.account}`,at:Date.now(),
-        build:primary.build,clientBuild:require('./buildInfo').readBuildInfo()};
+        accounts,build:primary.build,clientBuild:require('./buildInfo').readBuildInfo()};
       if(connection.capabilities.includes('quote-stream'))connection.ensureQuoteStream();
-      if (copies.length) connection.lastStatus.message += ' · счета '+copies.map(row=>`${row.account} ×${row.multiplier}`).join(', ');
+      const degraded=accounts.filter(row=>row.status!=='ready');
+      if(degraded.length)connection.lastStatus.message+=' · '+degraded.map(row=>`${row.account}: ${row.status==='checking' ? 'проверка' : 'недоступен'}`).join(', ');
+      else if(copies.length)connection.lastStatus.message+=' · счета '+copies.map(row=>`${row.account} ×${row.multiplier}`).join(', ');
       const deadline=require('./timeExit').timeExitConfig(config);
       if (deadline.enabled) connection.lastStatus.message += ` · закрытие ${deadline.time} NY`;
       const risk = api.riskManager?.snapshot?.().config;
-      if (risk?.enabled && risk.providers?.['mt5-vps']?.enabled) await connection.listOpenOrders();
+      if (accounts[0].status==='ready' && risk?.enabled && risk.providers?.['mt5-vps']?.enabled) await connection.listOpenOrders().catch(()=>{});
     } catch (error) { return {connected:false,message:error.message,canRecoverConnection:await tunnelRecovery.available(config)}; }
     return {...connection.lastStatus,canRecoverConnection:await tunnelRecovery.available(config)};
   });
@@ -149,47 +207,84 @@ function initService(api) {
       // Settings need capabilities/account ids, not ticket histories,
       // reconciliation, command journals or a management execution lease.
       return {status:'ok',account:config.account,accounts:[config.account,...primary.remoteAccounts],
-        followers:followers(config),timeExit:require('./timeExit').timeExitConfig(config),capabilities:state.capabilities || health.capabilities || []};
+        followers:followers(config),primaryRisk:primaryRisk(config),
+        timeExit:require('./timeExit').timeExitConfig(config),capabilities:state.capabilities || health.capabilities || []};
     } catch(error){return {status:'rejected',reason:error.message};}
   });
+  ipcMain.handle('mt5-vps:verify-candle-symbol',async(_event,symbol)=>{
+    try {
+      require('../tvListener/candle-mappings').brokerName(symbol);
+      const adapter=api.mt5VPS.getAdapter();
+      const [row]=await adapter.validateCandleSymbols([symbol]);
+      return {status:'ok',symbol:row.name,description:row.description};
+    } catch(error) {return {status:'rejected',reason:error.message};}
+  });
+  async function chartRecorder(payload) {
+    try {
+      const primary=api.mt5VPS.getAdapter();
+      if(!primary.capabilities?.includes('chart-recorder-v1'))throw Error('Требуется обновление приёмника VPS');
+      if(payload!==undefined && (!payload || typeof payload.account!=='string' || !/^[1-9][0-9]{0,19}$/.test(payload.account)
+        || typeof payload.revision!=='string' || !/^[a-f0-9]{32}$/.test(payload.revision)))throw Error('Обнови список терминалов и выбери счёт');
+      const result=await primary.request('/chart-recorder',payload===undefined ? undefined : {account:payload.account,revision:payload.revision});
+      return {status:'ok',chartRecorder:result.chartRecorder};
+    }catch(error){return {status:'rejected',reason:error.message};}
+  }
+  ipcMain.handle('mt5-vps:chart-recorder',()=>chartRecorder());
+  ipcMain.handle('mt5-vps:save-chart-recorder',(_evt,payload)=>payload===undefined
+    ? {status:'rejected',reason:'Выбери счёт MT5'} : chartRecorder(payload));
+  async function tradeHubRoles(payload) {
+    try {
+      const primary=api.mt5VPS.getAdapter();
+      if(!primary.capabilities?.includes('tradehub-roles-v1'))throw Error('Требуется обновление приёмника VPS');
+      if(payload!==undefined && (!payload || !['history','ticks','chart'].includes(payload.role)
+        || typeof payload.account!=='string' || !/^[1-9][0-9]{0,19}$/.test(payload.account)
+        || typeof payload.revision!=='string' || !/^[a-f0-9]{32}$/.test(payload.revision)))throw Error('Обнови список ролей и выбери счёт');
+      const result=await primary.request('/tradehub-roles',payload===undefined ? undefined
+        : {role:payload.role,account:payload.account,revision:payload.revision});
+      return {status:'ok',tradeHubRoles:result.tradeHubRoles};
+    }catch(error){return {status:'rejected',reason:error.message};}
+  }
+  ipcMain.handle('mt5-vps:tradehub-roles',()=>tradeHubRoles());
+  ipcMain.handle('mt5-vps:save-tradehub-role',(_evt,payload)=>payload===undefined
+    ? {status:'rejected',reason:'Выбери роль и счёт MT5'} : tradeHubRoles(payload));
   ipcMain.handle('mt5-vps:orders', async (_evt, account) => {
     try {
       const connection = forAccount(account);
       const primary = api.mt5VPS.getAdapter();
-      const identifiers = connection.commandJournal.records.filter(x=>x.result.status==='unknown').slice(-20).map(x=>x.id);
+      const selected=String(connection.config.account);
       let state;
       try {
-        state=identifiers.length
-          ? await primary.request(`/management?receipts=${encodeURIComponent(identifiers.join(','))}&receiptAccount=${encodeURIComponent(connection.config.account)}`)
-          : await primary.managementState({maxAgeMs:1000});
+        state=await primary.managementState({maxAgeMs:1000,allowPartial:true});
       } catch(error) {
-        // The receiver may yield while its existing native read is finishing.
-        // One UI-only handoff avoids waiting for another 2-second poll.
-        // Network errors and unknown-command receipt reads are never retried.
-        if(identifiers.length || error.code!=='MT5_VIEW_PENDING')throw error;
-        await new Promise(resolve=>setTimeout(resolve,120));
-        state=await primary.managementState({maxAgeMs:0});
+        if(error.code!=='MT5_VIEW_PENDING')throw error;
       }
+      // Allow one handoff for the selected account's pending read only.
+      if(!state || state.accountStates?.[selected]?.evidenceReady===false) {
+        await new Promise(resolve=>setTimeout(resolve,120));
+        try {state=await primary.managementState({maxAgeMs:0,allowPartial:true});}
+        catch(error){if(!state)throw error;}
+      }
+      const remoteAccounts=primary.remoteAccounts || [];
       acceptManagement(state);
-      const health = state.accountStates[String(connection.config.account)];
-      if (!health?.connected) throw Error(health?.reason || 'Нет связи с выбранным счётом');
+      const accountStates=managementDisplayAccounts(state,primary),health=accountStates[selected];
+      const config=readConfig(),copies=followers(config);
+      const accounts=[...new Set([config.account,...copies.map(row=>row.account),...remoteAccounts,
+        ...(primary.remoteAccounts || []),...Object.keys(accountStates)].map(String))];
+      const alerts=state.alerts || [];
+      if (!healthyManagementAccount(health,selected,primary.config.server))
+        return {status:'rejected',account:selected,server:primary.config.server,
+          reason:health?.reason || 'Нет свежих данных выбранного счёта',accounts,accountStates,alerts};
       connection.managementLeaseUntil = Date.now()+10000;
       connection.maintainExecutionWarmth().catch(()=>{});
-      await connection.commandJournal.reconcile(async id => connection.validateCommandReceipt(id,state.receipts[id]));
+      refreshManagementReceipt(primary,connection,accountStates);
       const parentCommands=primary.commandJournal.records.filter(command=>['entry-protection','entry-close','entry-partial-close','entry-take'].includes(command.operation));
-      if(connection!==primary) {
-        const pendingParents=new Set(parentCommands.filter(command=>command.result?.status==='unknown').slice(-20).map(command=>command.id));
-        await primary.commandJournal.reconcile(async id=>pendingParents.has(id)
-          ? primary.validateCommandReceipt(id,(await primary.request(`/receipt?id=${encodeURIComponent(id)}`)).result) : null);
-      }
-      const config = readConfig();
-      const rules=(health.rules || []).map(rule=>({...rule,executionResults:Object.fromEntries(Object.entries(state.accountStates).flatMap(([account,accountState])=>{
+      const rules=(health.rules || []).map(rule=>({...rule,executionResults:Object.fromEntries(Object.entries(accountStates).flatMap(([account,accountState])=>{
         const id=account===String(health.account) ? rule.id : rule.id+':'+account;
         const matched=(accountState.rules || []).find(candidate=>candidate.id===id);
         return matched?.result?.timings ? [[account,matched.result]] : [];
       }))}));
-      return {status:'ok',account:health.account,accounts:[config.account,...primary.remoteAccounts],followers:followers(config),timeExit:require('./timeExit').timeExitConfig(config),timeRules:health.timeRules || [],capabilities:state.capabilities || health.capabilities || [],orders:health.orders,rules,
-        alerts:state.alerts || [],accountStates:state.accountStates,parentTakes:state.parentTakes || [],checkedAt:health.checkedAt,
+      return {status:'ok',account:health.account,accounts,followers:copies,timeExit:require('./timeExit').timeExitConfig(config),timeRules:health.timeRules || [],capabilities:state.capabilities || health.capabilities || [],orders:health.orders,rules,
+        alerts,accountStates,parentTakes:state.parentTakes || [],checkedAt:health.checkedAt,
         commands:[...new Map([...connection.commandJournal.records,...parentCommands].map(command=>[command.id,command])).values()]
           .sort((a,b)=>(b.at || 0)-(a.at || 0)).slice(0,100)};
     } catch (error) { return {status:'rejected',reason:error.message}; }
@@ -211,6 +306,13 @@ function initService(api) {
       return {ok:true,groups:api.levelTrack?.snapshot?.().config.groups || []};
     } catch(error) {return {ok:false,reason:error.message};}
   });
+  function persistFollowers(primary,config,next) {
+    const changed={...config,followers:next,mirrorAccount:Number(next.find(row=>row.enabled)?.account || 0)};
+    if(!settings.writeConfig('mt5-vps',changed))throw Error('Не удалось сохранить настройки');
+    primary.config.followers=next;
+    primary.config.mirrorAccount=changed.mirrorAccount;
+    return {status:'ok',followers:next};
+  }
   ipcMain.handle('mt5-vps:save-followers',async (_evt,rows)=>{
     try {
       if(enrollment.busy)throw Error('Дождись завершения добавления счёта');
@@ -220,11 +322,43 @@ function initService(api) {
       if (!health.capabilities?.includes('scaled-accounts')) throw Error('Обновите приёмник VPS');
       if(next.some(row=>row.enabled && row.riskPercent!=null) && !health.capabilities?.includes('entry-balance-risk-v1'))throw Error('Обновите VPS для риска от баланса');
       if (next.some(row=>!health.linkedAccounts?.includes(row.account))) throw Error('Сначала подключите отдельный терминал и зарегистрируйте счёт на VPS');
-      const changed={...config,followers:next,mirrorAccount:Number(next.find(row=>row.enabled)?.account || 0)};
-      if (!settings.writeConfig('mt5-vps',changed)) throw Error('Не удалось сохранить настройки');
-      primary.config.followers=next; primary.config.mirrorAccount=changed.mirrorAccount;
-      return {status:'ok',followers:next};
+      const current=readConfig();
+      if(enrollment.busy || String(current.account)!==String(config.account)
+        || JSON.stringify(followers(current))!==JSON.stringify(followers(config))) {
+        throw Error('Настройки счетов изменились. Обнови список');
+      }
+      return persistFollowers(primary,current,next);
     } catch (error) {return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('mt5-vps:transfer-copying',async (_evt,request)=>{
+    try {
+      if(enrollment.busy)throw Error('Дождись завершения добавления счёта');
+      const primary=api.mt5VPS.getAdapter();
+      const state=await primary.managementState({maxAgeMs:0});
+      const current=readConfig(),capabilities=state.capabilities || [];
+      if(enrollment.busy || String(primary.config.account)!==String(current.account))throw Error('Настройки счетов изменились. Обнови список');
+      if(!capabilities.includes('scaled-accounts'))throw Error('Обнови приёмник VPS');
+      const next=transferCopying(current,request,Object.keys(state.accountStates));
+      const target=state.accountStates[request.to];
+      if(!target?.connected || target.evidenceReady===false || target.server!==current.server || String(target.account)!==request.to) {
+        throw Error('Нет подтверждённого подключения нового счёта');
+      }
+      if(request.riskPercent!=null && !capabilities.includes('entry-balance-risk-v1'))throw Error('Обнови VPS для риска от баланса');
+      return persistFollowers(primary,current,next);
+    } catch (error) {return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('mt5-vps:save-primary-risk',(_evt,value)=>{
+    try {
+      const primary=api.mt5VPS.getAdapter(),config=readConfig();
+      if (String(value?.account)!==String(config.account) || String(primary.config.account)!==String(config.account))
+        throw Error('Основной счёт изменился. Обнови настройки MT5');
+      const risk=normalizePrimaryRisk(value);
+      const policies={...config.primaryRiskByAccount,[String(config.account)]:risk};
+      if (!settings.writeConfig('mt5-vps',{...config,primaryRiskByAccount:policies}))
+        throw Error('Не удалось сохранить риск основного счёта');
+      primary.config.primaryRiskByAccount=policies;
+      return {status:'ok',primaryRisk:risk};
+    } catch(error) {return {status:'rejected',reason:error.message};}
   });
   ipcMain.handle('mt5-vps:save-time-exit',async (_evt,value)=>{
     try {
@@ -238,7 +372,12 @@ function initService(api) {
         }
         require('./timeExit').deadlineForNewTrade({timeExit});
       }
-      if (!settings.writeConfig('mt5-vps',{...config,timeExit})) throw Error('Не удалось сохранить время закрытия');
+      const current=readConfig();
+      if (timeExit.enabled && (String(current.account)!==String(config.account)
+        || JSON.stringify(followers(current))!==JSON.stringify(followers(config)))) {
+        throw Error('Настройки счетов изменились. Проверь время закрытия ещё раз');
+      }
+      if (!settings.writeConfig('mt5-vps',{...current,timeExit})) throw Error('Не удалось сохранить время закрытия');
       primary.config.timeExit=timeExit;
       return {status:'ok',timeExit};
     } catch(error) {return {status:'rejected',reason:error.message};}

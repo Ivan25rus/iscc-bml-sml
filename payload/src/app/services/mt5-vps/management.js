@@ -5,6 +5,29 @@ const {parentClosePreview}=require('./parentClosePreview');
 const {protectionReceiptView}=require('./protectionReceiptView');
 const {normalizeTarget,matchesTarget}=require('./managementTarget');
 const {managementBlock,decimal,protectionChanges,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock,exactEntryProtectionBlock,exactEntryCloseBlock,protectionView}=require('./managementPolicy');
+function peerProtectionTarget(data,wanted) {
+  const selected=data.accountStates?.[wanted.account],server=data.server || selected?.server;
+  if(!data.accountStates || String(data.account)!==wanted.account || selected?.account!=null && String(selected.account)!==wanted.account
+    || typeof server!=='string' || !server)return null;
+  const accounts=Array.isArray(data.accounts) ? data.accounts.map(String) : Object.keys(data.accountStates);
+  for(const account of accounts) {
+    if(account===wanted.account)continue;
+    const peer=data.accountStates[account],target=normalizeTarget({...wanted,account});
+    if(!target || peer?.connected!==true || peer.evidenceReady===false || peer.server!==server
+      || String(peer.account)!==account || !Array.isArray(peer.orders))continue;
+    if(peer.orders.some(row=>matchesTarget(row,target,account) && Array.isArray(row.entryPlan.accounts) && row.entryPlan.accounts.includes(account)
+      && (row.account==null || String(row.account)===account) && /^[1-9][0-9]{0,19}$/.test(String(row.ticket))
+      && Number.isFinite(row.lots) && row.lots>0))return target;
+  }
+  return null;
+}
+function accountControlDetails(result) {
+  const labels={ok:'подтверждено',rejected:'отклонено',unknown:'ожидает подтверждения'};
+  return Object.entries(result.accountResults || {}).map(([account,outcome])=>{
+    const label=outcome.noPosition===true ? 'нет позиции' : labels[outcome.status] || outcome.status;
+    return `${account}: ${label}${outcome.status!=='ok' && outcome.reason ? ` (${outcome.reason})` : ''}`;
+  }).join(' · ');
+}
 function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=true,priceClose=true}={}) {
   const launch = document.createElement('button');
   launch.id = 'mt5-manage-button';
@@ -24,7 +47,7 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
       else dialog.querySelector('#mt5-refresh').click();
       return;
     }
-    let navigationTarget=pendingTarget;pendingTarget=null;
+    let navigationTarget=pendingTarget,allowPeerTarget=true;pendingTarget=null;
     dialog = document.createElement('dialog');
     dialog.id = 'mt5-management';
     dialog.style.cssText = 'box-sizing:border-box;width:min(520px,94vw);max-width:94vw;min-width:0;max-height:88vh;margin:max(12px,6vh) auto 0;overflow:auto;scrollbar-gutter:stable;overflow-wrap:anywhere;color:var(--text);background:var(--panel,#20242b);border:1px solid var(--border);border-radius:12px;padding:14px;font-size:13px';
@@ -171,6 +194,7 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
     const parentTake=()=>parentTakes.find(rule=>rule.entryId===target()?.entryPlan?.id);
     const dirty=new Set();
     let readPromise=null,breakeven=false,observedAt=0,commandGeneration=0,previousTake='',commandBusy=false,cachedDisplay=false;
+    let nativeObservedAt,lastProtectionReceipt=null;
     const minuteHistory=require('./minuteHistory').createMinuteHistory({load:symbol=>ipc.invoke('mt5-vps:minute-bars',symbol),
       changed:()=>{if(dialog.open)buttons();}});
     function chartHistory(row) {
@@ -298,20 +322,22 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
         minuteHistory:minute.data,historyState:minute,
         enabled:!modify.disabled,blocked:protectionBlocked});
     }
-    function choose(preserve = false) {
+    function choose(preserve = false, keepEditedPrices = false) {
       const row = target(),hybrid=isEntryPlanRow(row);
       if(takeDraftParent!==(row?.entryPlan?.id || '')){takeDraftParent=row?.entryPlan?.id || '';takeDirty=false;}
       if(!takeDirty){const rule=parentTake();takePrice.value=rule?String(rule.targetPrice):'';takePercent.value=String(rule?.closePercent || 50);}
       title.textContent=navigationTarget ? `Стоп и тейк · ${navigationTarget.symbol}` : 'Позиции · MT5';
       select.hidden=!!navigationTarget;
       let protectionRow=row;try{protectionRow=protectionView(row);}catch{protectionRow={};}
-      detail.textContent = row ? (hybrid ? `Набор БМЛ/СМЛ · средняя ${protectionRow.open_price ?? '—'} · часть #${row.ticket}: ${row.lots} лота` : `Вход ${row.open_price} · ${row.lots} лота${row.__isPosition ? ` · P/L ${row.pnl ?? '—'} USD` : ''}`) : 'Открытых позиций и заявок по SPX500/USTEC нет.';
-      selectionSummary.textContent=row ? `${hybrid?'Средняя':'Вход'} ${protectionRow.open_price ?? '—'}` : 'Позиций и заявок нет';
+      const confirmedEmpty=connected && !rows.length && !navigationTarget;
+      detail.textContent = row ? (hybrid ? `Набор БМЛ/СМЛ · средняя ${protectionRow.open_price ?? '—'} · часть #${row.ticket}: ${row.lots} лота` : `Вход ${row.open_price} · ${row.lots} лота${row.__isPosition ? ` · P/L ${row.pnl ?? '—'} USD` : ''}`) : '';
+      selectionSummary.textContent=row ? `${hybrid?'Средняя':'Вход'} ${protectionRow.open_price ?? '—'}`
+        : confirmedEmpty ? 'Позиций и заявок нет' : 'Проверяем позиции и заявки…';
       protection.querySelector('strong').textContent=hybrid?'SL/TP · весь набор':'Стоп и тейк';
       if(!preserve){dirty.clear();breakeven=false;previousTake='';}
       for(const [key,field,value] of [['sl',sl,hybrid && breakeven ? protectionRow?.open_price : protectionRow?.sl],['tp',tp,protectionRow?.tp],['price',price,row?.open_price]]){
         const next=String(value ?? '');
-        if(!dirty.has(key) && (!preserve || document.activeElement!==field) && field.value!==next)field.value=next;
+        if(!keepEditedPrices && !dirty.has(key) && (!preserve || document.activeElement!==field) && field.value!==next)field.value=next;
       }
       const step = Number(row?.quantityStep), lots = Number(row?.lots);
       volume.step = step > 0 ? step : 'any'; volume.min = row?.minQty || '0';
@@ -353,9 +379,12 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
       buttons();
     };
     accounts.onchange = () => {
-      navigationTarget=null;
-      generation++; rows=[]; select.replaceChildren(); choose();
-      refresh.click();
+      const wanted=navigationTarget && {...navigationTarget,account:accounts.value};
+      rows=[];connected=false;cachedDisplay=false;select.replaceChildren();choose();
+      if(wanted){retarget(wanted,false);return;}
+      const requestedGeneration=++generation;
+      status.textContent='Проверяем позиции выбранного счёта…';
+      reload(false,true).catch(error=>{if(generation===requestedGeneration)status.textContent=error.message;});
     };
     function reload(preserveResult=false,supersede=false) {
       if(readPromise && !supersede)return readPromise;
@@ -373,6 +402,24 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
         if(field.options[index]!==option)field.insertBefore(option,field.options[index] || null);
       }
     }
+    function updateAccountDisplay(data) {
+      const selected=String(data.account);
+      accountStates=data.accountStates || {};
+      const listed=Array.isArray(data.accounts) ? data.accounts : [...accounts.options].map(option=>option.value);
+      const known=new Set([...listed,...Object.keys(accountStates),selected].map(String).filter(account=>/^[1-9][0-9]{0,19}$/.test(account)));
+      const options=[...known].map(account=>{
+        const health=accountStates[account];
+        const ready=health ? health.connected===true && health.evidenceReady!==false : data.status==='ok' && account===selected;
+        const suffix=health?.connectionState==='unavailable' ? ' · недоступен'
+          : ready ? '' : ' · проверяем';
+        return {value:account,text:account+suffix};
+      });
+      updateOptions(accounts,options);
+      accounts.value=selected;
+      alerts=data.alerts || [];
+      alertsView.textContent=alerts.map(alert=>`${alert.symbol || (alert.account ? 'Счёт '+alert.account : 'Связанные счета')}: ${alert.reason}`).join(' · ');
+      alertsView.hidden=!alerts.length;
+    }
     async function readState(preserveResult = false) {
       loading=true;
       buttons();
@@ -381,15 +428,42 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
       try {
       const data = await ipc.invoke('mt5-vps:orders',requestedAccount || undefined);
       if (generation!==requestGeneration || accounts.value!==selectedAccount || atCommand!==commandGeneration) return;
+      if(data.account!=null && requestedAccount && String(data.account)!==requestedAccount)throw Error('Получены данные другого счёта MT5');
+      const previous=target();
+      const hasPartialState=data.status==='rejected' && /^[1-9][0-9]{0,19}$/.test(String(data.account))
+        && typeof data.server==='string' && data.server && data.accountStates && !Array.isArray(data.accountStates);
+      if(hasPartialState)updateAccountDisplay(data);
+      const exact=data.status==='ok' && navigationTarget && data.orders.some(row=>matchesTarget(row,navigationTarget,data.account));
+      if(exact)allowPeerTarget=false;
+      else if(navigationTarget && allowPeerTarget && (data.status==='ok' || !previous)) {
+        const peer=peerProtectionTarget(data,navigationTarget);
+        // A peer row locates the parent only. Load the peer's own controls and
+        // receipt barriers before enabling any action on its position.
+        if(peer)return retarget(peer,false);
+      }
+      if(hasPartialState){
+        connected=false;cachedDisplay=!!previous;
+        const health=accountStates[String(data.account)];
+        status.textContent=`Счёт ${data.account} · ${health?.connectionState==='unavailable' ? 'недоступен' : 'проверяем позиции и заявки…'}`;
+        status.title=data.reason || '';
+        if(!previous)choose(true);
+        return;
+      }
       if (data.status !== 'ok') throw Error(data.reason || 'Нет связи с MT5');
-      const selected = select.value, previous=target();
-      rows = data.orders; capabilities = data.capabilities; commands = data.commands; rules=data.rules || []; parentTakes=data.parentTakes || []; timeRules=data.timeRules || [];alerts=data.alerts || [];accountStates=data.accountStates || {};connected=true;cachedDisplay=false;
-      observedAt=Number.isFinite(data.checkedAt)?data.checkedAt:Date.now();
-      alertsView.textContent=alerts.map(alert=>`${alert.symbol || (alert.account ? 'Счёт '+alert.account : 'Связанные счета')}: ${alert.reason}`).join(' · ');
-      alertsView.hidden=!alerts.length;
-      updateOptions(accounts,(data.accounts || [data.account]).map(account=>({value:String(account),text:String(account)})));
-      if(accounts.value!==String(data.account))accounts.value=String(data.account);
+      if(requestedAccount && data.account==null)throw Error('Получены данные другого счёта MT5');
+      const selected = select.value;
+      rows = data.orders; capabilities = data.capabilities; commands = data.commands; rules=data.rules || []; parentTakes=data.parentTakes || []; timeRules=data.timeRules || [];connected=true;cachedDisplay=false;
+      nativeObservedAt=Number.isFinite(data.checkedAt) ? data.checkedAt : undefined;
+      observedAt=nativeObservedAt ?? Date.now();
+      if(lastProtectionReceipt?.context.account===String(data.account)) {
+        // An active view may serve a cached native read even after the save.
+        if(nativeObservedAt<lastProtectionReceipt.checkedAt)
+          rows=protectionReceiptView(rows,lastProtectionReceipt.result,{...lastProtectionReceipt.context,checkedAt:nativeObservedAt});
+        else lastProtectionReceipt=null;
+      }
+      updateAccountDisplay(data);
       status.textContent = `Счёт ${data.account} · проверено ${new Date(data.checkedAt || Date.now()).toLocaleTimeString()} · обновление каждые 2 секунды${capabilities.includes('close') ? '' : ' · приёмник VPS требует обновления'}`;
+      status.title='';
       updateOptions(select,rows.map((row,index)=>({value:String(row.ticket),text:`${row.symbol} · ${row.type.toUpperCase()} · ${row.lots} л.${rows.length>1 || isEntryPlanRow(row)?' · '+(isEntryPlanRow(row)?'часть ':'№')+(index+1):''}`})));
       if(navigationTarget) {
         const exact=rows.find(row=>matchesTarget(row,navigationTarget,data.account));
@@ -415,7 +489,10 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
         && previous.entryPlan?.id===current.entryPlan?.id;
       if (previous && current && !preserve && !preserveResult) showMessage('Объём позиции изменился. Проверь заново параметры закрытия.','Объём изменился');
       choose(preserve);
-      } catch(error){if(generation===requestGeneration)connected=false;throw error;}
+      } catch(error){
+        if(generation!==requestGeneration || atCommand!==commandGeneration)return;
+        connected=false;cachedDisplay=!!target();if(!cachedDisplay)choose(true);throw error;
+      }
       finally {if(generation===requestGeneration){loading=false;buttons();}}
     }
     function renderConditions() {
@@ -473,21 +550,34 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
         if(blocked){showMessage(blocked,'Проверка');return;}
         showMessage('Отправляю команду…');
         submitted=true;
-        const result = await ipc.invoke('mt5-vps:manage',{action,target:{...selected,singleAccount:hybrid && !wholeProtection ? true : !mirror.checked,clickAt},account:accounts.value,...extra});
+        const commandTarget={...selected,singleAccount:hybrid && !wholeProtection ? true : !mirror.checked,clickAt};
+        const result = await ipc.invoke('mt5-vps:manage',{action,target:commandTarget,account:selectedAccount,...extra});
         commandGeneration++;
         if(wholeTake && result.status==='ok' && result.rule){parentTakes=[result.rule,...parentTakes.filter(rule=>rule.id!==result.rule.id)];takeDirty=false;}
-        if(wholeProtection)rows=protectionReceiptView(rows,result,selectedAccount,accountStates[selectedAccount]?.server);
+        const previousRows=rows;
+        if(wholeProtection) {
+          const context={target:commandTarget,account:selectedAccount,server:accountStates[selectedAccount]?.server};
+          rows=protectionReceiptView(rows,result,{...context,checkedAt:nativeObservedAt});
+          if(rows!==previousRows)lastProtectionReceipt={context,result,checkedAt:result.accountResults[selectedAccount].protectionProof.checkedAt};
+        }
         if(result?.id)commands=[{id:result.id,at:clickAt,operation:action,ticket:wholeProtection||wholeClose||wholeTake?`entry:${current.entryPlan.id}`:String(current.ticket),
           payload:{entryId:current.entryPlan?.id},result},...commands.filter(row=>row.id!==result.id)];
-        if(result.status==='ok' && ['modify','entry-protection'].includes(action)){for(const key of Object.keys(extra.changes || {}))dirty.delete(key);breakeven=false;}
+        const savedProtection=result.status==='ok' && (action==='modify' || wholeProtection);
+        if(savedProtection){for(const key of Object.keys(extra.changes || {}))dirty.delete(key);breakeven=false;}
+        const partlyProtected=wholeProtection && result.status!=='ok'
+          && Object.values(result.accountResults || {}).some(outcome=>outcome.status==='ok' && outcome.noPosition!==true);
         const closedPart=action==='entry-partial-close' && result.status==='ok'
           ? 'MT5 подтвердил закрытие части набора. '+Object.entries(result.accountResults || {}).map(([account,value])=>
-            `${account}: закрыто ${Number(value.filledVolume).toLocaleString('ru-RU',{maximumFractionDigits:8})} л. · остаток ${Number(value.remainingVolume).toLocaleString('ru-RU',{maximumFractionDigits:8})} л.`).join(' · ') : '';
-        const resultText=result.status === 'ok' ? (closedPart || (wholeTake ? (extra.take.operation==='arm'?'Частичный тейк сохранён на VPS. SL и обычный TP сохранены.':'Частичный тейк отменён.') : action==='schedule-close' ? 'Условие сохранено на VPS.' : action==='cancel-close' ? 'Условие отменено.' : 'MT5 подтвердил выполнение.')) : `${result.status === 'unknown' ? 'Результат неизвестен. Повтор заблокирован.' : 'Команда отклонена.'} ${result.reason || ''}`;
-        const accountText=result.accountResults ? ' '+Object.entries(result.accountResults).map(([account,value])=>`${account}: ${value.status}`).join(' · ') : '';
-        showMessage(resultText+accountText,result.status==='ok'?'Готово':result.status==='unknown'?'Проверка':'Ошибка');
+            value.noPosition===true ? `${account}: нет позиции`
+              : `${account}: закрыто ${Number(value.filledVolume).toLocaleString('ru-RU',{maximumFractionDigits:8})} л. · остаток ${Number(value.remainingVolume).toLocaleString('ru-RU',{maximumFractionDigits:8})} л.`).join(' · ') : '';
+        const resultText=partlyProtected ? 'MT5 подтвердил изменение защиты на части счетов.'
+          : result.status === 'ok' ? (closedPart || (wholeTake ? (extra.take.operation==='arm'?'Частичный тейк сохранён на VPS. SL и обычный TP сохранены.':'Частичный тейк отменён.') : action==='schedule-close' ? 'Условие сохранено на VPS.' : action==='cancel-close' ? 'Условие отменено.' : 'MT5 подтвердил выполнение.')) : `${result.status === 'unknown' ? 'Результат неизвестен. Повтор заблокирован.' : 'Команда отклонена.'} ${result.reason || ''}`;
+        const accountText=closedPart ? '' : accountControlDetails(result);
+        showMessage([resultText,accountText].filter(Boolean).join(' '),partlyProtected?'Частично подтверждено':result.status==='ok'?'Готово':result.status==='unknown'?'Проверка':'Ошибка');
         speed.textContent=timingLines(result).join('\n');
-        choose(true);
+        // Without fresh prices in the receipt, keep displaying the edited
+        // prices until the post-command read supplies the broker values.
+        choose(true,savedProtection && rows===previousRows);
         const earlierRead=readPromise;
         const refreshAfterCommand=async()=>{
           if(earlierRead)await earlierRead.catch(()=>{});
@@ -530,18 +620,20 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
     schedule.onclick = () => {try{run('schedule-close',{...closeSize(),targetPrice:String(decimal(trigger.value)),comparison:comparison.value});}catch(error){showMessage(error.message,'Ошибка');}};
     refresh.onclick = async () => {
       if(busy)return;
+      const requestedGeneration=generation;
       for(const symbol of chartAttempts)if(!chartReads.has(symbol) && !chartSpecifications.has(symbol))chartAttempts.delete(symbol);
       // A display refresh cannot lock an already captured exact protection intent.
       busy=!(isEntryPlanRow(target()) && capabilities.includes(EXACT_PROTECTION_CAPABILITY));buttons();
-      try{await reload();}catch(error){status.textContent=error.message;}finally{busy=commandBusy;buttons();}
+      try{await reload();}catch(error){if(generation===requestedGeneration)status.textContent=error.message;}
+      finally{if(generation===requestedGeneration){busy=commandBusy;buttons();}}
     };
     const poll=setInterval(() => {
       if (dialog.open && !document.hidden && !busy && !loading) reload().catch(error=>{status.textContent=error.message;});
     },2000);
-    retarget=async wanted=>{
+    retarget=async (wanted,canUsePeer=true)=>{
       if(commandBusy){pendingTarget=wanted;return;}
       showMessage('');speed.textContent='';
-      navigationTarget=wanted;const requestedGeneration=++generation;
+      navigationTarget=wanted;allowPeerTarget=canUsePeer;const requestedGeneration=++generation;
       title.textContent=`Стоп и тейк · ${wanted.symbol}`;
       dirty.clear();breakeven=false;
       const age=Date.now()-observedAt,fresh=connected && age>=-250 && age<=2500;
@@ -550,11 +642,19 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
       const cached=String(accounts.value)===wanted.account && (fresh || capabilities.includes(EXACT_PROTECTION_CAPABILITY))
         ? rows.find(row=>matchesTarget(row,wanted,accounts.value)) : null;
       cachedDisplay=!!cached && !fresh;
-      if(cachedDisplay)connected=false;
+      if(accounts.value!==wanted.account){
+        rows=[];select.replaceChildren();
+        if(![...accounts.options].some(option=>option.value===wanted.account)){
+          const option=document.createElement('option');option.value=option.textContent=wanted.account;accounts.append(option);
+        }
+        accounts.value=wanted.account;
+      }
+      if(!cached || cachedDisplay)connected=false;
+      if(!cached)status.textContent='Проверяем позиции выбранного счёта…';
       select.value=cached?String(cached.ticket):'';choose();
       busy=!cached;buttons();
       try {if(generation!==requestedGeneration)return;await reload(false,true);}
-      catch(error){status.textContent=error.message;}
+      catch(error){if(generation===requestedGeneration)status.textContent=error.message;}
       finally{if(generation===requestedGeneration){busy=commandBusy;buttons();}}
     };
     dialog.addEventListener('cancel',()=>{navigationTarget=null;chart.cancel();});
@@ -568,4 +668,4 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
   };
   launch.onclick=openPanel;
 }
-module.exports = {mountManagement};
+module.exports = {mountManagement,peerProtectionTarget};

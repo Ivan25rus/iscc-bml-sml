@@ -7,9 +7,9 @@ const {roundQtyToStep} = require('./strategy');
 // LT is fixed, so only that mode sizes at the adverse edge of the zone.
 function calculateMarketZoneTradePlan({action, ticker, instrumentType, level, entryPrice,
   maxOffset, zoneMultiplier = 1, entryMode = 'side-zone', maxGap = 2, riskUsd, stopOffsetPts, stopMode = 'entry', takeProfitPts,
-  tickSize, minLot, minQty = minLot, maxQty, maxLot = 0, chunkPercent = 30, lot = 1, orderCalculator} = {}) {
+  tickSize, minLot, minQty = minLot, maxQty, maxLot = 0, chunkPercent = 30, lot = 1, orderCalculator, previewWithoutSize=false} = {}) {
   if (!['MB','MS'].includes(action)) return {ok:false, reason:'Выбери направление рынка'};
-  const values = [level, entryPrice, maxOffset, riskUsd, stopOffsetPts, tickSize, minLot, minQty, maxQty, maxLot, lot];
+  const values = [level, entryPrice, maxOffset, previewWithoutSize ? 1 : riskUsd, stopOffsetPts, tickSize, minLot, minQty, maxQty, maxLot, lot];
   if (values.some(value => value == null || value === '' || !Number.isFinite(Number(value))))
     return {ok:false, reason:'Нет параметров входа или спецификации MT5'};
   const [lt, suppliedCenter, offset, risk, stop, tick, step, minimum, maximum, cap, pointValue] = values.map(Number);
@@ -49,11 +49,18 @@ function calculateMarketZoneTradePlan({action, ticker, instrumentType, level, en
   if (takePrice && direction * (takePrice - worstPrice) <= 0)
     return {ok:false, reason:'Вся зона рынка должна находиться до TP'};
   const stopPts = stopMode === 'entry' ? stop : direction * (worstPrice - stopPrice) / tick;
-  const totalQty = roundQtyToStep(orderCalculator.qty({riskUsd:risk, stopPts, tickSize:tick,
-    lot:pointValue, instrumentType, quantityStep:step}), step);
   const percent = entryMode === 'side-zone' ? Number(chunkPercent) : 100;
   if (!Number.isFinite(percent) || percent <= 0 || percent > 100)
     return {ok:false, reason:'Размер рыночной части: больше 0 и не больше 100%'};
+  const geometry={ok:true, ticker, action, entryMode, orderKind:isBuy ? 'B' : 'S', orderType:'market',
+    ...(entryMode === 'side-zone' ? {executionPolicy:'hybrid-market-limit-v1'} : {}),
+    orderSide:isBuy ? 'buy' : 'sell', level:lt, referencePrice:center, worstPrice,
+    zoneRadius, zoneMultiplier:multiplier, zoneLower, zoneUpper, maxGap:entryMode === 'zone' ? zoneRadius : gap,
+    tickSize:tick, minLot:step, stopOffsetPts:stop, stopMode, stopPrice, stopPts,
+    takeProfitPts:take || null, chunkPercent:percent, priceSource:'manual'};
+  if (previewWithoutSize) return geometry;
+  const totalQty = roundQtyToStep(orderCalculator.qty({riskUsd:risk, stopPts, tickSize:tick,
+    lot:pointValue, instrumentType, quantityStep:step}), step);
   // A tiny risk-sized target may permit just one minimum lot. Do not reject
   // it or round the total upwards; broker minimums can enlarge a tiny part.
   const percentageVolume = Math.max(minimum, roundQtyToStep(totalQty * percent / 100, step));
@@ -65,13 +72,7 @@ function calculateMarketZoneTradePlan({action, ticker, instrumentType, level, en
     return {ok:false, reason:entryMode === 'side-zone'
       ? 'Расчётный объём требует больше 100 частей. Увеличь процент части или Max lot либо уменьши риск'
       : 'Объём требует больше 50 рыночных частей. Увеличь Max lot'};
-  return {ok:true, ticker, action, entryMode, orderKind:isBuy ? 'B' : 'S', orderType:'market',
-    ...(entryMode === 'side-zone' ? {executionPolicy:'hybrid-market-limit-v1'} : {}),
-    orderSide:isBuy ? 'buy' : 'sell', level:lt, referencePrice:center, worstPrice,
-    zoneRadius, zoneMultiplier:multiplier, zoneLower, zoneUpper, maxGap:entryMode === 'zone' ? zoneRadius : gap,
-    riskUsd:risk, tickSize:tick, minLot:step, stopOffsetPts:stop, stopMode,
-    stopPrice, stopPts, takeProfitPts:take || null, totalQty, chunkVolume,
-    chunkPercent:percent, priceSource:'manual'};
+  return {...geometry,riskUsd:risk,totalQty,chunkVolume};
 }
 
 function resolveMarketChunkPercent(config = {}, ticker) {

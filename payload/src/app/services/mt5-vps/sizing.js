@@ -11,6 +11,22 @@ function followers(config) {
     return {account,multiplier,enabled:row.enabled!==false,...(riskPercent===null ? {} : {riskPercent})};
   });
 }
+function transferCopying(config, request, linkedAccounts) {
+  const account=String(config.account),from=String(request?.from),to=String(request?.to);
+  if(String(request?.account)!==account || from===to || [from,to].includes(account)
+    || !linkedAccounts.includes(from) || !linkedAccounts.includes(to)) {
+    throw Error('Выбери два разных дополнительных счёта');
+  }
+  const rows=followers(config),source=rows.find(row=>row.account===from);
+  if(!source?.enabled || rows.some(row=>row.account===to && row.enabled)
+    || source.multiplier!==request.multiplier || (source.riskPercent ?? null)!==(request.riskPercent ?? null)) {
+    throw Error('Настройки копирования изменились. Обнови список и проверь перенос');
+  }
+  const next=rows.filter(row=>row.account!==to).flatMap(row=>row.account===from
+    ? [{...row,enabled:false},{...row,account:to}]
+    : [row]);
+  return followers({...config,followers:next});
+}
 function percentVolume(row, percent) {
   const fraction=Number(percent)/100, lots=Number(row.lots), step=Number(row.quantityStep), minimum=Number(row.minQty);
   if (!Number.isFinite(fraction) || fraction<=0 || fraction>1 || !(step>0 && minimum>0 && lots>0)) throw Error('Неверный процент закрытия');
@@ -44,4 +60,4 @@ function closeVolumes(row, account, linked, mode, value) {
     } catch(error) {return {account:String(target.account),error:error.message};}
   });
 }
-module.exports={followers,percentVolume,closeVolumes};
+module.exports={followers,transferCopying,percentVolume,closeVolumes};

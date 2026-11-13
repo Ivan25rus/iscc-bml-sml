@@ -2,14 +2,18 @@
 // display/target view, and must never move an account back to an older read.
 class ManagementCache {
   constructor() { this.value=null;this.generation=0;this.accounts=new Map(); }
+  isCurrent(account,view) {
+    const old=this.accounts.get(account),epoch=view?.managementEpoch || null;
+    if(!old)return true;
+    if(epoch!==old.epoch)return !old.retired.has(epoch) && (!old.epoch || Boolean(epoch));
+    return !Number.isFinite(view?.checkedAt) || !Number.isFinite(old.view?.checkedAt)
+      || view.checkedAt>=old.view.checkedAt;
+  }
   accept(account,view,generation) {
     const old=this.accounts.get(account),epoch=view?.managementEpoch || null;
     if(old) {
-      if(epoch!==old.epoch) {
-        if(old.retired.has(epoch) || generation<old.generation || old.epoch && !epoch)return old.view;
-      } else if(Number.isFinite(view?.checkedAt) && Number.isFinite(old.view?.checkedAt)) {
-        if(view.checkedAt<old.view.checkedAt)return old.view;
-      } else if(generation<old.generation)return old.view;
+      const orderedByTime=epoch===old.epoch && Number.isFinite(view?.checkedAt) && Number.isFinite(old.view?.checkedAt);
+      if(!this.isCurrent(account,view) || !orderedByTime && generation<old.generation)return old.view;
     }
     const retired=new Set(old?.retired);
     if(old?.epoch && old.epoch!==epoch)retired.add(old.epoch);

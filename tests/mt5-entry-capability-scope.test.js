@@ -1,6 +1,7 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const {MT5VPSAdapter}=require('../payload/src/app/services/mt5-vps/client');
 const {buildEntryRequest}=require('../payload/src/app/services/mt5-vps/chunkEntryClient');
+const {managementFreshness}=require('../payload/src/app/services/mt5-vps/managementFreshness');
 const config={account:'900000002',server:'Example-MT5',spxSymbol:'SPX500',ustecSymbol:'USTEC',timeExit:{enabled:true,time:'15:00'}};
 const native=['chunked-breakout','atomic-entry-admission-v1','independent-account-lanes-v4'];
 const coordinator=[...native,'independent-account-engines-v5','entry-initial-sizing-only-v1','minute-chart-bars-v1','entry-exact-parent-protection-v1','management-active-v1'];
@@ -12,7 +13,8 @@ test('Account settings retain coordinator enrollment and balance risk capabiliti
   const source=fs.readFileSync(require.resolve('../reference/mt5-service-manifest.js.txt'),'utf8');
   const start=source.indexOf("  ipcMain.handle('mt5-vps:trade-settings'"),end=source.indexOf("  ipcMain.handle('mt5-vps:orders'",start);
   let handler;
-  const scope={ipcMain:{handle:(_name,fn)=>handler=fn},api:{mt5VPS:{getAdapter:()=>primary}},readConfig:()=>config,
+  const scope={ipcMain:{handle:(name,fn)=>{if(name==='mt5-vps:trade-settings')handler=fn;}},api:{mt5VPS:{getAdapter:()=>primary}},readConfig:()=>config,
+    primaryRisk:require('../payload/src/app/services/mt5-vps/primaryRisk').primaryRisk,
     acceptManagement(){},followers:()=>[],require:name=>{assert.equal(name,'./timeExit');return {timeExitConfig:()=>({})};}};
   vm.createContext(scope);vm.runInContext(source.slice(start,end),scope);
   const result=await handler();assert.equal(result.status,'ok');
@@ -77,8 +79,9 @@ for(const selected of ['900000002','900000001'])test('Positions UI receives root
   let handler;
   const scope={ipcMain:{handle:(_name,fn)=>handler=fn},forAccount:()=>connection,
     api:{mt5VPS:{getAdapter:()=>primary}},acceptManagement(){},readConfig:()=>config,followers:()=>[],
-    require:name=>{assert.equal(name,'./timeExit');return {timeExitConfig:()=>({})};},Date,Map,setTimeout};
-  vm.createContext(scope);vm.runInContext(source.slice(start,end),scope);
+    require:name=>{assert.equal(name,'./timeExit');return {timeExitConfig:()=>({})};},Date,Map,setTimeout,managementFreshness};
+  const readiness=source.slice(source.indexOf('  function healthyManagementAccount('),source.indexOf('  const warmthTimer'));
+  vm.createContext(scope);vm.runInContext(readiness+source.slice(start,end),scope);
   const value=await handler(null,selected);
   assert.equal(value.status,'ok');assert.equal(String(value.account),selected);
   assert.deepEqual(value.capabilities,coordinator);
@@ -97,5 +100,85 @@ for(const scenario of ['pending','network','unknown-receipt'])test('UI ready han
   const start=source.indexOf("  ipcMain.handle('mt5-vps:orders'"),end=source.indexOf("  ipcMain.handle('mt5-vps:minute-bars'",start);
   const scope={ipcMain:{handle:(_name,fn)=>handler=fn},forAccount:()=>connection,api:{mt5VPS:{getAdapter:()=>primary}},setTimeout};
   vm.createContext(scope);vm.runInContext(source.slice(start,end),scope);
-  const value=await handler(null,'900000002');assert.equal(value.status,'rejected');assert.equal(calls,scenario==='pending'?2:1);
+  const value=await handler(null,'900000002');assert.equal(value.status,'rejected');assert.equal(calls,scenario==='network'?1:2);
+});
+
+test('Positions IPC does not display an older empty account snapshot as flat',async t=>{
+  const primary=adapter(t),follower=adapter(t,{account:'900000001',routePrefix:'/accounts/900000001'});
+  for(const connection of [primary,follower]) {
+    connection.commandJournal={records:[],reconcile:async()=>{}};
+    connection.maintainExecutionWarmth=async()=>{};
+  }
+  const live=management(),selected=live.accountStates['900000002'];
+  selected.managementEpoch='first';
+  selected.orders=[{ticket:'77',__isPosition:true}];
+  live.accountStates['900000001'].orders=[{ticket:'17',__isPosition:true}];
+  live.receipts={};
+  const older=structuredClone(live);
+  older.accountStates['900000002'].checkedAt-=500;
+  older.accountStates['900000002'].orders=[];
+  primary.request=async()=>live;
+  await primary.managementState({maxAgeMs:0});
+
+  const source=fs.readFileSync(require.resolve('../reference/mt5-service-manifest.js.txt'),'utf8');
+  const ipcStart=source.indexOf("  ipcMain.handle('mt5-vps:orders'"),ipcEnd=source.indexOf("  ipcMain.handle('mt5-vps:minute-bars'",ipcStart);
+  const helpers=source.slice(source.indexOf('  function acceptManagement(state) {'),source.indexOf('  const warmthTimer'));
+  let handler;
+  const scope={ipcMain:{handle:(_name,fn)=>handler=fn},forAccount:id=>id==='900000002'?primary:follower,
+    api:{mt5VPS:{getAdapter:()=>primary}},managementFreshness,readConfig:()=>config,followers:()=>[],
+    require:()=>({timeExitConfig:()=>({})}),setTimeout};
+  vm.createContext(scope);vm.runInContext(helpers+source.slice(ipcStart,ipcEnd),scope);
+
+  primary.managementStateAt=0;
+  primary.request=async()=>older;
+  const stale=await handler(null,'900000002');
+  assert.equal(stale.status,'rejected');assert.match(stale.reason,/актуальность/);
+  assert.equal(stale.account,'900000002');assert.equal(stale.server,config.server);assert.equal(stale.accountStates['900000002'].evidenceReady,false);
+  assert.equal(stale.accountStates['900000001'].orders[0].ticket,'17');
+  assert.equal(primary.managementSnapshot.rows[0].ticket,'77');
+  primary.managementStateAt=0;
+  const peer=await handler(null,'900000001');
+  assert.equal(peer.status,'ok');assert.equal(peer.orders[0].ticket,'17');
+  assert.equal(peer.accountStates['900000002'].evidenceReady,false);
+
+  primary.managementStateAt=0;
+  const waiting=structuredClone(live);
+  waiting.accountStates['900000002']={...selected,evidenceReady:false,orders:[],reason:'Native view pending'};
+  let reads=0;
+  primary.request=async()=>{if(++reads===1)return waiting;throw Error('Native view timed out');};
+  const pending=await handler(null,'900000002');
+  assert.equal(reads,2);assert.equal(pending.status,'rejected');assert.equal(pending.account,'900000002');
+  assert.equal(pending.accountStates['900000002'].evidenceReady,false);
+  assert.equal(pending.accountStates['900000001'].orders[0].ticket,'17');
+
+  const receipt={status:'unknown',id:'close-unknown'};
+  primary.commandJournal.records=[{id:receipt.id,result:receipt}];
+  primary.managementStateAt=0;
+  primary.request=async()=>older;
+  let rawReceipt;
+  older.receipts[receipt.id]=receipt;
+  primary.validateCommandReceipt=(_id,value)=>{rawReceipt=value;return null;};
+  primary.commandJournal.reconcile=async read=>read(receipt.id);
+  assert.equal((await handler(null,'900000002')).status,'rejected');
+  assert.equal(rawReceipt,undefined,'An older positions snapshot does not launch receipt recovery');
+
+  primary.commandJournal.records=[];
+  primary.managementStateAt=0;
+  const flat=structuredClone(live);
+  flat.accountStates['900000002'].checkedAt+=1;
+  flat.accountStates['900000002'].orders=[];
+  primary.request=async()=>flat;
+  const current=await handler(null,'900000002');
+  assert.equal(current.status,'ok');assert.deepEqual(current.orders,[]);
+
+  const restarted=structuredClone(live);
+  restarted.accountStates['900000002'].managementEpoch='second';
+  primary.request=async()=>restarted;
+  await primary.managementState({maxAgeMs:-1});
+  primary.commandJournal.records=[{id:receipt.id,result:receipt}];
+  primary.managementStateAt=0;
+  primary.request=async()=>older;
+  assert.equal((await handler(null,'900000002')).status,'rejected');
+  assert.equal(primary.managementNativeState.managementEpoch,'second');
+  assert.equal(primary.managementSnapshot.rows[0].ticket,'77');
 });

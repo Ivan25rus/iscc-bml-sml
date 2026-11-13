@@ -9,10 +9,18 @@ function normalizeTarget(value) {
 function entryTarget(entry) {
   if(!entry || entry.positionLifecycle==='closed' || entry.positionsClosed===true
     || entry.hasOpenPositions===false && entry.positionsConfirmed===true)return null;
-  const filled=Object.entries(entry.accounts || {}).filter(([,row])=>Number.isFinite(row?.filledVolume) && row.filledVolume>0);
-  if(!filled.length)return null;
-  const primary=String(entry.primaryAccount || entry.children?.find(child=>child.result?.primaryAccount)?.result.primaryAccount || '');
-  const account=filled.find(([id])=>id===primary)?.[0] || filled[0][0];
+  const accounts=Object.entries(entry.accounts || {}).filter(([,row])=>row && row.positionsClosed!==true);
+  const primary=String(entry.primaryAccount || entry.primaryRiskSizing?.account
+    || entry.children?.find(child=>child.result?.primaryAccount)?.result.primaryAccount || '');
+  // The receiver includes live positions only for the accounts it could read.
+  // An incomplete peer snapshot does not invalidate an exact live ticket.
+  const livePositions=Array.isArray(entry.livePositions) ? entry.livePositions : [];
+  const liveAccounts=new Set(livePositions.filter(row=>row &&
+    /^[1-9][0-9]{0,19}$/.test(String(row.ticket)) && Number.isFinite(row.volume) && row.volume>0)
+    .map(row=>String(row.account)));
+  const live=accounts.filter(([id])=>liveAccounts.has(id));
+  const candidates=live.length ? live : accounts.filter(([,row])=>Number.isFinite(row.filledVolume) && row.filledVolume>0);
+  const account=candidates.find(([id])=>id===primary)?.[0] || candidates[0]?.[0];
   return normalizeTarget({entryId:entry.id,symbol:entry.symbol,side:entry.side,account});
 }
 function matchesTarget(row,wanted,account) {

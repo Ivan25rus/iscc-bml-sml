@@ -31,6 +31,97 @@ test('market arm accepts lost LT and a reversal, takes play from saved groups an
   assert.equal(f.rules[0].type,'market'); assert.equal(f.rules[0].price,25012);
 });
 
+test('primary balance is read again for each new entry and replaces the card amount',async()=>{
+  const plans=[], balances=[100000,105000];
+  const adapter={config:{account:900000003,server:'Example-MT5',primaryRiskByAccount:{900000003:{mode:'balance',percent:.2}}},
+    async request(route,body) {
+      assert.equal(route,'/health');
+      assert.equal(body,undefined);
+      return {account:900000003,server:'Example-MT5',tradingEnabled:true,accountInfo:{balance:balances.shift(),equity:99000}};
+    },
+    async armChunkEntry(plan){plans.push(plan);return {status:'ok'};}};
+  const f=fixture({getAdapter:()=>adapter});
+  await Promise.all([f.service.arm({...f.payload,riskUsd:13}),f.service.arm({...f.payload,riskUsd:13})]);
+  assert.equal((await f.service.arm({...f.payload,requestId:'second',riskUsd:13})).status,'ok');
+  assert.deepEqual(plans.map(plan=>plan.riskUsd),[200,210]);
+  assert.deepEqual(plans.map(plan=>plan.totalQty),[12.5,13.1]);
+  assert.equal(plans[0].balanceRisk.account,'900000003');
+  assert.equal(plans[0].balanceRisk.balance,100000);
+  assert.equal(balances.length,0);
+});
+
+test('native primary risk arms without a balance HTTP read and keeps the captured constraints',async()=>{
+  const config={account:900000003,server:'Example-MT5',primaryRiskByAccount:{900000003:{mode:'balance',percent:.2}},
+    followers:[{account:'900000004',enabled:true,multiplier:1,riskPercent:.2}],timeExit:{enabled:true,time:'15:59'}};
+  const adapter={config,capabilities:['atomic-entry-admission-v1','entry-primary-balance-risk-v1',
+    'independent-account-engines-v5','entry-initial-sizing-only-v1','entry-balance-risk-v1'],
+    brokerSymbol:s=>s,request:()=>assert.fail('separate balance HTTP request'),
+    armChunkEntry:async plan=>({status:'ok',request:buildEntryRequest(adapter,plan)})};
+  const f=fixture({getAdapter:()=>adapter,getQuantityLimit:()=>100});
+  const result=await f.service.arm({...f.payload,maxLot:.6});
+  assert.equal(result.status,'ok');
+  assert.deepEqual(result.request.primaryRiskRequest,{account:'900000003',percent:.2,quantityStep:.1,minQty:.1,
+    maxQty:10,pointValue:1,maxLot:.6,quantityLimit:100});
+  assert.equal(result.request.riskUsd,undefined);
+  assert.equal(result.request.volume,undefined);
+  assert.ok(result.request.requiredCapabilities.includes('entry-primary-balance-risk-v1'));
+  assert.equal(result.request.mirrorAccounts[0].riskPercent,.2);
+});
+
+test('a click keeps its account, exit and size settings while instrument metadata is pending',async()=>{
+  const adapter=new MT5VPSAdapter({account:'900000003',server:'fixture',ustecSymbol:'USTEC',spxSymbol:'SPX500',
+    followers:[{account:'900000001',enabled:true,multiplier:1}],timeExit:{enabled:true,time:'15:59'},entryRiskLimitUsd:60});
+  adapter.capabilities=['atomic-entry-admission-v1','chunked-breakout','market-zone-entry','market-zone-entry-stop',
+    'market-side-zone-entry','hybrid-market-limit-v1','independent-account-engines-v5','entry-initial-sizing-only-v1','entry-balance-risk-v1'];
+  const posts=[];
+  adapter.request=async(route,request)=>{
+    assert.equal(route,'/entry-plan-admit');posts.push(request);
+    return {admissionContract:'atomic-entry-admission-v1',capabilities:adapter.capabilities,entry:{id:request.id,phase:'armed'}};
+  };
+  let release,defaults={chunkPercent:20};
+  const f=fixture({getAdapter:()=>adapter,getConfig:()=>({defaults}),getSnapshot:()=>new Promise(resolve=>{release=resolve;})});
+  const reply=f.service.arm(f.payload);
+  adapter.config.followers=[{account:'900000004',enabled:true,multiplier:1,riskPercent:.2}];
+  adapter.config.timeExit.time='16:30';adapter.config.entryRiskLimitUsd=5;defaults={chunkPercent:50};
+  release({provider:'mt5-vps',symbol:'USTEC',metadata:{tickSize:.01,quantityStep:.1,minQty:.1,maxQty:10,contractSize:1}});
+  assert.equal((await reply).status,'ok');
+  assert.deepEqual(posts[0].mirrorAccounts,[{account:'900000001',multiplier:1}]);
+  assert.equal(posts[0].closeLocalTime,'15:59');assert.equal(posts[0].chunkPercent,20);assert.equal(posts[0].entryRiskLimitUsd,60);
+  const next=f.service.arm({...f.payload,requestId:'after-switch',riskUsd:4});
+  release({provider:'mt5-vps',symbol:'USTEC',metadata:{tickSize:.01,quantityStep:.1,minQty:.1,maxQty:10,contractSize:1}});
+  assert.equal((await next).status,'ok');
+  assert.deepEqual(posts[1].mirrorAccounts,[{account:'900000004',multiplier:1,riskPercent:.2}]);
+  assert.equal(posts[1].closeLocalTime,'16:30');assert.equal(posts[1].chunkPercent,50);assert.equal(posts[1].entryRiskLimitUsd,5);
+});
+
+test('primary percent cannot use an unconfirmed balance or the card amount as a fallback',async()=>{
+  const config={account:900000003,server:'Example-MT5',primaryRiskByAccount:{900000003:{mode:'balance',percent:.2}}};
+  const valid={account:900000003,server:'Example-MT5',tradingEnabled:true,accountInfo:{balance:100000}};
+  for(const response of [{...valid,account:900000002},{...valid,accountInfo:{equity:100000}},{...valid,tradingEnabled:false}]){
+    const f=fixture({getAdapter:()=>({config,request:async()=>response,armChunkEntry:()=>assert.fail('sent a trade')})});
+    assert.equal((await f.service.arm(f.payload)).status,'rejected');
+  }
+  const f=fixture({getAdapter:()=>({config:{...config,account:900000002},request:()=>assert.fail('read another account'),
+    armChunkEntry:async plan=>{assert.equal(plan.riskUsd,13);return {status:'ok'};}})});
+  assert.equal((await f.service.arm({...f.payload,riskUsd:13})).status,'ok');
+});
+
+test('approved primary credit supports a zero balance without using equity or card risk',async()=>{
+  const config={account:900000004,server:'Example-MT5',primaryRiskByAccount:{900000004:{mode:'balance',percent:.2}}};
+  const accountInfo={balance:0,credit:5000,equity:6100,riskBase:5000,riskIncludesCredit:true};
+  const health={account:900000004,server:'Example-MT5',tradingEnabled:true};
+  const f=fixture({getAdapter:()=>({config,request:async()=>({...health,accountInfo}),
+    armChunkEntry:async plan=>{assert.equal(plan.riskUsd,10);assert.equal(plan.balanceRisk.credit,5000);
+      assert.equal(plan.balanceRisk.balance,0);return {status:'ok'};}})});
+  assert.equal((await f.service.arm(f.payload)).status,'ok');
+  for(const info of [{...accountInfo,riskIncludesCredit:false},{...accountInfo,credit:undefined},
+    {...accountInfo,riskBase:6100}]) {
+    const rejected=fixture({getAdapter:()=>({config,request:async()=>({...health,accountInfo:info}),
+      armChunkEntry:()=>assert.fail('sent an entry with unverified funds')})});
+    assert.equal((await rejected.service.arm(rejected.payload)).status,'rejected');
+  }
+});
+
 test('market admission never accepts forged bands, missing LT, invalid multipliers or missing specifications', async () => {
   for (const overrides of [{getGroups:()=>[]},{validateTrade:()=>({ok:false,reason:'Risk restriction'})},
     {getSnapshot:async()=>({provider:'mt5-vps',symbol:'USTEC',metadata:{}})}]) {

@@ -165,12 +165,13 @@ class HybridProtectionTests(unittest.TestCase):
         for directory in self.directories:
             directory.cleanup()
 
-    def make(self, side='buy', accounts=1):
+    def make(self, side='buy', accounts=1, account_ids=(900000002, 900000001)):
         self.side = side
         directory = tempfile.TemporaryDirectory()
         self.directories.append(directory)
         self.natives, self.bridges, self.paths = [], [], []
-        for account in (900000002, 900000001)[:accounts]:
+        selected = account_ids[:accounts]
+        for account in selected:
             native = ProtectionMT5(self.now, account, side)
             path = pathlib.Path(directory.name) / (str(account) + '.sqlite')
             config = dict(account=account, server='Example-MT5', symbols=['USTEC'], tradingEnabled=True)
@@ -181,8 +182,9 @@ class HybridProtectionTests(unittest.TestCase):
             self.resources.append(bridge)
         self.primary = self.bridges[0]
         self.engine = self.primary.chunk_entries
-        if accounts == 2:
-            self.primary.linked['900000001'] = InProcessWorker(self.primary, self.bridges[1])
+        if accounts > 1:
+            for account, bridge in zip(selected[1:],self.bridges[1:]):
+                self.primary.linked[str(account)] = InProcessWorker(self.primary,bridge)
             self.primary.warm_group_executor()
         due = datetime.datetime(2026, 10, 21, 19, tzinfo=datetime.timezone.utc).timestamp()*1000
         self.payload = dict(id='protection-one', cid='protection-one', symbol='USTEC', side=side,
@@ -192,8 +194,8 @@ class HybridProtectionTests(unittest.TestCase):
             tickSize=.1, stopOffsetPts=160., stopMode='entry', maxGap=6.,
             expiresAt=self.now*1000+3000, closeAtUtc=due, closeTimeZone='America/New_York',
             closeLocalDate='2026-10-21', closeLocalTime='15:00', cancelPendingAtDeadline=True)
-        if accounts == 2:
-            self.payload['mirrorAccounts'] = [dict(account='900000001', multiplier=1.)]
+        if accounts > 1:
+            self.payload['mirrorAccounts'] = [dict(account=str(account),multiplier=1.) for account in selected[1:]]
 
     def state(self):
         return self.engine.get(self.payload['id'])

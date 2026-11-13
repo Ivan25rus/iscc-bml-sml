@@ -1,9 +1,19 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('fs'),os=require('os'),path=require('path');
+const {createHash}=require('crypto');
 const {MT5VPSAdapter}=require('../payload/src/app/services/mt5-vps/client');
 const {CommandJournal}=require('../payload/src/app/services/mt5-vps/commandJournal');
 const {protectionReceiptView}=require('../payload/src/app/services/mt5-vps/protectionReceiptView');
 const {readErrorLabel}=require('../payload/src/app/services/mt5-vps/entryStatus');
+const account='900000002',server='test',peer='900000001';
+const digest=id=>createHash('sha256').update(`${id}:${account}`).digest('hex');
+const receiptContext=target=>({target,account,server});
+function nativeOutcome(id,positions,independent=false) {
+  const localId=independent ? 'account-protection:'+digest(id) : id;
+  return {status:'ok',averagePrice:25000,positions,...(independent ? {controlId:localId} : {}),
+    protectionProof:{schema:'entry-protection-proof-v1',commandId:'parent-protection:'+digest(localId),
+      account,server,symbol:'USTEC',checkedAt:Date.now(),positions}};
+}
 function fixture(t){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'iscc-protection-fast-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const adapter=new MT5VPSAdapter({account:900000002,server:'test',spxSymbol:'SPX500',ustecSymbol:'USTEC'});t.after(()=>adapter.close());
@@ -78,17 +88,45 @@ test('Exact protection policy keeps unresolved command barriers while allowing d
   assert.match(exactEntryProtectionBlock({...options,timeRules:[{ticket:'71',state:'unknown'}]}),/неподтверждённая/);
   assert.notEqual(exactEntryProtectionBlock({...options,row:{...f.row,entryPlan:{...f.row.entryPlan,protectionReady:false}}}),'');
 });
-test('Exact receipt projection edits only proven matching positions and leaves volume and execution status untouched',()=>{
-  const row={ticket:'71',lots:.8,open_price:25000,sl:24984,tp:25102,entryPlan:{id:'parent',accounts:['900000002'],phase:'completed'}};
+test('Exact receipt projection edits only proven matching positions and leaves volume and execution status untouched',t=>{
+  const {row}=fixture(t),context=receiptContext(row);
   const position={ticket:'71',volume:.8,fillPrice:25000,sl:24984,tp:25110};
-  const result={id:'command',entryId:'parent',status:'ok',accountResults:{'900000002':{status:'ok',averagePrice:25000,sl:24984,tp:25110,
-    positions:[position],protectionProof:{schema:'entry-protection-proof-v1',account:'900000002',server:'test',checkedAt:Date.now(),positions:[position]}}}};
-  const original=JSON.stringify(row),updated=protectionReceiptView([row],result,'900000002','test')[0];
+  const result={id:'command',entryId:'parent',status:'ok',accountResults:{[account]:nativeOutcome('command',[position])}};
+  const original=JSON.stringify(row),updated=protectionReceiptView([row],result,context)[0];
   assert.equal(updated.tp,25110);assert.equal(updated.entryPlan.tp,25110);assert.equal(updated.lots,.8);assert.equal(updated.entryPlan.phase,'completed');
   assert.equal(JSON.stringify(row),original);
-  for(const changed of [{status:'unknown'},{entryId:'other'}])assert.equal(protectionReceiptView([row],{...result,...changed},'900000002','test')[0],row);
-  assert.equal(protectionReceiptView([{...row,lots:.4}],result,'900000002','test')[0].tp,25102);
-  assert.equal(protectionReceiptView([row],result,'900000002','wrong-server')[0],row);
+  for(const changed of [{status:'unknown'},{id:'other'},{entryId:'other'}])assert.equal(protectionReceiptView([row],{...result,...changed},context)[0],row);
+  assert.equal(protectionReceiptView([{...row,lots:.4}],result,context)[0].tp,25102);
+  assert.equal(protectionReceiptView([row],result,{...context,server:'wrong-server'})[0],row);
+  assert.equal(protectionReceiptView([row],result,{...context,checkedAt:result.accountResults[account].protectionProof.checkedAt+1})[0],row);
+});
+test('A peer rejection keeps its own outcome while an independent exact selected-account proof updates TP',t=>{
+  const {row}=fixture(t);row.entryPlan.accounts=[account,peer];
+  const id='partial-result',own=nativeOutcome(id,[{ticket:'71',volume:.8,fillPrice:25000,sl:24984,tp:0}],true);
+  const result={id,entryId:'parent',status:'rejected',independentAccountControls:true,
+    accountResults:{[account]:own,[peer]:{status:'rejected',reason:'Previous protection is unconfirmed'}}};
+  const foreign={...row,ticket:'72',entryPlan:{...row.entryPlan,id:'different-parent'}};
+  const pending={...row,ticket:'73',__isPosition:false};
+  const rows=[row,foreign,pending],context=receiptContext(row);
+  const updated=protectionReceiptView(rows,result,context);
+  assert.equal(updated[0].tp,0);assert.equal(updated[0].sl,row.sl);
+  assert.equal(updated[1],foreign);assert.equal(updated[2],pending);
+  assert.equal(result.status,'rejected');assert.equal(result.accountResults[peer].status,'rejected');
+  for(const changed of [{status:'unknown'},{controlId:'other'},{noPosition:true},
+    {protectionProof:{...own.protectionProof,commandId:'other'}},{protectionProof:{...own.protectionProof,symbol:'SPX500'}},
+    {protectionProof:{...own.protectionProof,account:peer}}]) {
+    const different={...result,accountResults:{...result.accountResults,[account]:{...own,...changed}}};
+    assert.equal(protectionReceiptView(rows,different,context),rows);
+  }
+  assert.equal(protectionReceiptView(rows,result,receiptContext({...row,ticket:'999'})),rows);
+});
+test('A single-account save updates its exact position without requiring receipts from unselected peers',t=>{
+  const {row}=fixture(t);row.entryPlan.accounts=[account,peer];
+  const id='selected-only',own=nativeOutcome(id,[{ticket:'71',volume:.8,fillPrice:25000,sl:24990,tp:25102}],true);
+  const result={id,entryId:'parent',status:'ok',independentAccountControls:true,accountResults:{[account]:own}};
+  const context=receiptContext({...row,singleAccount:true}),rows=[row];
+  assert.equal(protectionReceiptView(rows,result,context)[0].sl,24990);
+  assert.equal(protectionReceiptView(rows,{...result,accountResults:{...result.accountResults,[peer]:{status:'ok'}}},context),rows);
 });
 test('A confirmed control and a later read warning remain distinct; an uncertain new command retains its warning',()=>{
   const entry={id:'parent',phase:'completed',_readError:'Нет свежего статуса VPS',_lastConfirmedControl:{entryId:'parent',operation:'entry-protection',status:'ok'}};
@@ -99,10 +137,9 @@ test('A confirmed control and a later read warning remain distinct; an uncertain
 for(const edited of ['sl','tp'])test(`A ${edited}-only native receipt retains both confirmed parent prices for the next explicit save`,async t=>{
   const f=fixture(t),sl=edited==='sl'?24990:24984,tp=edited==='tp'?25110:25102;
   const position={ticket:'71',volume:.8,fillPrice:25000,sl,tp};
-  const outcome={status:'ok',averagePrice:25000,[edited]:edited==='sl'?sl:tp,positions:[position],
-    protectionProof:{schema:'entry-protection-proof-v1',account:'900000002',server:'test',checkedAt:Date.now(),positions:[position]}};
-  const result={id:'confirmed-first-save',entryId:'parent',status:'ok',accountResults:{'900000002':outcome}};
-  const row=protectionReceiptView([f.row],result,'900000002','test')[0];
+  const id='confirmed-first-save',outcome={...nativeOutcome(id,[position]),[edited]:edited==='sl'?sl:tp};
+  const result={id,entryId:'parent',status:'ok',accountResults:{[account]:outcome}};
+  const row=protectionReceiptView([f.row],result,receiptContext(f.row))[0];
   assert.equal(row.entryPlan.sl,sl);assert.equal(row.entryPlan.tp,tp);
   assert.equal(require('../payload/src/app/services/mt5-vps/managementPolicy').entryPlanMetadata(row).id,'parent');
   const next=await f.adapter.modifyEntryProtection(row,edited==='sl'?{tp:25120}:{sl:24995});
@@ -111,13 +148,12 @@ for(const edited of ['sl','tp'])test(`A ${edited}-only native receipt retains bo
 });
 test('Native protection projection accepts a removed take and refuses a mixed or missing parent proof',t=>{
   const f=fixture(t),position={ticket:'71',volume:.8,fillPrice:25000,sl:24990,tp:0};
-  const outcome={status:'ok',averagePrice:25000,sl:24990,positions:[position],
-    protectionProof:{schema:'entry-protection-proof-v1',account:'900000002',server:'test',checkedAt:Date.now(),positions:[position]}};
-  const result={id:'confirmed',entryId:'parent',status:'ok',accountResults:{'900000002':outcome}};
-  assert.equal(protectionReceiptView([f.row],result,'900000002','test')[0].entryPlan.tp,0);
+  const id='confirmed',outcome={...nativeOutcome(id,[position]),sl:24990};
+  const result={id,entryId:'parent',status:'ok',accountResults:{[account]:outcome}};
+  assert.equal(protectionReceiptView([f.row],result,receiptContext(f.row))[0].entryPlan.tp,0);
   for(const positions of [[{...position,tp:undefined}],[position,{...position,ticket:'72',tp:25102}]]){
     const changed={...result,accountResults:{'900000002':{...outcome,positions,protectionProof:{...outcome.protectionProof,positions}}}};
-    assert.equal(protectionReceiptView([f.row],changed,'900000002','test')[0],f.row);
+    assert.equal(protectionReceiptView([f.row],changed,receiptContext(f.row))[0],f.row);
   }
 });
 test('Identical exact watched reads share in-flight work; a different ticket and a later request require fresh work',async t=>{

@@ -25,7 +25,8 @@ test('Hybrid protection and complete close use the primary coordinator even when
     '../brokerage/brokerageAdapters':{},timers:{setInterval:()=>({unref(){}}),clearInterval(){}}
   };
   const file=path.resolve(__dirname,'../reference/mt5-service-manifest.js.txt');
-  vm.runInNewContext(fs.readFileSync(file,'utf8'),{module,__dirname:path.dirname(file),require:name=>name in stubs?stubs[name]:require(name)},{filename:file});
+  const load=require('node:module').createRequire(require.resolve('../payload/src/app/services/mt5-vps/client'));
+  vm.runInNewContext(fs.readFileSync(file,'utf8'),{module,__dirname:path.dirname(file),require:name=>name in stubs?stubs[name]:load(name)},{filename:file});
   const api={};module.exports.initService(api);
   const target={ticket:'71',symbol:'USTEC',__isPosition:true,singleAccount:true,entryPlan:{id:'parent-a'},clickAt:123};
   const manage=handlers['mt5-vps:manage'];

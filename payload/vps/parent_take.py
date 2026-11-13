@@ -88,9 +88,13 @@ class ParentTakeRules:
                 if any(r['entryId']==entry_id and any(s['state'] in ('armed','firing','unknown') for s in r['accounts'].values()) for r in self.list()):
                     raise ValueError('Cancel or reconcile the existing partial take before arming a new one')
                 if parent.get('protectionPending') or parent.get('closurePending'):raise ValueError('Parent control is unresolved')
-                # These checks never send a close. All captured accounts must
-                # confirm the price, owned lots and a valid rounded allocation.
+                # Preserve the captured account set in the receipt. A proven
+                # admission refusal leaves no position this rule can close.
+                accounts={}
                 for account in parent['accounts']:
+                    if self.entries.account_was_not_admitted(parent,account):
+                        accounts[account]=dict(state='cancelled',reason='Account was not admitted to this parent')
+                        continue
                     engine=self.entries.shards.get(account);local=engine._load(entry_id) if engine else None
                     if not local:raise ValueError('Account parent is not admitted: '+account)
                     if local[2].get('closurePending') or local[2].get('protectionPending') or local[2]['phase']=='unknown':
@@ -110,9 +114,11 @@ class ParentTakeRules:
                             raise ValueError('Partial take must precede the ordinary TP on '+account)
                         if row['sl'] and (price<=row['sl'] if buy else price>=row['sl']):
                             raise ValueError('Partial take must stay beyond the stop on '+account)
+                    accounts[account]=dict(state='armed')
+                if not any(state['state']=='armed' for state in accounts.values()):
+                    raise ValueError('No owned parent positions eligible for a partial take')
                 rule=dict(id=identifier,entryId=entry_id,symbol=payload['symbol'],side=payload['side'],
-                    targetPrice=price,closePercent=percent,createdAt=time.time()*1000,
-                    accounts={account:dict(state='armed') for account in parent['accounts']})
+                    targetPrice=price,closePercent=percent,createdAt=time.time()*1000,accounts=accounts)
             result=dict(id=identifier,entryId=entry_id,status='ok',operation=operation,rule=copy.deepcopy(rule))
             self.entries._expiry(command)
             with self.storage.lock:

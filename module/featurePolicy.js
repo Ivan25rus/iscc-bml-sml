@@ -17,7 +17,7 @@ function createFeaturePolicy(features){
         Number(payload.volume)===Number(payload.target?.lots));
       return has('management');
     }
-    if(['mt5-vps:save-followers','mt5-vps:account-discovery','mt5-vps:account-catalog','mt5-vps:account-register'].includes(channel))return has('accounts');
+    if(['mt5-vps:save-followers','mt5-vps:transfer-copying','mt5-vps:account-discovery','mt5-vps:account-catalog','mt5-vps:account-register'].includes(channel))return has('accounts');
     if(channel==='mt5-vps:save-time-exit')return has('time-exit');
     return true;
   }

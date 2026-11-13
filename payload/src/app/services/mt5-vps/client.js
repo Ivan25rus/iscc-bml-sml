@@ -10,9 +10,14 @@ const {ENTRY_PROTECTION_CAPABILITY,ACCOUNT_CONTROL_CAPABILITY,independentControl
 const { ExecutionAdapter } = require('../brokerage/comps/base');
 const {EXACT_CLOSE_CAPABILITY,EXACT_PROTECTION_CAPABILITY,PARENT_PARTIAL_CAPABILITY,accountIds,controlEntry}=require('./entryControlState');
 const {createQuoteFrameReader}=require('./quoteFrameReader');
+const {isIndependentEntryControl}=require('./commandJournal');
 
 const INDEX_SYMBOLS = new Set(['SPX', 'SPX500', 'USTEC']);
+const MAX_QUOTE_CAPTURE_AGE_MS = 1500;
 function isIndex(symbol) { return INDEX_SYMBOLS.has(String(symbol || '').toUpperCase().split(':').pop()); }
+function validBidAsk(quote) {
+  return Number.isFinite(quote?.bid) && quote.bid > 0 && Number.isFinite(quote.ask) && quote.ask >= quote.bid;
+}
 
 function entryCloseContext(state,entry,symbol,config) {
   const parent=state.entryPlans?.find(row=>row.id===entry.id);
@@ -48,6 +53,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     this.streamRequest = null;
     this.streamTimer = null;
     this.streamFailures = 0;
+    this.streamSnapshotRetryUsed = false;
     this.streamDiagnostics = {attempts:0,frames:0,discardedFrames:0,disconnects:0,lastFrameAt:null,maxGapMs:0};
     this.quoteContinuity=require('./quoteContinuity').createQuoteContinuity();
     this.agents = null;
@@ -130,8 +136,9 @@ class MT5VPSAdapter extends ExecutionAdapter {
     return this.candleSnapshotInflight.get(name);
   }
   request(route, payload, {execution = false, enrollment = false, readTimeoutMs} = {}) {
-    if(readTimeoutMs!==undefined && (payload || !Number.isInteger(readTimeoutMs) || readTimeoutMs<2500 || readTimeoutMs>15000 || !['/health','/management','/diagnostics','/entry-events','/minute-bars'].includes(route.split('?')[0])))
-      return Promise.reject(Error('Extended diagnostic timeout is restricted to read-only health/management/diagnostics'));
+    if(readTimeoutMs!==undefined && (payload || !Number.isInteger(readTimeoutMs) || readTimeoutMs<2500 || readTimeoutMs>15000
+      || !['/health','/management','/diagnostics','/entry-events','/entry-plans','/entry-plan','/entry-plan-stop','/minute-bars'].includes(route.split('?')[0])))
+      return Promise.reject(Error('Extended timeout is restricted to read-only requests'));
     const cfg = this.config;
     if (!cfg.enabled || !cfg.endpoint || !cfg.token || !cfg.caFile || !cfg.account || !cfg.server) return Promise.reject(Error('Подключение MT5 VPS не настроено'));
     let url;
@@ -148,6 +155,11 @@ class MT5VPSAdapter extends ExecutionAdapter {
     };
     const body = payload ? Buffer.from(JSON.stringify(payload)) : null;
     let agent=execution ? this.agents.execution : this.agents.commands;
+    if(!execution && ['/candle-levels','/chart-recorder','/tradehub-roles'].includes(pathname)){
+      // Trading and its preparation never queue behind line synchronization.
+      this.agents.levelSync ||= new https.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:1,...tls});
+      agent=this.agents.levelSync;
+    }
     if(!body && pathname==='/minute-bars'){
       this.agents.chartHistory ||= new https.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:1,scheduling:'fifo',...tls});
       agent=this.agents.chartHistory;
@@ -170,22 +182,37 @@ class MT5VPSAdapter extends ExecutionAdapter {
     }
     const started = Date.now(), startedPerf = performance.now();
     const timing = {startedAt:started};
+    const entryArm=execution && body && ['/entry-plan','/entry-plan-admit'].includes(pathname);
     return new Promise((resolve, reject) => {
-      let deadline,readTimer,request,readFinished=false;
+      let deadline,readTimer,request,readFinished=false,writeStarted=false;
       const traceRead=!body && ['/health','/management','/snapshot','/orders','/diagnostics','/minute-bars'].includes(pathname);
-      const readDetail=()=>({account:String(cfg.account),route:pathname,startedAt:started,elapsedMs:Number((performance.now()-startedPerf).toFixed(2))});
-      const finishRead=ok=>{
+      const managementView=pathname==='/management' ? {
+        view:url.searchParams.get('view')==='active' ? 'active' : 'full',
+        watch:url.searchParams.has('watch'),receipts:url.searchParams.has('receipts')
+      } : {};
+      const readDetail=()=>({account:String(cfg.account),route:pathname,...managementView,startedAt:started,
+        elapsedMs:Number((performance.now()-startedPerf).toFixed(2)),reusedSocket:timing.reusedSocket,
+        firstByteMs:timing.firstByteMs});
+      const finishRead=(ok,failure)=>{
         if(readFinished)return;readFinished=true;clearTimeout(deadline);clearTimeout(readTimer);
-        if(traceRead && (!ok || performance.now()-startedPerf>=750))this.recordQuoteStream('read-complete',ok ? 'slow-read' : 'failed-read',{...readDetail(),ok});
+        if(traceRead && (!ok || performance.now()-startedPerf>=750))this.recordQuoteStream('read-complete',ok ? 'slow-read' : 'failed-read',
+          {...readDetail(),ok,...(!ok ? {failure} : {})});
       };
-      const fail=error=>{
+      const fail=(error,failure)=>{
         if(readFinished)return;
-        finishRead(false);
+        finishRead(false,failure || (/^[A-Z_0-9]{1,40}$/.test(error.code || '') ? error.code : 'response'));
         if(pathname!=='/minute-bars' || body)this.lastStatus={connected:false,message:error.message,at:Date.now()};
         // A broken reply settles once. The caller retains any uncertain trade
         // result; neither transport cleanup nor status polling resends it.
         if(request && !request.destroyed)request.destroy(error);
+        if(entryArm && !writeStarted)error.entryArmNotSent=true;
         reject(error);
+      };
+      const writeRequest=()=>{
+        if(readFinished || writeStarted)return;
+        writeStarted=true;
+        if(body)request.write(body);
+        request.end();
       };
       request = https.request(url, {
         method: body ? 'POST' : 'GET', ...tls, agent,
@@ -193,8 +220,8 @@ class MT5VPSAdapter extends ExecutionAdapter {
       }, response => {
         timing.firstByteMs=Number((performance.now()-startedPerf).toFixed(2));
         response.on('error',fail);
-        response.on('aborted',()=>fail(Error('MT5 VPS: ответ соединения прерван')));
-        response.on('close',()=>{if(!response.complete)fail(Error('MT5 VPS: ответ соединения прерван'));});
+        response.on('aborted',()=>fail(Error('MT5 VPS: ответ соединения прерван'),'response-aborted'));
+        response.on('close',()=>{if(!response.complete)fail(Error('MT5 VPS: ответ соединения прерван'),'response-aborted');});
         const encoding=(response.headers?.['content-encoding'] || 'identity').toLowerCase();
         if(encoding!=='identity' && (body || encoding!=='gzip')){response.resume?.();fail(Error('Неподдерживаемое сжатие ответа MT5'));return;}
         // Full bounded entry journals can exceed 1 MiB. Only reads receive the
@@ -206,9 +233,19 @@ class MT5VPSAdapter extends ExecutionAdapter {
           if(readFinished)return;
           try {
             const result = JSON.parse(data);
-            if (response.statusCode !== 200) throw Error(result.error || `MT5 VPS: ${response.statusCode}`);
-            if (Number(result.account) !== Number(cfg.account) || result.server !== cfg.server) throw Error('MT5 VPS: другой счёт или сервер');
+            if (response.statusCode !== 200) {
+              fail(Error(result.error || `MT5 VPS: ${response.statusCode}`),`http-${response.statusCode}`);
+              return;
+            }
+            if (Number(result.account) !== Number(cfg.account) || result.server !== cfg.server) {
+              fail(Error('MT5 VPS: другой счёт или сервер'),'account-identity');
+              return;
+            }
             if (Array.isArray(result.capabilities)) { this.capabilities = result.capabilities; this.capabilitiesAt = Date.now(); }
+            if (!cfg.routePrefix && ['/health','/management'].includes(pathname) && Array.isArray(result.linkedAccounts)
+                && result.linkedAccounts.every(account=>/^[1-9][0-9]{0,19}$/.test(String(account)))) {
+              this.remoteAccounts=result.linkedAccounts.map(String);
+            }
             this.lastStatus = { connected: true, message: `MT5 VPS · ${result.account} · ${Date.now()-started} мс${result.tradingEnabled === false ? ' · только чтение' : ''}`, at:Date.now() };
             timing.totalMs = Number((performance.now()-startedPerf).toFixed(2));
             Object.defineProperty(result,'transportTiming',{value:timing,enumerable:false});
@@ -225,16 +262,26 @@ class MT5VPSAdapter extends ExecutionAdapter {
       request.on('socket',socket => {
         timing.socketWaitMs = Number((performance.now()-startedPerf).toFixed(2));
         timing.reusedSocket = request.reusedSocket;
-        if (!request.reusedSocket) socket.once('secureConnect',() => { timing.tlsReadyMs = Number((performance.now()-startedPerf).toFixed(2)); });
+        // An agent can hand an already authorized socket directly to a
+        // queued request without setting ClientRequest.reusedSocket.
+        if (socket.authorized===true) {
+          if(entryArm)writeRequest();
+        } else {
+          socket.once('secureConnect',() => {
+            timing.tlsReadyMs = Number((performance.now()-startedPerf).toFixed(2));
+            // Before this point a new connection has not written any part
+            // of the opening request, so failure is a definitive non-send.
+            if(entryArm)writeRequest();
+          });
+        }
       });
       request.on('finish',() => { timing.sentAt = Date.now(); timing.writeMs = Number((performance.now()-startedPerf).toFixed(2)); });
       // Waiting longer for an execution reply never renews or resends its command.
       const enrollmentWait=enrollment && ['/account-discovery','/account-register'].includes(pathname) && body;
-      deadline = setTimeout(() => fail(Error('MT5 VPS: время ожидания истекло')),enrollmentWait ? 15000 : execution && body ? 5000 : readTimeoutMs ?? 2500);
+      deadline = setTimeout(() => fail(Error('MT5 VPS: время ожидания истекло'),'deadline'),enrollmentWait ? 15000 : execution && body ? 5000 : readTimeoutMs ?? 2500);
       if(traceRead){readTimer=setTimeout(()=>this.recordQuoteStream('read-pending','slow-read',readDetail()),750);readTimer.unref?.();}
       request.on('error', fail);
-      if (body) request.write(body);
-      request.end();
+      if(!entryArm)writeRequest();
     });
   }
   acceptQuoteFrame(frame, {discardStale = false} = {}) {
@@ -243,21 +290,36 @@ class MT5VPSAdapter extends ExecutionAdapter {
     const allowed = new Set([cfg.spxSymbol,cfg.ustecSymbol]);
     const entries = Object.entries(frame.snapshots || {});
     if (!entries.length) throw Error('MT5 VPS: пустой поток котировок');
-    require('./entryIntentClock').rememberServerClock(this,frame.capturedAt);
+    const unavailable=frame.unavailableSymbols===undefined ? [] : frame.unavailableSymbols;
+    if(!Array.isArray(unavailable) || unavailable.length>allowed.size || new Set(unavailable).size!==unavailable.length
+      || unavailable.some(symbol=>!allowed.has(symbol) || Object.hasOwn(frame.snapshots,symbol)))
+      throw Error('MT5 VPS: некорректный список недоступных котировок');
     for (const [symbol, data] of entries) {
       if (!allowed.has(symbol) || Number(data.account) !== Number(cfg.account) || data.server !== cfg.server
-          || !Number.isFinite(data.quote?.bid) || data.quote.bid <= 0 || !Number.isFinite(data.quote?.ask) || data.quote.ask < data.quote.bid) {
+          || !validBidAsk(data.quote)) {
         throw Error('MT5 VPS: некорректная котировка');
       }
     }
     const at = Date.now();
     // A queued old frame is never a usable quote. Keep reading the same
     // authenticated stream so a fresh frame behind it can restore prices.
-    if (!Number.isFinite(frame.capturedAt) || Math.abs(at-frame.capturedAt) > 1500) {
-      if (discardStale && Number.isFinite(frame.capturedAt) && at-frame.capturedAt > 1500) return false;
+    if (!Number.isFinite(frame.capturedAt) || Math.abs(at-frame.capturedAt) > MAX_QUOTE_CAPTURE_AGE_MS) {
+      if (discardStale && Number.isFinite(frame.capturedAt) && at-frame.capturedAt > MAX_QUOTE_CAPTURE_AGE_MS) return false;
       throw Error('MT5 VPS: поток котировок устарел');
     }
+    require('./entryIntentClock').rememberServerClock(this,frame.capturedAt);
+    if(unavailable.length) {
+      this.unavailableQuotes ||= new Set();
+      const changed=[];
+      for(const symbol of unavailable) {
+        this.snapshots.delete(symbol);
+        if(!this.unavailableQuotes.has(symbol))changed.push(symbol);
+        this.unavailableQuotes.add(symbol);
+      }
+      if(changed.length)this.eventBus.emit('quote:stale',changed);
+    }
     for (const [symbol, data] of entries) {
+      this.unavailableQuotes?.delete(symbol);
       this.snapshots.set(symbol,{data,at});
       this.eventBus.emit('quote:updated',{symbol,quote:data.quote,metadata:data.metadata,at});
     }
@@ -333,6 +395,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
                 this.streamDiagnostics.lastFrameAt=now;
                 this.streamDiagnostics.frames++;
                 this.streamFailures=0;
+                this.streamSnapshotRetryUsed=false;
                 if (!accepted || discarding || gap>=1000) this.recordQuoteStream('receiving',discarding ? 'backlog-recovered' : !accepted ? 'first-frame' : 'gap-recovered',timing);
                 accepted=true;discarding=false;
         },error=>fail('invalid-frame',error));
@@ -353,6 +416,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
         this.streamRequest = null;
         const hadQuotes = this.snapshots.size > 0;
         this.snapshots.clear();
+        this.unavailableQuotes?.clear();
         if (hadQuotes) this.eventBus.emit('quote:stale');
         if (!this.closed) {
           this.streamDiagnostics.disconnects++;
@@ -413,9 +477,14 @@ class MT5VPSAdapter extends ExecutionAdapter {
     this.protectionDispatchState={...identity(state),accountStates:Object.fromEntries(
       Object.entries(state.accountStates || {}).map(([account,view])=>[account,identity(view)]))};
   }
-  cacheManagementResponse(raw,generation) {
+  cacheManagementResponse(raw,generation,{allowPartial=false}={}) {
     const state=managementFreshness(raw,Date.now());
-    this.validateManagementState(state.accountStates?.[String(this.config.account)] || state,state);
+    const own=state.accountStates?.[String(this.config.account)] || state;
+    // The authenticated coordinator can return useful peer evidence while
+    // the primary is checking. Do not promote that reply to the trade cache.
+    if(allowPartial && own?.evidenceReady===false && String(own.account)===String(this.config.account)
+      && own.server===this.config.server)return state;
+    this.validateManagementState(own,state);
     this.managementCache ||= new (require('./managementCache').ManagementCache)();
     const selected=this.managementCache.commit(raw,generation);
     const current=managementFreshness(selected,Date.now());
@@ -442,7 +511,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     this.executionWarmAttemptAt = Date.now();
     await this.warmExecutionConnection();
   }
-  async managementState({maxAgeMs=5000,watch}={}) {
+  async managementState({maxAgeMs=5000,watch,allowPartial=false,readTimeoutMs}={}) {
     // Ticket histories are requested only for the captured opening group.
     // They must never be satisfied by an ordinary cached management snapshot.
     if (watch?.length) {
@@ -450,7 +519,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
       this.managementWatchedReads ||= new Map();
       if(this.managementWatchedReads.has(key))return this.managementWatchedReads.get(key);
       const generation=this.managementRequestGeneration=(this.managementRequestGeneration || 0)+1;
-      const pending=this.request(this.managementRoute(watch)).then(raw=>this.cacheManagementResponse(raw,generation))
+      const pending=this.request(this.managementRoute(watch),undefined,{readTimeoutMs}).then(raw=>this.cacheManagementResponse(raw,generation))
         .finally(()=>{if(this.managementWatchedReads.get(key)===pending)this.managementWatchedReads.delete(key);});
       this.managementWatchedReads.set(key,pending);
       return pending;
@@ -459,10 +528,12 @@ class MT5VPSAdapter extends ExecutionAdapter {
     if (this.managementStateView && age>=0 && age<=maxAgeMs) return managementFreshness(this.managementStateView,this.managementStateAt);
     if (!this.managementReading) this.managementReading=(async()=>{
       const generation=this.managementRequestGeneration=(this.managementRequestGeneration || 0)+1;
-      const raw=await this.request(this.managementRoute());
-      return this.cacheManagementResponse(raw,generation);
+      const raw=await this.request(this.managementRoute(),undefined,{readTimeoutMs});
+      return this.cacheManagementResponse(raw,generation,{allowPartial:true});
     })().finally(()=>{this.managementReading=null;});
-    return this.managementReading;
+    const state=await this.managementReading;
+    if(!allowPartial)this.validateManagementState(state.accountStates?.[String(this.config.account)] || state,state);
+    return state;
   }
   managementRoute(watch) {
     const query=[];
@@ -477,7 +548,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     const age=Date.now()-Number(this.managementSnapshot?.at || 0);
     const interested=this.managementHasPositions || Date.now()<this.managementLeaseUntil;
     if (this.closed || (age>=0 && age<(interested ? 2000 : 10000))) return null;
-    return this.managementState({maxAgeMs:0});
+    return this.managementState({maxAgeMs:-1,allowPartial:!this.config.routePrefix});
   }
   async managementOrders() {
     const age=Date.now()-Number(this.managementSnapshot?.at || 0);
@@ -534,10 +605,33 @@ class MT5VPSAdapter extends ExecutionAdapter {
     if (cached && Date.now()-cached.at < 500) return cached.data;
     if (!this.snapshotInflight.has(brokerSymbol)) {
       const task = this.request(`/snapshot?symbol=${encodeURIComponent(brokerSymbol)}`)
+        .then(data => {
+          this.retryQuoteStreamOnSnapshot(brokerSymbol, data);
+          return data;
+        })
         .finally(() => this.snapshotInflight.delete(brokerSymbol));
       this.snapshotInflight.set(brokerSymbol,task);
     }
     return this.snapshotInflight.get(brokerSymbol);
+  }
+  retryQuoteStreamOnSnapshot(symbol, data) {
+    if (this.closed || this.config.routePrefix || this.streamRequest || !this.streamTimer || this.streamSnapshotRetryUsed) return;
+    if (Number(data?.account) !== Number(this.config.account) || data.server !== this.config.server
+        || data.symbol !== symbol || !validBidAsk(data.quote)) return;
+    const {nativeCapturedAt, nativeAgeMs} = data.quote;
+    if (!Number.isFinite(nativeCapturedAt) || !Number.isFinite(nativeAgeMs)) return;
+    const captureAgeMs = Date.now() - nativeCapturedAt;
+    // Match the VPS native quote freshness range and allow for time in transit.
+    if (Math.abs(captureAgeMs) > MAX_QUOTE_CAPTURE_AGE_MS || nativeAgeMs < -250 || nativeAgeMs > 1000
+        || Math.max(0, captureAgeMs) + nativeAgeMs > MAX_QUOTE_CAPTURE_AGE_MS) return;
+
+    // One early attempt per outage. A successful GET can coexist with a failed
+    // stream endpoint, so later reads keep the normal backoff until a live frame.
+    this.streamSnapshotRetryUsed = true;
+    clearTimeout(this.streamTimer);
+    this.streamTimer = null;
+    this.ensureQuoteStream();
+    this.recordQuoteStream('reconnecting', 'fresh-snapshot', {symbol, captureAgeMs, nativeAgeMs});
   }
   async getQuote(symbol) {
     const data = await this.snapshot(symbol);
@@ -548,7 +642,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
   async armChunkEntry(plan,options={}) { return require('./chunkEntryClient').armChunkEntry(this,plan,options); }
   async stopChunkEntry(entryId,options) { return require('./chunkEntryClient').stopChunkEntry(this,entryId,options); }
   async continueChunkEntry(entryId,account,options) { return require('./chunkEntryClient').continueChunkEntry(this,entryId,account,options); }
-  async listChunkEntries() { return require('./chunkEntryClient').listChunkEntries(this); }
+  async listChunkEntries(visible,preferredId) { return require('./chunkEntryClient').listChunkEntries(this,visible,preferredId); }
   async placeOrder(order) {
     if(this.connectionRestarting || this.accountEnrollmentBusy) return {status:'rejected',provider:this.provider,reason:'Подключение обновляется. Дождись готовности счетов'};
     let submitted = false;
@@ -872,18 +966,22 @@ class MT5VPSAdapter extends ExecutionAdapter {
       const {parent,accounts}=context;
       const independent=parent.accountExecution==='independent-v5' && this.capabilities.includes(ACCOUNT_CONTROL_CAPABILITY);
       const reconciliationStarted=performance.now();
-      await this.commandJournal.reconcile(async id=>this.validateCommandReceipt(id,(await this.request(`/receipt?id=${encodeURIComponent(id)}`)).result),{ticket:scope});
+      // The VPS blocks unresolved account-level controls on their own lanes.
+      // An older independent receipt can be reconciled by the normal background read.
+      await this.commandJournal.reconcile(async id=>this.validateCommandReceipt(id,(await this.request(`/receipt?id=${encodeURIComponent(id)}`)).result),
+        {ticket:scope,skipIndependentEntryControls:independent});
       preparation.receiptReconciliationMs=Number((performance.now()-reconciliationStarted).toFixed(3));
       if(this.commandJournal.records.some(command=>command.ticket===scope && command.result?.status==='unknown'
-        && !(independent && command.payload?.independentAccountControls===true)))return {status:'unknown',provider:this.provider,reason:'Есть неподтверждённая команда для всего набора БМЛ/СМЛ. Повтор заблокирован.'};
+        && !(independent && isIndependentEntryControl(command))))return {status:'unknown',provider:this.provider,reason:'Есть неподтверждённая команда для всего набора БМЛ/СМЛ. Повтор заблокирован.'};
       if(!Number.isFinite(clickAt) || Date.now()-clickAt<0 || Date.now()-clickAt>60000)clickAt=Date.now();
       const request={id:randomUUID(),entryId:parent.id,symbol:parent.symbol,expiresAt:Date.now()+2000};
       if(partial)request.closePercent=closePercent;
       submitted=true;
       const journalStarted=performance.now();
-      const result=await this.commandJournal.run(operation,{...request,ticket:scope,capturedAccounts:accounts,...(independent ? {independentAccountControls:true} : {})},async()=>{
+      const result=await this.commandJournal.run(operation,{...request,ticket:scope,capturedAccounts:accounts,...(independent ? {independentAccountControls:true} : {})},async journalTiming=>{
         const macBeforeSendMs=Math.max(0,Date.now()-clickAt);
         preparation.journalBeforeSendMs=Number((performance.now()-journalStarted).toFixed(3));
+        if(journalTiming)Object.assign(preparation,journalTiming);
         preparation.totalMs=Number((performance.now()-preparationStarted).toFixed(3));
         const response=await this.request('/entry-plan-close',request,{execution:true}),value=response.result;
         if(!value || value.id!==request.id || value.entryId!==parent.id || !['ok','rejected','unknown'].includes(value.status)

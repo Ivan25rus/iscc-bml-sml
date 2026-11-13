@@ -29,6 +29,8 @@ test('management without partial closing permits a full exit and rejects a reduc
  assert.ok(policy.allow('mt5-vps:manage',{action:'cancel-time-exit'}));
  assert.equal(policy.allow('mt5-vps:manage',{action:'schedule-close'}),false);
  assert.equal(policy.allow('mt5-vps:save-followers'),false);
+ assert.equal(policy.allow('mt5-vps:transfer-copying'),false);
+ assert.ok(createFeaturePolicy(['accounts']).allow('mt5-vps:transfer-copying'));
  assert.equal(policy.allow('mt5-vps:save-time-exit'),false);
 });
 test('partial exit does not implicitly expose a new price or time rule',()=>{

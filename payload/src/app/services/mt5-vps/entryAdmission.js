@@ -1,9 +1,11 @@
 // The cached capability selects a route only. The VPS validates this complete
 // contract, real accounts and the captured plan before saving an opening intent.
 const CAPABILITY='atomic-entry-admission-v1';
+const PRIMARY_RISK_CAPABILITY='entry-primary-balance-risk-v1';
 function requiredCapabilities(request) {
   const required=['chunked-breakout'];
   if(request.mirrorAccounts?.some(row=>row.riskPercent!=null))required.push('entry-balance-risk-v1');
+  if(request.primaryRiskRequest)required.push(PRIMARY_RISK_CAPABILITY);
   if(request.fillPriority!==undefined)required.push('entry-fill-priority-v1');
   if(['zone','boundary','side-zone'].includes(request.entryMode)) {
     required.push('market-zone-entry');
@@ -24,4 +26,4 @@ function validateHealth(health,operation,request) {
     || (operation==='arm' ? requiredCapabilities(request) : ['chunked-breakout']).some(value=>!health.capabilities?.includes(value)))
     throw Error('Обновите приёмник VPS для выбранного набора и проверьте подключение');
 }
-module.exports={CAPABILITY,requiredCapabilities,validateHealth};
+module.exports={CAPABILITY,PRIMARY_RISK_CAPABILITY,requiredCapabilities,validateHealth};

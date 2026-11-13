@@ -2,11 +2,15 @@ const {randomUUID}=require('crypto');
 const {performance}=require('perf_hooks');
 const {followers}=require('./sizing');
 const {deadlineForNewTrade}=require('./timeExit');
+const {entryRiskLimit,checkEntryRisk}=require('./entryRisk');
 const {CommandJournal}=require('./commandJournal');
 const admission=require('./entryAdmission');
+const {manualEntryReadOptions}=require('./entryLifecycle');
 
 const CAPABILITY='chunked-breakout';
 const STOP_PRIORITY_CAPABILITY='entry-stop-priority-v1';
+const STOP_RECEIPT_CAPABILITY='entry-stop-receipt-read-v1';
+const RECENT_COMMANDS=128;
 const PHASES=new Set(['armed','running','paused','sending','completed','stopped','unknown']);
 const DATE_FIELDS=new Set(['expiresAt','closeAtUtc','closeLocalDate']);
 const PREPARATION_FIELDS=['ipcDispatchMs','trackedValidationMs','snapshotReadMs','planValidationMs','admissionMs','requestBuildMs'];
@@ -24,8 +28,18 @@ function commandId(value,maximum=100) {
   if (typeof value!=='string' || value.length>maximum || !/^[A-Za-z0-9_.:-]+$/.test(value)) throw Error('Неверный номер команды набора');
   return value;
 }
-function buildEntryRequest(adapter,plan,{requestId=randomUUID(),cardPayload}={},now=Date.now()) {
-  const deadline=deadlineForNewTrade(adapter.config,now);
+function captureEntrySettings(adapter,ticker,now=Date.now()) {
+  const config=adapter.config || {};
+  return Object.freeze({account:String(config.account),server:config.server,
+    symbol:adapter.brokerSymbol?.(ticker),deadline:Object.freeze(deadlineForNewTrade(config,now)),
+    copies:Object.freeze(followers(config).filter(row=>row.enabled).map(row=>Object.freeze(row))),
+    entryRiskLimitUsd:entryRiskLimit(config)});
+}
+function buildEntryRequest(adapter,plan,{requestId=randomUUID(),cardPayload,entrySettings}={},now=Date.now()) {
+  const captured=entrySettings || captureEntrySettings(adapter,plan?.ticker,now);
+  const {deadline,copies}=captured;
+  if(captured.account!==String(adapter.config?.account) || captured.server!==adapter.config?.server)
+    throw Error('Основной счёт изменился. Запусти новый вход заново');
   if (!deadline) throw Error('Для набора частями включите закрытие по времени: у набора должен быть ограниченный срок');
   const side=plan?.orderSide;
   if (!['buy','sell'].includes(side)) throw Error('Неверное направление набора');
@@ -36,10 +50,12 @@ function buildEntryRequest(adapter,plan,{requestId=randomUUID(),cardPayload}={},
   if (!Number.isFinite(takeProfitPts) || takeProfitPts<0) throw Error('Неверный тейк набора');
   const maxGap=Number(plan.entryMode==='side-zone' ? plan.zoneRadius : plan.maxGap);
   if (!Number.isFinite(maxGap) || maxGap<0) throw Error('Неверный параметр набора: допуск цены');
-  const request={id:commandId(requestId),symbol:adapter.brokerSymbol(plan.ticker),side,
+  const request={id:commandId(requestId),symbol:captured.symbol ?? adapter.brokerSymbol(plan.ticker),side,
     trigger,sl,tp:takeProfitPts ? trigger+(side==='buy' ? 1 : -1)*takeProfitPts*tickSize : 0,
-    volume:positive(plan.totalQty,'общий объём'),chunkVolume:positive(plan.chunkVolume,'часть объёма'),
-    maxGap,riskUsd:positive(plan.riskUsd,'общий риск'),
+    ...(plan.primaryRiskRequest ? {primaryRiskRequest:plan.primaryRiskRequest} :
+      {volume:positive(plan.totalQty,'общий объём'),chunkVolume:positive(plan.chunkVolume,'часть объёма'),
+        riskUsd:positive(plan.riskUsd,'общий риск')}),
+    maxGap,
     level:positive(plan.level,'уровень'),tickSize,expiresAt:now+3000,...deadline};
   if (plan.entryMode!==undefined && !['breakout','zone','boundary','side-zone'].includes(plan.entryMode)) throw Error('Неверный режим входа');
   if (['zone','boundary','side-zone'].includes(plan.entryMode)) {
@@ -93,11 +109,14 @@ function buildEntryRequest(adapter,plan,{requestId=randomUUID(),cardPayload}={},
     if (typeof cardPayload.cid!=='string' || cardPayload.cid.length>128) throw Error('Неверный номер карточки');
     request.cid=cardPayload.cid;
   }
-  const copies=followers(adapter.config).filter(row=>row.enabled);
   if(copies.some(row=>row.riskPercent!=null) && (request.accountExecution!=='independent-v5'
     || !adapter.capabilities?.includes('entry-balance-risk-v1')))throw Error('Для риска от баланса обновите VPS и используйте БМЛ/СМЛ');
   if (copies.length) request.mirrorAccounts=copies.map(({account,multiplier,riskPercent})=>({account,multiplier,...(riskPercent==null ? {} : {riskPercent})}));
-  const riskLimit=require('./entryRisk').checkEntryRisk(adapter.config,request.riskUsd);
+  if(request.primaryRiskRequest && (request.accountExecution!=='independent-v5'
+      || !adapter.capabilities?.includes(admission.PRIMARY_RISK_CAPABILITY)
+      || !adapter.capabilities?.includes(admission.CAPABILITY)))
+    throw Error('VPS не поддерживает расчёт риска основного счёта при запуске');
+  const riskLimit=request.primaryRiskRequest ? captured.entryRiskLimitUsd : checkEntryRisk(captured,request.riskUsd);
   if(riskLimit>0)request.entryRiskLimitUsd=riskLimit;
   if(adapter.capabilities?.includes(admission.CAPABILITY)) {
     request.admissionContract=admission.CAPABILITY;
@@ -151,6 +170,22 @@ function capturedAccounts(adapter,request) {
   }
   return accounts;
 }
+function verifyPrimarySizing(entry,request) {
+  if(!request.primaryRiskRequest)return;
+  const expected=request.primaryRiskRequest,sizing=entry.primaryRiskSizing;
+  const base=sizing?.credit===undefined ? sizing?.balance : sizing.riskBase;
+  if(sizing?.account!==expected.account || sizing?.percent!==expected.percent
+    || !Number.isFinite(base) || base<=0 || !Number.isFinite(sizing.balance)
+    || sizing.credit!==undefined && (!Number.isFinite(sizing.credit) || sizing.credit<0
+      || Math.abs(sizing.balance+sizing.credit-base)>1e-7)
+    || !Number.isFinite(sizing.capturedAt) || sizing.capturedAt<=0
+    || sizing.riskUsd!==Math.floor(base*expected.percent)/100 || !(sizing.riskUsd>0)
+    || !(sizing.volume>0) || !(sizing.chunkVolume>0) || sizing.chunkVolume>sizing.volume
+    || entry.riskUsd!==sizing.riskUsd || entry.volume!==sizing.volume || entry.chunkVolume!==sizing.chunkVolume
+    || request.entryRiskLimitUsd && sizing.riskUsd>request.entryRiskLimitUsd+1e-8
+    || expected.quantityLimit!=null && sizing.volume>expected.quantityLimit)
+    throw Error('VPS не подтвердил расчёт риска основного счёта');
+}
 function validateRecoveredEntry(adapter,response,request) {
   const lifecycle=require('./entryLifecycle'),entry=response?.entry;
   if(request.fillPriority!==undefined && !response?.capabilities?.includes('entry-fill-priority-v1'))
@@ -171,6 +206,7 @@ function validateRecoveredEntry(adapter,response,request) {
     if(request[key]!==undefined && (!Number.isFinite(entry[key]) || Math.abs(entry[key]-request[key])>1e-7))
       throw Error('Точный журнал VPS не подтвердил параметры набора');
   }
+  verifyPrimarySizing(entry,request);
   // The broker can reduce the initial part to its per-order maximum. SL/TP can
   // subsequently be changed by the user's whole-parent protection controls.
   if(entry.fillPriority!==request.fillPriority || entry.stopMode!==request.stopMode || !Number.isFinite(entry.chunkVolume) || entry.chunkVolume<=0
@@ -182,11 +218,18 @@ function validateRecoveredEntry(adapter,response,request) {
     throw Error('Точный журнал VPS не подтвердил захваченные счета набора');
   for(const [account,multiplier] of accounts) {
     const details=entry.accounts[account];
+    const percent=request.mirrorAccounts?.find(row=>row.account===account)?.riskPercent;
+    const independentRisk=percent!=null;
+    const volume=request.volume ?? entry.volume,riskUsd=request.riskUsd ?? entry.riskUsd;
+    if(independentRisk && details?.multiplier===multiplier && details.riskPercent===percent
+      && lifecycle.zeroSizedBalanceAdmission(entry,account))continue;
     if(!details || !Number.isFinite(details.multiplier) || Math.abs(details.multiplier-multiplier)>1e-7
-      || !Number.isFinite(details.targetVolume) || details.targetVolume<=0 || details.targetVolume>request.volume*multiplier+1e-7
-      || account===String(adapter.config.account) && Math.abs(details.targetVolume-request.volume)>1e-7
+      || !Number.isFinite(details.targetVolume) || details.targetVolume<=0 || !independentRisk && details.targetVolume>volume*multiplier+1e-7
+      || account===String(adapter.config.account) && Math.abs(details.targetVolume-volume)>1e-7
       || !Number.isFinite(details.filledVolume) || details.filledVolume<0 || details.filledVolume>details.targetVolume+1e-7
-      || !Number.isFinite(details.riskUsd) || Math.abs(details.riskUsd-request.riskUsd*multiplier)>1e-7)
+      || !Number.isFinite(details.riskUsd)
+      || (independentRisk ? details.balanceRisk?.riskPercent!==percent || details.balanceRisk?.riskUsd!==details.riskUsd
+        || details.balanceRisk?.volume!==details.targetVolume : Math.abs(details.riskUsd-riskUsd*multiplier)>1e-7))
       throw Error('Точный журнал VPS не подтвердил объём и риск счетов набора');
   }
   if(hybrid)lifecycle.exactHybridEntry(entry,{...request,accounts:entry.accounts});
@@ -227,10 +270,13 @@ async function saveRecoveredArm(adapter,journal,candidate,entry) {
     catch(error) {candidate.record.result=previous;candidate.record.updatedAt=updatedAt;throw error;}
   }
   const command=adapter.chunkEntryCommands?.get('arm:'+candidate.request.id);
-  if(command && !command.pending){command.result=result;command.promise=Promise.resolve(result);}
+  if(command && !command.pending){
+    command.result=result;command.promise=Promise.resolve(result);
+    if(candidate.record){command.durable=true;trimSettledCommands(adapter.chunkEntryCommands);}
+  }
   require('./entryLifecycle').rememberEntry(adapter,entry);
 }
-async function reconcileUnknownArms(adapter,entries) {
+async function reconcileUnknownArms(adapter,entries,preferredId,deadline) {
   const journal=journalFor(adapter),unconfirmed=unknownArmCandidates(adapter,journal),candidates=[];
   const output=new Map(entries.map(entry=>[entry.id,entry])),proofs=new Map();
   // Immutable cancellation evidence remains useful if the UI response was lost
@@ -266,7 +312,10 @@ async function reconcileUnknownArms(adapter,entries) {
       await saveRecoveredArm(adapter,journal,candidate,restored);
       output.set(candidate.request.id,restored);
     } catch(error) {uncertain(candidate.request,'Не удалось сохранить подтверждение отмены: '+error.message);}
-    else {uncertain(candidate.request);candidates.push(candidate);}
+    else {
+      uncertain(candidate.request);
+      if(!preferredId || candidate.request.id===preferredId)candidates.push(candidate);
+    }
   }
   if(!candidates.length)return [...output.values()];
   const candidate=candidates[(adapter.chunkArmRecoveryCursor || 0)%candidates.length];
@@ -274,11 +323,75 @@ async function reconcileUnknownArms(adapter,entries) {
   try {
     // One exact parent per existing UI refresh. This GET cannot arm, stop,
     // cancel or close anything, and a missing result is never an empty fill.
-    const response=await adapter.request('/entry-plan?id='+encodeURIComponent(candidate.request.id));
+    const response=await adapter.request('/entry-plan?id='+encodeURIComponent(candidate.request.id),undefined,manualEntryReadOptions(deadline));
     const entry=validateRecoveredEntry(adapter,response,candidate.request);
     await saveRecoveredArm(adapter,journal,candidate,entry);
     output.set(entry.id,entry);
   } catch(error) {uncertain(candidate.request,'Не удалось подтвердить запуск: '+error.message+'. Повторная команда не отправляется.');}
+  return [...output.values()];
+}
+function pendingStopCandidates(adapter,journal) {
+  const candidates=new Map();
+  for(const record of journal?.records || []) {
+    if(record.operation==='entry-plan-stop' && record.result?.status==='unknown')
+      candidates.set(record.id,{request:record.payload,record});
+  }
+  for(const command of adapter.chunkEntryCommands?.values() || []) {
+    if(command.operation==='stop' && (command.pending || command.result?.status==='unknown') && !candidates.has(command.request.id))
+      candidates.set(command.request.id,{request:command.request});
+  }
+  return candidates;
+}
+async function reconcileUnknownStops(adapter,entries,preferredId,deadline) {
+  const journal=journalFor(adapter),candidates=pendingStopCandidates(adapter,journal);
+  if(!candidates.size)return entries;
+  const output=new Map(entries.map(entry=>[entry.id,entry]));
+  const commandFor=id=>adapter.chunkEntryCommands?.get('stop:'+id);
+  const readable=[...candidates.values()].filter(({request})=>!commandFor(request.id)?.pending
+    && (!preferredId || request.entryId===preferredId));
+  if(readable.length && adapter.capabilities?.includes(STOP_RECEIPT_CAPABILITY)) {
+    const index=(adapter.chunkStopRecoveryCursor || 0)%readable.length;
+    adapter.chunkStopRecoveryCursor=(adapter.chunkStopRecoveryCursor || 0)+1;
+    const {request,record}=readable[index],previous=record?.result;
+    try {
+      commandId(request.id,130);commandId(request.entryId);
+      const response=await adapter.request('/entry-plan-stop?id='+encodeURIComponent(request.id),undefined,manualEntryReadOptions(deadline));
+      const proof=response?.entryControlReceipt,revoked=request.cancelContinueIds || [];
+      let entry=response?.entry;
+      if(!response?.capabilities?.includes(STOP_RECEIPT_CAPABILITY) || ![38,39].includes(response.version)
+        || proof?.schema!=='entry-control-recovery-v1' || proof.id!==request.id || proof.entryId!==request.entryId
+        || !Array.isArray(proof.cancelContinueIds) || JSON.stringify(proof.cancelContinueIds)!==JSON.stringify(revoked)
+        || entry?.id!==request.entryId || !PHASES.has(entry.phase))throw Error('Нет точной квитанции остановки VPS');
+      if(entry.cancelledBeforeAdmission!==undefined) {
+        const original=journal?.records.find(row=>row.operation==='entry-plan-arm' && row.id===entry.id)?.payload
+          || adapter.chunkEntryCommands?.get('arm:'+entry.id)?.request;
+        entry=require('./entryLifecycle').confirmAdmissionCancellation(entry,request.entryId,response,original);
+      }
+      const command=commandFor(request.id);
+      if(!command?.pending && (!record || record.result===previous)) {
+        await settleRevokedContinuations(adapter,request,response);
+        if(!commandFor(request.id)?.pending && (!record || record.result===previous)) {
+          const result={status:'ok',entry};
+          if(record) {
+            const updatedAt=record.updatedAt;
+            record.result=result;record.updatedAt=Date.now();
+            try {await journal.save([record]);}
+            catch(error){record.result=previous;record.updatedAt=updatedAt;throw error;}
+          }
+          if(command && !command.pending){
+            command.result=result;command.promise=Promise.resolve(result);
+            if(record){command.durable=true;trimSettledCommands(adapter.chunkEntryCommands);}
+          }
+          if(!commandFor(request.id)?.pending)candidates.delete(request.id);
+          if(entry._admissionCancelConfirmed || !output.has(entry.id))output.set(entry.id,entry);
+        }
+      }
+    } catch { /* The saved intent remains unresolved, with its explicit stop recovery available. */ }
+  }
+  for(const {request} of candidates.values()) {
+    const entry=output.get(request.entryId) || adapter.chunkLifecycleEntries?.get(request.entryId);
+    if(entry)output.set(entry.id,{...entry,_stopUnconfirmed:true});
+  }
   return [...output.values()];
 }
 async function retryExplicitStop(journal,record,send) {
@@ -294,10 +407,21 @@ async function retryExplicitStop(journal,record,send) {
   catch {record.result={status:'unknown',reason:'Не удалось сохранить ответ остановки. Проверь статус набора на VPS.'};}
   return record.result;
 }
+
+function trimSettledCommands(commands) {
+  if(commands.size<=RECENT_COMMANDS)return;
+  // The original durable result remains available by ID after eviction. An
+  // in-flight or unresolved command cannot be evicted from this safety cache.
+  for(const [key,command] of commands) {
+    if(command.durable && !command.pending && command.result?.status!=='unknown')commands.delete(key);
+    if(commands.size<=RECENT_COMMANDS)break;
+  }
+}
 async function runMutation(adapter,operation,request,{clickAt,preparation={}}={}) {
   preparation=preparationTimings(preparation);
   const reason=unavailable(adapter);
   if (reason) return {status:'rejected',provider:adapter.provider,reason,timings:preparation};
+  const account=String(adapter.config.account),server=adapter.config.server;
   let submitted=false;
   try {
     const key=operation+':'+request.id,signature=identity(operation,request);
@@ -358,6 +482,9 @@ async function runMutation(adapter,operation,request,{clickAt,preparation={}}={}
       const send=async journalTiming=>{
         if(journalTiming)Object.assign(preparation,journalTiming);
         preparation.journalBeforeSendMs=elapsed(journalBeforeSend);
+        const unavailableReason=unavailable(adapter);
+        if(unavailableReason || String(adapter.config.account)!==account || adapter.config.server!==server)
+          return {status:'rejected',reason:unavailableReason || 'Основной счёт изменился. Запусти новый вход заново'};
         submitted=true;
         const beforeSend=Date.now();
         // Expiry is transport metadata excluded from the durable identity.
@@ -365,8 +492,27 @@ async function runMutation(adapter,operation,request,{clickAt,preparation={}}={}
         request.expiresAt=request.intentTtlMs
           ? require('./entryIntentClock').intentExpiry(adapter,request.intentTtlMs,beforeSend)
           : beforeSend+3000;
-        const response=await adapter.request(atomic ? '/entry-plan-admit' : operation==='arm' ? '/entry-plan'
-          : operation==='continue' ? '/entry-plan-continue' : '/entry-plan-stop',request,{execution:true});
+        const sendStarted=performance.now();
+        const route=atomic ? '/entry-plan-admit' : operation==='arm' ? '/entry-plan'
+          : operation==='continue' ? '/entry-plan-continue' : '/entry-plan-stop';
+        let response;
+        try {
+          try {response=await adapter.request(route,request,{execution:true});}
+          catch(error) {
+            // TLS/queue failure before the first request write is a proven
+            // non-send. The only transport retry keeps the saved ID and expiry.
+            const stopping=()=>[...(adapter.chunkEntryCommands?.values() || [])].some(command=>
+              command.operation==='stop' && command.request?.entryId===request.id);
+            if(!atomic || error.entryArmNotSent!==true || !request.intentTtlMs
+              || performance.now()-sendStarted>=request.intentTtlMs-2500 || unavailable(adapter)
+              || String(adapter.config.account)!==account || adapter.config.server!==server || stopping())throw error;
+            response=await adapter.request(route,request,{execution:true});
+          }
+        } catch(error) {
+          if(operation!=='arm' || error.entryArmNotSent!==true)throw error;
+          return {status:'rejected',reason:'Команда набора не отправлена: соединение с VPS оборвалось до отправки. Проверь подключение и нажми ещё раз.',
+            timings:{...preparation,macClickToResultMs:Number.isFinite(clickAt) ? Math.max(0,Date.now()-clickAt) : undefined}};
+        }
         const validationStarted=performance.now();
         // Stopping an exact parent needs no preliminary health round trip.
         // The authenticated stop reply supplies its own protocol evidence,
@@ -396,7 +542,7 @@ async function runMutation(adapter,operation,request,{clickAt,preparation={}}={}
             throw Error('Обновите VPS для подтверждения отмены до запуска набора');
           const original=operation==='arm' ? request : journal?.records.find(row=>row.operation==='entry-plan-arm' && row.id===expected)?.payload;
           entry=require('./entryLifecycle').confirmAdmissionCancellation(entry,expected,response,original);
-        }
+        } else if(operation==='arm')verifyPrimarySizing(entry,request);
         adapter.managementSnapshot=null;adapter.managementStateView=null;
         if(operation==='stop')await settleRevokedContinuations(adapter,request,response);
         preparation.replyValidationMs=elapsed(validationStarted);
@@ -404,9 +550,9 @@ async function runMutation(adapter,operation,request,{clickAt,preparation={}}={}
           macBeforeSendMs:Number.isFinite(clickAt) ? Math.max(0,beforeSend-clickAt) : undefined,
           macClickToResultMs:Number.isFinite(clickAt) ? Math.max(0,Date.now()-clickAt) : undefined}};
       };
-      // Distinct scopes allow an uncertain arm to be stopped explicitly. Arming
-      // is never replayed. Only a new explicit stop click may resend the SAME
-      // idempotent stop command after a lost reply; polling never calls this.
+      // Distinct scopes allow an uncertain arm to be stopped explicitly.
+      // An arm that may have reached VPS is never replayed. Only an explicit
+      // stop click may resend its SAME idempotent stop command after a lost reply.
       journalBeforeSend=performance.now();
       const result=journal ? previous && operation==='stop' ? await retryExplicitStop(journal,previous,send)
         : await journal.run('entry-plan-'+operation,{...request,ticket:operation+':'+(request.entryId || request.id)
@@ -417,6 +563,10 @@ async function runMutation(adapter,operation,request,{clickAt,preparation={}}={}
     const command={signature,promise:run,pending:true,operation,request:JSON.parse(JSON.stringify(request))};
     adapter.chunkEntryCommands.set(key,command);
     const result=await run;command.pending=false;command.result=result;
+    if(result.status!=='unknown' && journal?.records.find(row=>row.id===request.id)?.result?.status===result.status) {
+      command.durable=true;
+      trimSettledCommands(adapter.chunkEntryCommands);
+    }
     return result;
   } catch(error) {return {status:submitted ? 'unknown' : 'rejected',provider:adapter.provider,reason:error.message,timings:{...preparation}};}
 }
@@ -478,22 +628,36 @@ async function stopChunkEntry(adapter,entryId,{cancelContinueIds=[]}={}) {
     return await runMutation(adapter,'stop',request);
   } catch(error) {return {status:'rejected',provider:adapter.provider,reason:error.message};}
 }
-async function listChunkEntries(adapter) {
+async function listChunkEntries(adapter,visible,preferredId) {
   if (adapter.config.routePrefix) throw Error('Список наборов доступен через основной счёт');
+  const deadline=preferredId ? performance.now()+12000 : undefined;
   // New receivers publish entry plans in the ordinary shared management view.
   // Exact unknown-arm recovery below still reads its own immutable plan id.
   const fast=adapter.capabilities?.includes('entry-progress-fast-read-v1');
-  if(!fast && adapter.capabilities?.includes(admission.CAPABILITY))await adapter.managementState({maxAgeMs:1000});
+  if(!fast && adapter.capabilities?.includes(admission.CAPABILITY))
+    await adapter.managementState({maxAgeMs:1000,...manualEntryReadOptions(deadline)});
   const age=Date.now()-Number(adapter.managementStateAt || 0);
   const cached=adapter.managementStateView?.entryPlans;
-  const entries=Array.isArray(cached) && age>=0 && age<=1000 ? cached : (await adapter.request('/entry-plans'))?.entries;
+  const entries=!preferredId && Array.isArray(cached) && age>=0 && age<=1000 ? cached
+    : (await adapter.request('/entry-plans',undefined,manualEntryReadOptions(deadline)))?.entries;
   if (!Array.isArray(entries) || entries.some(entry=>!entry || typeof entry!=='object'
       || typeof entry.id!=='string' || !PHASES.has(entry.phase))) throw Error('MT5 VPS: некорректный список наборов');
   const clean=entries.map(entry=>{
-    const {_admissionCancelConfirmed,_armUnconfirmed,...record}=entry;
+    const {_admissionCancelConfirmed,_armUnconfirmed,_stopUnconfirmed,...record}=entry;
     return record;
   });
-  return require('./entryLifecycle').reconcileEntries(adapter,await reconcileUnknownArms(adapter,clean));
+  const withStops=await reconcileUnknownStops(adapter,clean,preferredId,deadline);
+  const withArms=await reconcileUnknownArms(adapter,withStops,preferredId,deadline);
+  const reconciled=await require('./entryLifecycle').reconcileEntries(adapter,withArms,visible,preferredId,deadline);
+  // Broker history can outlive the short list or a stop can finish during a
+  // read. Publish the stop flag from the current exact local intent state.
+  const pendingStops=new Set([...pendingStopCandidates(adapter,journalFor(adapter)).values()].map(({request})=>request.entryId));
+  return reconciled.map(entry=>{
+    const pending=pendingStops.has(entry.id);
+    if(pending===(entry._stopUnconfirmed===true))return entry;
+    const {_stopUnconfirmed,...current}=entry;
+    return pending ? {...current,_stopUnconfirmed:true} : current;
+  });
 }
 async function continueChunkEntry(adapter,entryId,account,{requestId='continue-'+randomUUID()}={}) {
   try {
@@ -510,4 +674,4 @@ async function continueChunkEntry(adapter,entryId,account,{requestId='continue-'
     return await runMutation(adapter,'continue',{id:requestId,entryId,account,expiresAt:Date.now()+3000,...delivery(adapter,'continue')});
   } catch(error) {return {status:'rejected',provider:adapter.provider,reason:error.message};}
 }
-module.exports={buildEntryRequest,armChunkEntry,stopChunkEntry,continueChunkEntry,listChunkEntries};
+module.exports={captureEntrySettings,buildEntryRequest,armChunkEntry,stopChunkEntry,continueChunkEntry,listChunkEntries};

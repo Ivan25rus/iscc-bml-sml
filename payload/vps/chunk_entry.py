@@ -30,16 +30,28 @@ PUBLIC_FIELDS = ('id', 'symbol', 'side', 'phase', 'trigger', 'volume', 'chunkVol
                  'maxGap', 'riskUsd', 'sl', 'tp', 'level', 'closeAtUtc', 'nextChunk',
                  'childCount', 'createdAt', 'updatedAt', 'tickSize', 'stopMode', 'stopOffsetPts', 'fillPriority',
                  'entryMode', 'zoneRadius', 'zoneMultiplier', 'executionPolicy', 'protectionPending', 'protectionPause', 'closurePending', 'positionsClosed',
-                 'hasOpenPositions', 'positionsConfirmed', 'positionLifecycle', 'cancelledBeforeAdmission', 'quoteWait', 'reconciliation', 'independentAccountControls')
-PUBLIC_ACCOUNT_FIELDS = ('multiplier', 'riskPercent', 'balanceRisk', 'targetVolume', 'filledVolume', 'anchor', 'riskUsd', 'riskUsed', 'averagePrice', 'sl', 'tp', 'protectionOverride', 'entryStatus', 'entryReason', 'lastEntryCheckAt', 'entryTiming', 'userStopped', 'laneStopReason', 'stopCheckRejected', 'commonStopUncertain', 'riskRepairRequired', 'limitRetryAvailable', 'admissionWaiting', 'protectionPending', 'closurePending')
+                 'hasOpenPositions', 'positionsConfirmed', 'positionLifecycle', 'cancelledBeforeAdmission', 'quoteWait', 'reconciliation', 'independentAccountControls', 'primaryRiskSizing')
+PUBLIC_ACCOUNT_FIELDS = ('multiplier', 'riskPercent', 'balanceRisk', 'targetVolume', 'filledVolume', 'anchor', 'riskUsd', 'riskUsed', 'averagePrice', 'sl', 'tp', 'protectionOverride', 'entryStatus', 'entryReason', 'lastEntryCheckAt', 'entryTiming', 'userStopped', 'laneStopReason', 'stopCheckRejected', 'commonStopUncertain', 'riskRepairRequired', 'limitRetryAvailable', 'admissionWaiting', 'protectionPending', 'closurePending', 'positionsClosed')
 PUBLIC_RESULT_FIELDS = ('status', 'providerOrderId', 'filledVolume', 'fillPrice', 'primaryAccount')
 PUBLIC_LIST_BUDGET = 512 * 1024
 HYBRID_MAX_MARKET_PARTS = 100
 HYBRID_MAX_POSITIONS = 200
 HYBRID_MAX_SUBMISSIONS = 512
 HYBRID_ROUNDS_PER_TICK = 25
+PASSIVE_RECONCILE_INTERVAL = 1.
+PASSIVE_RECONCILE_BATCH = 2
 HYBRID_STOP_QUOTE_WAIT = 'Further entry stopped; waiting for a fresh broker quote to confirm the common stop'
 ENTRY_STOP_PRIORITY_CAPABILITY = 'entry-stop-priority-v1'
+CLOSE_PROOF_RECHECK_SECONDS = (.05, .15, .35)
+CLOSE_HISTORY_PENDING_REASONS = frozenset((
+    'Cannot read broker order history', 'Opening not found in broker history',
+    'Cannot read broker deal history', 'No balanced full exit in broker history',
+    'Opening outcome unconfirmed',
+))
+
+
+class CloseHistoryPending(ValueError):
+    """The position disappeared before its broker history could prove the exit."""
 
 
 class EntryControlBarrier:
@@ -176,6 +188,10 @@ def hybrid_receipt(value):
     return compact
 
 
+def native_parent_close_id(identifier, account, ticket):
+    return 'parent-close:'+hashlib.sha256((identifier+':'+account+':'+ticket).encode()).hexdigest()
+
+
 def public_record(state, *, diagnostics=True):
     """Keep ledger details out of frequently polled authenticated responses."""
     result = {key: copy.deepcopy(state[key]) for key in PUBLIC_FIELDS if key in state}
@@ -251,6 +267,13 @@ def entry_stop_distance(payload):
     return None
 
 
+def entry_take_price(average, direction, distance, tick_size):
+    raw = Decimal(str(rounded(average))) + direction * Decimal(str(distance))
+    step = Decimal(str(tick_size))
+    return float((raw / step).to_integral_value(
+        rounding=ROUND_CEILING if direction == 1 else ROUND_FLOOR) * step)
+
+
 def weighted_nasdaq_stop(payload, details=None):
     """Use the captured panel distance from the actual index lot average."""
     if (payload.get('symbol') not in ('USTEC','SPX500') or payload.get('accountExecution') not in ('independent-v4','independent-v5')
@@ -295,7 +318,21 @@ def valid_units(value, step, name):
     return int(integer)
 
 
-def balance_risk_sizing(payload, account, metadata):
+def balance_risk_capital(account, include_credit=False):
+    balance = number(getattr(account, 'balance', None), 'Native account balance', positive=not include_credit)
+    capital = Decimal(str(balance))
+    details = {'balance': balance}
+    if include_credit:
+        credit = number(getattr(account, 'credit', None), 'Native account credit', positive=False)
+        if credit < 0:
+            raise ValueError('Native account credit must not be negative')
+        capital += Decimal(str(credit))
+        risk_base = number(float(capital), 'Native balance plus credit')
+        details.update(credit=credit, riskBase=risk_base)
+    return capital, details
+
+
+def balance_risk_sizing(payload, account, metadata, include_credit=False):
     """Capture risk from the account already read by native admission; no I/O."""
     if (payload.get('accountExecution')!='independent-v4' or payload.get('initialSizingOnly') is not True
             or payload.get('executionPolicy')!='hybrid-market-limit-v1' or payload.get('stopMode') not in ('entry','level')):
@@ -303,7 +340,7 @@ def balance_risk_sizing(payload, account, metadata):
     percent = number(payload.get('riskPercent'), 'Balance risk percent')
     if percent>100:
         raise ValueError('Balance risk percent must not exceed 100')
-    balance = number(getattr(account,'balance',None), 'Native account balance')
+    capital, funding = balance_risk_capital(account, include_credit)
     if getattr(account,'currency',None)!='USD':
         raise ValueError('Balance risk requires a USD account')
     tick = number(metadata.get('tickSize'), 'Price step')
@@ -319,7 +356,7 @@ def balance_risk_sizing(payload, account, metadata):
         distance=Decimal(str(upper))-Decimal(str(number(payload.get('sl'),'Stop price'))) if payload['side']=='buy' else Decimal(str(number(payload.get('sl'),'Stop price')))-Decimal(str(lower))
         if distance<=0:
             raise ValueError('Balance level stop must protect the whole entry zone')
-    budget = (Decimal(str(balance))*Decimal(str(percent))/100).quantize(Decimal('.01'),rounding=ROUND_FLOOR)
+    budget = (capital*Decimal(str(percent))/100).quantize(Decimal('.01'),rounding=ROUND_FLOOR)
     step = Decimal(str(number(metadata.get('quantityStep'),'Quantity step')))
     minimum = number(metadata.get('minQty'),'Minimum lot')
     maximum = number(metadata.get('maxQty'),'Maximum lot')
@@ -333,8 +370,53 @@ def balance_risk_sizing(payload, account, metadata):
     if part_percent>100:
         raise ValueError('Hybrid chunk percent must not exceed 100')
     chunk = min(total,maximum,max(minimum,floor(Decimal(str(total))*Decimal(str(part_percent))/100)))
-    return dict(riskPercent=percent,balance=balance,riskUsd=float(budget),volume=total,chunkVolume=chunk,
+    return dict(riskPercent=percent,**funding,riskUsd=float(budget),volume=total,chunkVolume=chunk,
                 stopDistance=float(distance),pointValue=point,quantityStep=float(step),capturedAt=time.time()*1000)
+
+
+def primary_balance_risk_sizing(payload, account, metadata, include_credit=False):
+    request = payload['primaryRiskRequest']
+    if not isinstance(request, dict) or request.get('account') != str(account.login):
+        raise ValueError('Primary balance risk account mismatch')
+    percent = number(request.get('percent'), 'Primary risk percent')
+    if percent > 100:
+        raise ValueError('Primary risk percent must not exceed 100')
+    capital, funding = balance_risk_capital(account, include_credit)
+    cents = number(float(capital) * percent, 'Primary risk cents')
+    budget = number(math.floor(cents) / 100, 'Primary risk USD')
+    keys = {'tickSize': payload, 'quantityStep': request, 'minQty': request, 'maxQty': request}
+    for key, captured in keys.items():
+        if abs(number(captured.get(key), key) - number(metadata.get(key), key)) > 1e-8:
+            raise ValueError('Primary broker specification changed: ' + key)
+    tick = metadata['tickSize']
+    step, minimum, maximum = (metadata[key] for key in ('quantityStep','minQty','maxQty'))
+    point = number(metadata.get('contractSize'), 'Native point value')
+    if abs(number(request.get('pointValue'), 'Captured point value') - point) > 1e-8:
+        raise ValueError('Primary broker point value changed')
+    if payload.get('stopMode') == 'entry':
+        stop_pts = number(payload.get('stopOffsetPts'), 'Entry stop steps')
+    elif payload.get('stopMode') == 'level':
+        lower, upper = market_price_bounds(payload)
+        stop = number(payload.get('sl'), 'Fixed stop')
+        stop_pts = number(((upper-stop) if payload['side']=='buy' else (stop-lower))/tick, 'Adverse stop steps')
+    else:
+        raise ValueError('Invalid primary risk stop mode')
+    part_percent = number(payload.get('chunkPercent'), 'Chunk percent')
+    cap = number(request.get('maxLot'), 'Per-part lot cap', positive=False)
+    if part_percent > 100 or cap < 0:
+        raise ValueError('Invalid primary chunk sizing limits')
+    # Preserve the existing Mac FX calculation and its two step roundings.
+    def step_down(value):
+        return round(math.floor((value+step*1e-9)/step)*step, 10)
+    total = step_down(round(math.floor(((budget/tick)/stop_pts/point)/step)*step, 10))
+    chunk = step_down(min(total, maximum, cap or maximum, max(minimum,step_down(total*part_percent/100))))
+    if total < minimum-1e-8 or chunk < minimum-1e-8 or math.ceil(total/chunk-1e-9)>HYBRID_MAX_MARKET_PARTS:
+        raise ValueError('Primary balance risk cannot size a valid entry')
+    limit = request.get('quantityLimit')
+    if limit is not None and total > number(limit, 'Total quantity limit', positive=False):
+        raise ValueError('Primary size exceeds the total quantity limit')
+    return dict(account=str(account.login),percent=percent,**funding,riskUsd=budget,volume=total,
+                chunkVolume=chunk,capturedAt=time.time()*1000)
 
 
 def account_entry_sizes(payload, spec):
@@ -703,6 +785,7 @@ class ChunkEntries:
         self.protection_requests = {}
         self.reconcile_jobs = {}
         self.reconcile_poll_at = {}
+        self.passive_reconcile_cursors = {}
         self.owner_index = {}
         self.owner_lock = threading.RLock()
         self.owner_misses = {}
@@ -712,6 +795,8 @@ class ChunkEntries:
         with bridge.lock:
             bridge.db.execute('CREATE TABLE IF NOT EXISTS chunk_entries (id TEXT PRIMARY KEY, digest TEXT, payload TEXT, state TEXT)')
             bridge.db.execute('CREATE TABLE IF NOT EXISTS chunk_entry_stops (id TEXT PRIMARY KEY, digest TEXT, result TEXT)')
+            bridge.db.execute('CREATE TABLE IF NOT EXISTS chunk_entry_stop_receipts '
+                              '(id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, cancelled TEXT NOT NULL)')
             bridge.db.execute('CREATE TABLE IF NOT EXISTS chunk_entry_cancels (entry_id TEXT PRIMARY KEY, stop_id TEXT)')
             bridge.db.execute('CREATE TABLE IF NOT EXISTS chunk_entry_protections (id TEXT PRIMARY KEY, digest TEXT, result TEXT)')
             bridge.db.execute('CREATE TABLE IF NOT EXISTS chunk_entry_closures (id TEXT PRIMARY KEY, digest TEXT, result TEXT)')
@@ -976,16 +1061,18 @@ class ChunkEntries:
                 independent = state.get('accountExecution') == 'independent-v5'
                 details = state['accounts'][account]
                 phase = state.get('lanePhases', {}).get(account, state['phase']) if independent else state['phase']
+                observed_split = independent and phase == 'stopped' and details.get('recoveredZeroPriceFill') is True
                 uncertain = [details] if independent else state['accounts'].values()
                 row['entryPlan'] = dict(id=identifier, executionPolicy=state['executionPolicy'], side=state['side'],
                     accounts=list(state['accounts']), phase=phase, averagePrice=average,
                     independentAccountControls=independent,
-                    sl=next(iter(stops)) if len(stops)==1 else None, tp=next(iter(takes)) if len(takes)==1 else None,
+                    sl=next(iter(stops)) if len(stops)==1 else float(row['sl']) if observed_split else None,
+                    tp=next(iter(takes)) if len(takes)==1 else float(row['tp']) if observed_split else None,
                     protectionReady=any(account in child.get('positions', {}) for child in state['children'])
                         and phase != 'unknown' and not state.get('protectionPending') and not state.get('closurePending')
                         and not details.get('protectionPending') and not details.get('closurePending')
                         and not state.get('protectionOnlyWait')
-                        and len(stops)==1 and len(takes)==1
+                        and (len(stops)==1 and len(takes)==1 or observed_split and all(value > 0 for value in stops))
                         and not any(value.get('commonStopUncertain') or value.get('riskRepairRequired')
                                     for value in uncertain))
 
@@ -1030,12 +1117,96 @@ class ChunkEntries:
             # is allowed only after that exact proof that no mutation began.
             request = dict(request, id=original_id+':q'+str(attempt+1))
 
+    def _reconcile_timed_out_protection(self, identifier, saved):
+        """Settle a single account's lost reply from its ledger and exact MT5 rows."""
+        if (not saved or saved[1].get('status') != 'unknown'
+                or saved[1].get('reason') != 'Linked MT5 response unknown; inspect receipt'
+                or not self.lock.acquire(blocking=False)):
+            return False
+        try:
+            result = saved[1]
+            found = self._load(result.get('entryId'))
+            if not found or self._protection_receipt(identifier) != saved:
+                return False
+            _, payload, state = found
+            if (len(state['accounts']) != 1 or state.get('protectionPending') != identifier
+                    or state.get('closurePending') or self._protecting(state['id'])
+                    or any(child['state'] not in ('confirmed','cancelled','rejected') for child in state['children'])):
+                return False
+            account, details = next(iter(state['accounts'].items()))
+            captured = {row['ticket']:row for child in state['children']
+                        if (row := child.get('positions', {}).get(account)) and not row.get('closed')}
+            if not captured:
+                return False
+            parent_id = 'parent-protection:' + hashlib.sha256((identifier+':'+account).encode()).hexdigest()
+            receipt = self._call(account, 'entry_common_stop_receipt', dict(parentId=parent_id))
+            if str(receipt.get('account')) != account or receipt.get('server') != self.bridge.config['server']:
+                return False
+            current = {row['ticket']:row for row in self._owned_close_view(payload,state,account,exact_exit=True)}
+            live = [row for row in current.values() if row['status'] == 'open']
+            proof = None
+            if live:
+                native = receipt.get('result') or {}
+                if (native.get('status') not in ('ok','unknown') or native.get('account') != account
+                        or native.get('symbol') != payload['symbol'] or not isinstance(native.get('positions'),list)):
+                    return False
+                planned = {row['ticket']:row for row in native['positions']}
+                if len(planned) != len(native['positions']) or set(planned) != set(captured):
+                    return False
+                stop = number(native.get('sl'), 'Requested stop')
+                for row in live:
+                    target = captured.get(row['ticket'])
+                    original = planned.get(row['ticket'])
+                    if not target or not original:
+                        return False
+                    take = number(native.get('tp',target['tp']), 'Requested take', positive=False)
+                    if (take < 0 or abs(row['volume']-target['volume']) > 1e-8
+                            or abs(number(original.get('volume'),'Requested volume')-target['volume']) > 1e-8
+                            or abs(number(original.get('fillPrice'),'Requested fill price')-target['fillPrice']) > 1e-8
+                            or abs(number(row['sl'],'Observed stop')-stop) > 1e-8
+                            or abs(number(row['tp'],'Observed take',positive=False)-take) > 1e-8):
+                        return False
+                if len(live) == len(captured):
+                    rows = [dict(ticket=row['ticket'],volume=row['volume'],fillPrice=captured[row['ticket']]['fillPrice'],sl=row['sl'],tp=row['tp']) for row in live]
+                    proof = dict(schema='entry-protection-proof-v1',commandId=receipt['id'],account=account,
+                        server=receipt['server'],symbol=payload['symbol'],checkedAt=time.time()*1000,positions=rows)
+            for ticket, position in captured.items():
+                row = current[ticket]
+                if row['status'] == 'closed':
+                    position['closed'] = True
+                else:
+                    position.update(sl=row['sl'],tp=row['tp'])
+            state.pop('protectionPending',None);state.pop('protectionPause',None)
+            state.update(phase='stopped',reason='Exact MT5 protection or full exits confirmed after timeout')
+            details.update(userStopped=True,entryStatus='stopped',entryReason=state['reason'])
+            self._hybrid_recount(payload,state,allow_excess_risk=True)
+            if not live:
+                state.update(positionsClosed=True,hasOpenPositions=False,positionsConfirmed=True,positionLifecycle='closed')
+            if proof:
+                positions = proof['positions']
+                outcome = dict(status='ok',account=account,symbol=payload['symbol'],sl=positions[0]['sl'],
+                               averagePrice=sum(row['fillPrice']*row['volume'] for row in positions)/sum(row['volume'] for row in positions),
+                               positions=positions,protectionProof=proof,reason='Exact MT5 protection confirmed after timeout')
+                if 'tp' in native: outcome['tp'] = native['tp']
+                details.update(sl=outcome['sl'],tp=positions[0]['tp'],averagePrice=outcome['averagePrice'])
+                details.setdefault('protectionOverride',{}).update({key:outcome[key] for key in ('sl','tp') if key in outcome})
+                result = dict(result,status='ok',reason=outcome['reason'],accountResults={account:outcome})
+            self._save(state,('chunk_entry_protections',identifier,result))
+            return True
+        except (ValueError,TypeError,KeyError,AttributeError,OSError,RuntimeError):
+            return False
+        finally:
+            self.lock.release()
+
     def reconcile_protection_rejection(self, identifier):
-        """Settle a known partial refusal using native reads only; never resend."""
+        """Resolve protection receipts using native reads only; never resend."""
         saved = self._protection_receipt(identifier)
         if not saved:
             return
         result = saved[1]
+        if result.get('status') == 'unknown' and result.get('reason') == 'Linked MT5 response unknown; inspect receipt':
+            self._reconcile_timed_out_protection(identifier, saved)
+            return
         outcomes = result.get('accountResults', {})
         if (result.get('status') != 'unknown' or result.get('id') != identifier
                 or result.get('reason') != 'Whole-parent protection outcome is unconfirmed'
@@ -1115,7 +1286,7 @@ class ChunkEntries:
             with self.stop_requests_lock:
                 self.protection_requests.pop(entry_id, None)
 
-    def protection(self, command):
+    def protection(self, command, *, allow_empty_mirror=False):
         identifier, entry_id = command.get('id'), command.get('entryId')
         if (not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,130}', identifier)
                 or not isinstance(entry_id, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,100}', entry_id)):
@@ -1132,7 +1303,7 @@ class ChunkEntries:
         try:
             self._drain_lanes(entry_id)
             with self.lock:
-                response = self._protection_locked(command, fingerprint)
+                response = self._protection_locked(command, fingerprint, allow_empty_mirror=allow_empty_mirror)
         finally:
             with self.stop_requests_lock:
                 count = self.protection_requests[entry_id] - 1
@@ -1148,7 +1319,112 @@ class ChunkEntries:
             response = dict(result=self._protection_receipt(identifier)[1], entry=self.get(entry_id))
         return response
 
-    def _protection_locked(self, command, fingerprint):
+    def _empty_protection_mirror(self, payload, state, account):
+        """Prove an idle mirror without changing its position or working order."""
+        if payload.get('side') not in ('buy','sell'):
+            raise ValueError('Mirrored entry side is unconfirmed')
+        captured, pending, cancelled = {}, {}, set()
+        unconfirmed_opening = False
+        for child in state['children']:
+            position = child.get('positions', {}).get(account)
+            outcome = self._limit_results(state, child).get(account, {})
+            ticket = str(outcome.get('providerOrderId', ''))
+            if position:
+                opening = position.get('openingTicket') or position['ticket']
+                if opening in captured or self.owned_entry(account,position['ticket']) != state['id']:
+                    raise ValueError('Mirrored position ownership is unconfirmed')
+                captured[opening] = position
+            if child['state'] == 'pending':
+                if child['type'] != 'limit' or outcome.get('status') != 'ok':
+                    unconfirmed_opening = True
+                else:
+                    if ticket in pending or self.owned_entry(account,ticket) != state['id']:
+                        raise ValueError('Mirrored limit ownership is unconfirmed')
+                    pending[ticket] = child
+            elif position:
+                continue
+            elif child['state'] == 'cancelled' and child['type'] == 'limit' and outcome.get('status') == 'ok':
+                if ticket in cancelled or self.owned_entry(account,ticket) != state['id']:
+                    raise ValueError('Mirrored cancellation ownership is unconfirmed')
+                cancelled.add(ticket)
+            elif not (child['state'] == 'rejected' and outcome.get('status') == 'rejected'
+                      and outcome.get('providerOrderId') in (None, 0, '0', '')):
+                unconfirmed_opening = True
+        tickets = {row['ticket'] for row in captured.values()}
+        if len(tickets) != len(captured):
+            raise ValueError('Mirrored positions are duplicated')
+        openings = set(captured) | set(pending)
+        # Completed mirrors reuse the ordinary protection snapshot. Cold
+        # history for already-cancelled limits is needed only to prove a skip.
+        for watched in (openings, openings | cancelled) if cancelled else (openings,):
+            watch = [dict(account=account,ticket=ticket,symbol=payload['symbol']) for ticket in sorted(watched)]
+            view = self._call(account,'entry_management',watch)
+            if (str(view.get('account')) != account or view.get('server') != self.bridge.config['server']
+                    or not isinstance(view.get('orders'),list) or not isinstance(view.get('openingStates'),dict)):
+                raise ValueError('Mirrored account evidence is unavailable')
+            history, working, live = view['openingStates'], {}, False
+            position_links = tickets | openings
+            position_links.update(str(history[ticket]['ticket']) for ticket in openings
+                                  if history.get(ticket,{}).get('phase') == 'opened')
+            for row in view['orders']:
+                ticket, position_id = str(row.get('ticket')), str(row.get('positionId'))
+                if (row.get('__isPosition') is False and ticket in pending and row.get('symbol') == payload['symbol']
+                        and row.get('type') == payload['side'] and row.get('orderType') == (2 if payload['side'] == 'buy' else 3)
+                        and re.fullmatch(r'[1-9][0-9]{0,19}', position_id)
+                        and 0 < number(row.get('lots'),'Mirrored pending volume') < pending[ticket]['volumes'][account]-1e-8):
+                    position_links.add(position_id)
+            for row in view['orders']:
+                ticket = str(row.get('ticket'))
+                identifiers = {ticket,str(row.get('identifier'))}
+                same_symbol = row.get('symbol') == payload['symbol']
+                if not identifiers.intersection(position_links | cancelled) and not (same_symbol and
+                        (row.get('comment') == 'cid:'+payload.get('cid', '') or self.owned_entry(account,ticket) == state['id'])):
+                    continue
+                if not same_symbol or row.get('type') != payload['side']:
+                    raise ValueError('Mirrored order or position identity changed')
+                if row.get('__isPosition') is True and identifiers.intersection(position_links):
+                    live = True
+                    continue
+                if row.get('__isPosition') is not False or ticket not in pending or ticket in working:
+                    raise ValueError('Mirrored order or position is unconfirmed')
+                working[ticket] = row
+            if live:
+                return None, view  # Native protection still revalidates all live parts.
+        details = state['accounts'][account]
+        if (unconfirmed_opening or state.get('reconciliation', {}).get('status') == 'checking' or state.get('observeAdmissionHold')
+                or state.get('missingNativeChild') or state.get('protectionOnlyWait') or details.get('riskRepairRequired')
+                or any(child.get('cancellations', {}).get(account, {}).get('status') not in (None, 'ok', 'rejected')
+                       for child in state['children'])):
+            raise ValueError('Mirrored entry or prior control is unconfirmed')
+        filled = number(details.get('filledVolume'),'Mirrored filled volume',positive=False)
+        captured_live = sum(row['volume'] for row in captured.values() if not row.get('closed'))
+        # Exact close recovery can retain the last acquired display volume
+        # after marking every captured row closed. Never accept an excess.
+        confirmed_closed = state.get('positionsClosed') is True and all(row.get('closed') for row in captured.values())
+        maximum = sum(row['volume'] for row in captured.values()) if confirmed_closed else captured_live
+        if not captured_live-1e-8 <= filled <= maximum+1e-8:
+            raise ValueError('Mirrored entry volume is unconfirmed')
+        for opening, position in captured.items():
+            if not self._exact_closed_opening(payload,position,history.get(opening,{})):
+                raise ValueError('Mirrored full exit is unconfirmed')
+        if any(history.get(ticket,{}).get('phase') != 'cancelled' for ticket in cancelled):
+            raise ValueError('Mirrored cancellation is unconfirmed')
+        for ticket, child in pending.items():
+            row, opening = working.get(ticket), history.get(ticket,{})
+            if row is None and opening.get('phase') == 'cancelled':
+                continue
+            if (not row or opening.get('phase') != 'waiting' or opening.get('ticket') != ticket
+                    or row.get('orderType') != (2 if payload['side'] == 'buy' else 3)
+                    or row.get('positionId') not in ('0', 0)
+                    or any(abs(number(row.get(key),'Mirrored pending order value',positive=key!='tp')-expected)>1e-8
+                           for key,expected in (('lots',child['volumes'][account]),('open_price',child['prices'][account]),
+                                               ('sl',child['stops'][account]),('tp',child.get('takes',{}).get(account,payload.get('tp',0)))))):
+                raise ValueError('Mirrored limit remainder is unconfirmed')
+        if working:
+            return 'No open parent positions; working limit unchanged', None
+        return ('Exact broker full exits confirmed' if captured else 'No open parent positions'), None
+
+    def _protection_locked(self, command, fingerprint, *, allow_empty_mirror=False):
         identifier, entry_id = command['id'], command['entryId']
         saved = self._protection_receipt(identifier)
         if saved:
@@ -1161,8 +1437,8 @@ class ChunkEntries:
             raise ValueError('Hybrid parent does not exist')
         _, payload, state = found
         if (payload.get('executionPolicy') != 'hybrid-market-limit-v1' or command.get('symbol') != payload['symbol']
-                or state['phase'] == 'unknown' or state.get('protectionPending') or state.get('closurePending') or state.get('positionsClosed')
-                or any(child['state'] in ('sending','unknown') for child in state['children'])
+                or state['phase'] == 'unknown' or state.get('protectionPending') or state.get('closurePending')
+                or state.get('positionsClosed') and not allow_empty_mirror
                 or any(details.get('commonStopUncertain') for details in state['accounts'].values())):
             raise ValueError('Hybrid ownership or previous protection is unconfirmed')
         allowed = {'id','entryId','symbol','operation','account','mirrorAccounts','sl','tp','expiresAt','capturedTarget'}
@@ -1181,28 +1457,46 @@ class ChunkEntries:
             number(command['sl'], 'Stop loss')
         if 'tp' in command and number(command['tp'], 'Take profit', positive=False) < 0:
             raise ValueError('Take profit cannot be negative')
+        if any(child['state'] in ('sending','unknown') for child in state['children']):
+            if not self._recover_stopped_zero_price_fill(payload, state, accounts):
+                raise ValueError('Hybrid ownership or previous protection is unconfirmed')
+            self._expiry(command)
+        no_position, mirror_view = None, None
+        if allow_empty_mirror and len(accounts) == len(state['accounts']) == 1 and 'capturedTarget' not in command:
+            no_position, mirror_view = self._empty_protection_mirror(payload,state,accounts[0])
+            self._expiry(command)
+        if state.get('positionsClosed') and not no_position:
+            raise ValueError('Hybrid ownership or previous protection is unconfirmed')
         previous_phase = state['phase']
         result = dict(id=identifier, entryId=entry_id, status='unknown', reason='Protection intent saved; no automatic replay', accountResults={})
         # Persist the parent pause and command intent together, before even a
         # cancellation can race a fill. A restart cannot resume either action.
-        state.update(protectionPending=identifier, phase='paused', reason='Updating whole-parent protection')
+        if no_position:
+            result.update(status='ok',reason=no_position,accountResults={accounts[0]:dict(status='ok',noPosition=True,reason=no_position)})
+        else:
+            state.update(protectionPending=identifier, phase='paused', reason='Updating whole-parent protection')
         with self.storage.lock:
             if any(self.storage.db.execute('SELECT 1 FROM '+table+' WHERE id=?', (identifier,)).fetchone() for table in ('requests','groups','chunk_entry_closures')):
                 raise ValueError('Protection ID collides with an existing command')
             try:
                 self.storage.db.execute('INSERT INTO chunk_entry_protections VALUES (?,?,?)', (identifier, fingerprint, json.dumps(result)))
-                self.storage.db.execute('UPDATE chunk_entries SET state=? WHERE id=?', (json.dumps(state), entry_id))
+                if not no_position:
+                    self.storage.db.execute('UPDATE chunk_entries SET state=? WHERE id=?', (json.dumps(state), entry_id))
                 self.storage.db.commit()
             except Exception:
                 self.storage.db.rollback();raise
+        if no_position:
+            return dict(result=result,entry=public_record(state))
         self._index_committed(state); self._remember(state)
         applying = False; cancelled = False
         try:
+            account_views = {accounts[0]:mirror_view} if mirror_view is not None else {}
             for child in state['children']:
                 if child.get('type') == 'limit' and child['state'] not in ('confirmed','cancelled','rejected'):
+                    account_views.clear()  # A cancellation can race a fresh fill.
                     self._hybrid_limit(payload, state, child, cancel=True)
             cancelled = True
-            reduced = self._refresh_protection_positions(payload,state)
+            reduced = self._refresh_protection_positions(payload,state,account_views=account_views)
             captured = command.get('capturedTarget')
             if captured is not None:
                 if (not isinstance(captured,dict) or set(captured)!={'account','ticket','volume','fillPrice','sl','tp'}
@@ -1300,50 +1594,64 @@ class ChunkEntries:
             row = self.storage.db.execute('SELECT digest,result FROM chunk_entry_closures WHERE id=?', (identifier,)).fetchone()
         return (row[0], json.loads(row[1])) if row else None
 
-    def reconcile_closed_position(self, identifier):
+    def reconcile_closed_position(self, identifier, entry_id=None):
         """Retire a failed close display using exact exits; never replay it."""
         saved = self._closure_receipt(identifier)
+        if not saved and entry_id and hasattr(self,'coordinator'):
+            # Older whole-parent commands lived only in the coordinator
+            # journal. Each connected shard can still prove its own exits.
+            saved = self.coordinator._closure_receipt(identifier)
         if not saved or saved[1].get('status') != 'unknown' or not self.lock.acquire(blocking=False):
             return False
         try:
-            found = self._load(saved[1].get('entryId'))
+            captured_id = saved[1].get('entryId')
+            if not captured_id or entry_id and captured_id != entry_id:
+                return False
+            found = self._load(captured_id)
             if not found:
                 return False
             _, payload, state = found
-            if (state.get('closurePending') != identifier or state['phase'] != 'unknown'
+            if (state.get('closurePending') != identifier or state['phase'] not in ('unknown','stopped')
+                    or self._protecting(captured_id)
                     or state.get('protectionPending') or state.get('reconciliation', {}).get('status') == 'checking'
                     or any(child['state'] not in ('confirmed','cancelled','rejected') for child in state['children'])
                     or any(details.get('commonStopUncertain') for details in state['accounts'].values())):
                 return False
-            count = 0
+            closed_positions = []
             for account in state['accounts']:
                 positions = [child['positions'][account] for child in state['children'] if account in child.get('positions', {})]
-                if not positions or len({row['ticket'] for row in positions}) != len(positions):
+                if (not positions or len({row['ticket'] for row in positions}) != len(positions)
+                        or any(self.owned_entry(account,row['ticket']) != state['id'] for row in positions)):
                     return False
-                watch = [dict(account=account,ticket=row['openingTicket'],symbol=payload['symbol']) for row in positions]
-                data = self._call(account,'entry_management',watch)
+                watch = [dict(account=account,ticket=row.get('openingTicket') or row['ticket'],
+                              positionTicket=row['ticket'],symbol=payload['symbol']) for row in positions]
+                data = self._call(account,'entry_close_reconciliation',identifier,watch)
                 if (str(data.get('account')) != account or data.get('server') != self.bridge.config['server']
                         or not isinstance(data.get('orders'),list)):
                     return False
                 # Include owned pending orders too: absence of positions alone
                 # cannot release a parent which can still acquire more volume.
-                if any(self.owned_entry(account,str(row['ticket'])) == state['id'] for row in data['orders']):
+                captured_tickets = {str(row['ticket']) for row in positions} | {str(row['ticket']) for row in watch}
+                if any(self.owned_entry(account,str(row['ticket'])) == state['id'] or row.get('symbol') == payload['symbol']
+                       and (any(str(row.get(key)) in captured_tickets for key in ('ticket','identifier'))
+                            or not row.get('__isPosition') and row.get('type') == payload['side']) for row in data['orders']):
                     return False
                 for position in positions:
-                    if self.owned_entry(account,position['ticket']) != state['id']:
-                        return False
-                    history = data.get('openingStates', {}).get(position['openingTicket'], {})
+                    opening_ticket = position.get('openingTicket') or position['ticket']
+                    history = data.get('openingStates', {}).get(opening_ticket, {})
                     proof = history.get('openingProof', {})
                     if (history.get('phase') != 'closed' or proof.get('kind') != 'exact-balanced-opening-v1'
-                            or proof.get('openingTicket') != position['openingTicket']
+                            or proof.get('openingTicket') != opening_ticket
                             or proof.get('positionId') != position['ticket'] or proof.get('symbol') != payload['symbol']
                             or proof.get('side') != payload['side']
                             or abs(number(proof.get('volume'),'Closed opening volume')-position.get('acquiredVolume',position['volume'])) > 1e-8
                             or abs(number(proof.get('fillPrice'),'Closed opening price')-position['fillPrice']) > 1e-8):
                         return False
-                    count += 1
-            if not count:
+                    closed_positions.append(position)
+            if not closed_positions:
                 return False
+            for position in closed_positions:
+                position['closed'] = True
             state.pop('closurePending',None);state.pop('protectionPause',None)
             state.update(phase='stopped',positionsClosed=True,hasOpenPositions=False,positionsConfirmed=True,
                 positionLifecycle='closed',reason='Exact broker full exits confirmed; original close receipt retained')
@@ -1384,14 +1692,34 @@ class ChunkEntries:
                 if count: self.protection_requests[entry_id]=count
                 else: del self.protection_requests[entry_id]
 
-    def _owned_close_view(self, payload, state, account):
+    @staticmethod
+    def _exact_closed_opening(payload, captured, history):
+        opening = history.get('openingProof', {})
+        return (history.get('phase') == 'closed' and opening.get('kind') == 'exact-balanced-opening-v1'
+                and opening.get('openingTicket') == (captured.get('openingTicket') or captured['ticket'])
+                and opening.get('positionId') == captured['ticket'] and opening.get('symbol') == payload['symbol']
+                and opening.get('side') == payload['side']
+                and abs(number(opening.get('volume'), 'Closed opening volume')-captured.get('acquiredVolume',captured['volume'])) <= 1e-8
+                and abs(number(opening.get('fillPrice'), 'Closed opening price')-captured['fillPrice']) <= 1e-8)
+
+    def _owned_close_view(self, payload, state, account, *, exact_exit=False, data=None, preflight=False, close_control_id=None):
         positions = [child['positions'][account] for child in state['children'] if account in child.get('positions',{})]
         if len({row['ticket'] for row in positions}) != len(positions):
             raise ValueError('Owned close tickets are duplicated')
         watch = [dict(account=account,ticket=row['openingTicket'],symbol=payload['symbol']) for row in positions]
-        data = self._call(account,'entry_management',watch)
-        if str(data.get('account')) != account:
+        if data is None:
+            if close_control_id is not None:
+                for target, position in zip(watch, positions):
+                    target['positionTicket'] = position['ticket']
+                data = self._call(account,'entry_close_reconciliation',close_control_id,watch)
+            else:
+                options = (True,) if preflight else ()
+                data = self._call(account,'entry_management',watch,*options)
+        if str(data.get('account')) != account or (exact_exit or preflight) and data.get('server') != self.bridge.config['server']:
             raise ValueError('Close account identity mismatch')
+        if exact_exit and (not isinstance(data.get('orders'),list) or any(not row.get('__isPosition')
+                and self.owned_entry(account,str(row['ticket'])) == state['id'] for row in data['orders'])):
+            raise ValueError('Owned pending orders are not settled')
         result = []
         for captured in positions:
             if self.owned_entry(account,captured['ticket']) != state['id']:
@@ -1400,7 +1728,12 @@ class ChunkEntries:
             if row is None:
                 proof = data.get('openingStates',{}).get(captured['openingTicket'],{})
                 if proof.get('phase') != 'closed':
-                    raise ValueError('Absent owned position has no definite broker full-exit proof')
+                    reason = 'Absent owned position has no definite broker full-exit proof'
+                    detail = proof.get('reason')
+                    error = CloseHistoryPending if proof.get('phase')=='unknown' and detail in CLOSE_HISTORY_PENDING_REASONS else ValueError
+                    raise error(reason+': '+detail if detail else reason)
+                if exact_exit and not self._exact_closed_opening(payload,captured,proof):
+                    raise ValueError('Owned position does not match the exact full exit')
                 result.append(dict(ticket=captured['ticket'],status='closed',volume=0.))
                 continue
             volume = number(row.get('lots'),'Owned remaining close volume')
@@ -1419,10 +1752,11 @@ class ChunkEntries:
             result.append(dict(ticket=captured['ticket'],status='open',volume=volume,sl=float(row['sl']),tp=float(row['tp'])))
         return result
 
-    def _refresh_protection_positions(self, payload, state):
+    def _refresh_protection_positions(self, payload, state, *, account_views=None):
         reduced = False
         for account in state['accounts']:
-            views = {row['ticket']:row for row in self._owned_close_view(payload,state,account)}
+            view = (account_views or {}).get(account)
+            views = {row['ticket']:row for row in self._owned_close_view(payload,state,account,data=view)}
             for child in state['children']:
                 position = child.get('positions',{}).get(account)
                 if not position:
@@ -1485,8 +1819,7 @@ class ChunkEntries:
                     self._hybrid_limit(payload,state,child,cancel=True)
             views={}
             for account in state['accounts']:
-                self._account(account)
-                views[account]=self._owned_close_view(payload,state,account)
+                views[account]=self._owned_close_view(payload,state,account,preflight=True)
             preflight_complete=True
             plans={account:partial_close_plan(rows,state['accounts'][account]['spec'],command['closePercent'])
                 for account,rows in views.items()} if partial else {}
@@ -1515,7 +1848,10 @@ class ChunkEntries:
                     result['accountResults'][account]=self._close_account_positions(identifier,payload,state,account,rows,plans.get(account))
                     if result['accountResults'][account]['status']!='ok':break
             if set(result['accountResults'])!=set(views) or any(row['status']!='ok' for row in result['accountResults'].values()):
-                raise RuntimeError('An owned close result is unconfirmed; no automatic retry')
+                reason = 'An owned close result is unconfirmed; no automatic retry'
+                if len(views)==1:
+                    reason = result['accountResults'].get(next(iter(views)),{}).get('reason') or reason
+                raise RuntimeError(reason)
             # Read all accounts again: no successful envelope relies solely on
             # an order-send retcode or an earlier account's stale snapshot.
             if partial:
@@ -1548,29 +1884,77 @@ class ChunkEntries:
         self._save(state, ('chunk_entry_closures', identifier, result))
         return dict(result=result,entry=public_record(state))
 
+    def _confirm_account_full_close(self, identifier, payload, state, account, before_open, exact_close_orders):
+        try:
+            after = self._owned_close_view(payload,state,account)
+            still_open = {row['ticket'] for row in after if row['status']!='closed'}
+            if not still_open:
+                return
+            reason = RuntimeError('Broker has not confirmed every owned position fully closed')
+            if not still_open <= before_open:
+                raise reason
+        except CloseHistoryPending as error:
+            reason = error
+        if not before_open or len(exact_close_orders)!=len(before_open):
+            raise reason
+
+        # DONE can precede the account's updated position view and deal history.
+        # Recheck only the captured account and tickets, without sending again.
+        started = time.monotonic()
+        deadline = started + CLOSE_PROOF_RECHECK_SECONDS[-1]
+        for delay in CLOSE_PROOF_RECHECK_SECONDS:
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if started+delay > now:
+                time.sleep(started+delay-now)
+            try:
+                after = self._owned_close_view(payload,state,account,exact_exit=True,close_control_id=identifier)
+            except CloseHistoryPending as error:
+                reason = error
+                continue
+            still_open = {row['ticket'] for row in after if row['status']!='closed'}
+            if not still_open:
+                return
+            reason = RuntimeError('Broker has not confirmed every owned position fully closed')
+            if not still_open <= before_open:
+                break
+        raise reason
+
     def _close_account_positions(self, identifier, payload, state, account, rows, plan=None):
         result=dict(status='unknown',positions=[])
+        exact_close_orders=set()
         try:
             for row in rows:
                 if row['status']=='closed':
                     result['positions'].append(dict(ticket=row['ticket'],status='closed',alreadyClosed=True));continue
                 amount=plan['volumes'][row['ticket']] if plan is not None else row['volume']
                 if not amount:continue
-                close_id='parent-close:'+hashlib.sha256((identifier+':'+account+':'+row['ticket']).encode()).hexdigest()
-                outcome=self._call(account,'execute','close',dict(id=close_id,ticket=row['ticket'],symbol=payload['symbol'],
-                    volume=amount,expectedVolume=row['volume'],expiresAt=time.time()*1000+3000))['result']
+                close_id=native_parent_close_id(identifier,account,row['ticket'])
+                reply=self._call(account,'execute','close',dict(id=close_id,ticket=row['ticket'],symbol=payload['symbol'],
+                    volume=amount,expectedVolume=row['volume'],expiresAt=time.time()*1000+3000))
+                outcome=reply['result']
                 result['positions'].append({**hybrid_receipt(outcome),'ticket':row['ticket']})
                 if outcome.get('status')!='ok':
-                    raise RuntimeError('An owned close result is unconfirmed; no automatic retry')
-            after=self._owned_close_view(payload,state,account)
+                    raise RuntimeError(outcome.get('reason') or 'An owned close result is unconfirmed; no automatic retry')
+                if plan is None:
+                    order=outcome.get('providerOrderId')
+                    volume=outcome.get('filledVolume')
+                    if (str(reply.get('account'))==account and reply.get('server')==self.bridge.config['server']
+                            and outcome.get('operation')=='close' and outcome.get('ticket')==row['ticket']
+                            and outcome.get('retcode')==10009 and isinstance(order,str) and re.fullmatch(r'[1-9][0-9]{0,19}',order)
+                            and type(volume) in (int,float) and volume>0 and abs(volume-amount)<=1e-8):
+                        exact_close_orders.add(order)
             if plan is not None:
+                after=self._owned_close_view(payload,state,account)
                 before={row['ticket']:row['volume'] for row in rows}
                 for row in after:
                     if abs(row['volume']-(before[row['ticket']]-plan['volumes'].get(row['ticket'],0)))>1e-8:
                         raise RuntimeError('Broker has not confirmed the exact partial-close remainder')
                 result.update(filledVolume=plan['volume'],remainingVolume=plan['remaining'])
-            elif any(row['status']!='closed' for row in after):
-                raise RuntimeError('Broker has not confirmed every owned position fully closed')
+            else:
+                before_open={row['ticket'] for row in rows if row['status']=='open'}
+                self._confirm_account_full_close(identifier,payload,state,account,before_open,exact_close_orders)
             result['status']='ok'
         except Exception as error:
             result['reason']=str(error)
@@ -1835,7 +2219,7 @@ class ChunkEntries:
                 raise ValueError('An automatic exit deadline is required for chunk entry')
             self.bridge.validate_deadline(payload)
             active = [state for _, text in self._active_rows()
-                      if (state := json.loads(text))['phase'] in ACTIVE]
+                      if (state := json.loads(text))['phase'] in ACTIVE and not state.get('observeAdmissionHold')]
             if any(row['symbol'] == payload['symbol'] and row['side'] == payload['side'] for row in active):
                 raise ValueError('An entry in this direction is already active for this symbol; inspect it before arming another')
             if len(active) >= 4:
@@ -2106,6 +2490,29 @@ class ChunkEntries:
     def _begin_account_stops(self, identifier, entry_id, payload):
         return []
 
+    def stop_receipt(self, identifier):
+        if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,130}', identifier):
+            raise ValueError('A single exact entry stop ID is required')
+        with self.storage.lock:
+            row = self.storage.db.execute('SELECT stops.result, receipts.entry_id, receipts.cancelled '
+                'FROM chunk_entry_stops stops JOIN chunk_entry_stop_receipts receipts USING(id) WHERE id=?',
+                (identifier,)).fetchone()
+        if row is None:
+            return None
+        state, entry_id, cancelled = json.loads(row[0]), row[1], json.loads(row[2])
+        if state.get('id') != entry_id or not isinstance(cancelled, list):
+            raise ValueError('Saved stop receipt has invalid identity')
+        return dict(entry=public_record(state), entryControlReceipt=dict(schema='entry-control-recovery-v1',
+            id=identifier, entryId=entry_id, cancelContinueIds=cancelled))
+
+    def _store_stop(self, identifier, fingerprint, entry_id, payload, state):
+        # The complete list can include previously revoked IDs. The revocation
+        # table alone cannot prove which of those IDs were in this request.
+        self.storage.db.execute('INSERT INTO chunk_entry_stops VALUES (?,?,?)',
+            (identifier, fingerprint, json.dumps(state)))
+        self.storage.db.execute('INSERT INTO chunk_entry_stop_receipts VALUES (?,?,?)',
+            (identifier, entry_id, json.dumps(payload.get('cancelContinueIds', []))))
+
     def _stop_locked(self, identifier, fingerprint, entry_id, payload):
         # The priority protocol validates expiry at admission in stop(). Once
         # accepted, a slow read must not undo the operator's cancellation.
@@ -2128,7 +2535,7 @@ class ChunkEntries:
                 createdAt=time.time() * 1000, updatedAt=time.time() * 1000)
             with self.storage.lock:
                 try:
-                    self.storage.db.execute('INSERT INTO chunk_entry_stops VALUES (?,?,?)', (identifier, fingerprint, json.dumps(state)))
+                    self._store_stop(identifier, fingerprint, entry_id, payload, state)
                     self.storage.db.execute('INSERT OR IGNORE INTO chunk_entry_cancels VALUES (?,?)', (entry_id, identifier))
                     self.storage.db.commit()
                 except Exception:
@@ -2140,6 +2547,7 @@ class ChunkEntries:
         hybrid = found[1].get('executionPolicy') == 'hybrid-market-limit-v1'
         if hybrid:
             deadline()
+            state.pop('observeAdmissionHold', None)
             if state.get('reconciliation', {}).get('status') == 'checking':
                 state['reconciliation']['resumeAllowed'] = False
             # The explicit cancellation remains durable even when its common
@@ -2174,7 +2582,7 @@ class ChunkEntries:
         with self.storage.lock:
             try:
                 self.storage.db.execute('UPDATE chunk_entries SET state=? WHERE id=?', (json.dumps(state), state['id']))
-                self.storage.db.execute('INSERT INTO chunk_entry_stops VALUES (?,?,?)', (identifier, fingerprint, json.dumps(state)))
+                self._store_stop(identifier, fingerprint, entry_id, payload, state)
                 self.storage.db.execute('INSERT OR IGNORE INTO chunk_entry_cancels VALUES (?,?)', (entry_id, identifier))
                 self.storage.db.commit()
             except Exception:
@@ -2192,9 +2600,11 @@ class ChunkEntries:
         ticket = str(outcome.get('providerOrderId', ''))
         if not re.fullmatch(r'[1-9][0-9]{0,19}', ticket):
             raise ValueError('Номер лимитной заявки не подтверждён; повторная отправка запрещена')
-        self._account(account)
+        if not hasattr(self, 'lane_account'):
+            self._account(account)
         view = self._call(account, 'entry_limit_state', ticket, payload['symbol'])
-        if str(view.get('account')) != account:
+        if (str(view.get('account')) != account or
+                hasattr(self, 'lane_account') and view.get('server') != self.bridge.config['server']):
             raise ValueError('Limit status account mismatch')
         return ticket, view
 
@@ -2374,16 +2784,20 @@ class ChunkEntries:
             return [self.progress_observer.decorate(row) for row in selected] if self.progress_observer else selected
 
     def get(self, identifier):
-        """Read one exact durable parent without admission, mutation or retry."""
+        """Read one durable parent and reconcile verified exits without sending orders."""
         if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,100}', identifier):
             raise ValueError('Invalid chunk entry ID')
         with self.lock:
             found = self._load(identifier)
-            if found:
-                record = public_record(found[2])
-                return self.progress_observer.decorate(record) if self.progress_observer else record
-            cancelled = self._cancelled(identifier)
-            return public_record(cancelled) if cancelled is not None else None
+            if not found:
+                cancelled = self._cancelled(identifier)
+                return public_record(cancelled) if cancelled is not None else None
+            record = public_record(found[2])
+        if (record.get('accountExecution') != 'independent-v5' and record.get('closurePending')
+                and record['phase'] in ('unknown','stopped')
+                and self.reconcile_closed_position(record['closurePending'],identifier)):
+            return self.get(identifier)
+        return self.progress_observer.decorate(record) if self.progress_observer else record
 
     def _positions(self, payload, state, accounts=None, evidence=None):
         for account in state['accounts']:
@@ -2433,16 +2847,38 @@ class ChunkEntries:
                 self.position_proof = getattr(self,'position_proof',{})
                 self.position_proof[account] = (time.monotonic(),digest(dict(positions=[position for _,position in expected])))
 
-    def _confirmed_position(self, payload, state, child, account, outcome):
-        """Validate one exact full fill, with the same proof for every policy."""
+    def _confirmed_position(self, payload, state, child, account, outcome, *, partial_view=None):
+        """Validate the exact position for an already confirmed opening."""
+        partial = partial_view is not None
         volume = number(outcome.get('filledVolume'), 'Confirmed fill volume')
-        price = number(outcome.get('fillPrice'), 'Confirmed fill price')
+        hybrid = payload.get('executionPolicy') == 'hybrid-market-limit-v1'
+        reported_price = outcome.get('fillPrice')
+        # Some completed market replies carry an exact ticket and volume but
+        # leave the execution price at zero. The existing broker proof below
+        # can supply that price once the exact position or closed deal is visible.
+        price_from_broker = (hybrid and child['type'] == 'market' and outcome.get('retcode') == 10009
+                             and type(reported_price) in (int, float) and reported_price == 0)
+        price = None if price_from_broker else number(reported_price, 'Confirmed fill price')
         opening = str(outcome.get('providerOrderId', ''))
-        if outcome.get('status') != 'ok' or abs(volume - child['volumes'][account]) > 1e-8 or not re.fullmatch(r'[1-9][0-9]{0,19}', opening):
+        requested = child['volumes'][account]
+        volume_matches = (payload.get('initialSizingOnly') is True and child['type'] == 'market'
+                          and outcome.get('nativePartial') is True and volume < requested-1e-8
+                          if partial else abs(volume-requested) <= 1e-8)
+        if outcome.get('status') != 'ok' or not volume_matches or not re.fullmatch(r'[1-9][0-9]{0,19}', opening):
             raise ValueError('A tranche fill does not match the requested volume; inspect every account')
         cached=getattr(self,'opening_proofs',{}).pop((child['id'],account),None)
         data=None
-        if (isinstance(cached,dict) and cached.get('schema')=='entry-opening-proof-v1'
+        if partial:
+            proof = partial_view['partialMarketProof']
+            rows = partial_view['positions']
+            if proof['closed']:
+                resolved = dict(phase='closed', openingProof=dict(proof, kind='exact-balanced-opening-v1', volume=volume))
+            elif len(rows) == 1:
+                resolved = dict(ticket=rows[0]['ticket'])
+            else:
+                raise ValueError('Exact IOC position is not visible')
+            data = dict(account=account, server=self.bridge.config['server'], orders=rows, openingStates={opening:resolved})
+        elif (isinstance(cached,dict) and cached.get('schema')=='entry-opening-proof-v1'
                 and cached.get('commandId')==child['id'] and str(cached.get('account'))==account
                 and cached.get('server')==self.bridge.config['server']
                 and type(cached.get('checkedAt')) in (int,float)
@@ -2451,24 +2887,31 @@ class ChunkEntries:
         if data is None:
             data = self._call(account,'entry_positions' if payload.get('initialSizingOnly') is True else 'entry_management',
                 [dict(account=account, ticket=opening, symbol=payload['symbol'])])
-        if str(data.get('account')) != account:
+        if (str(data.get('account')) != account
+                or (price_from_broker or partial) and data.get('server') != self.bridge.config['server']):
             raise ValueError('Management account mismatch after entry')
         resolved = data.get('openingStates', {}).get(opening, {})
         ticket = str(resolved.get('ticket', opening))
-        row = next((row for row in data.get('orders', []) if row.get('__isPosition') and row.get('symbol') == payload['symbol']
-                    and (str(row.get('ticket')) == ticket or opening in (str(row.get('ticket')), str(row.get('identifier'))))), None)
+        matches = (row for row in data.get('orders', []) if row.get('__isPosition') and row.get('symbol') == payload['symbol']
+                   and (str(row.get('ticket')) == ticket or opening in (str(row.get('ticket')), str(row.get('identifier')))))
+        row = next(matches, None)
+        if (price_from_broker or partial) and next(matches, None) is not None:
+            raise ValueError('Multiple positions match the confirmed opening ticket')
         closed = resolved.get('openingProof', {}) if resolved.get('phase') == 'closed' else {}
         closed_row = (not row and closed.get('kind') == 'exact-balanced-opening-v1'
             and closed.get('openingTicket') == opening and closed.get('symbol') == payload['symbol']
             and closed.get('side') == payload['side'] and re.fullmatch(r'[1-9][0-9]{0,19}', str(closed.get('positionId', '')))
             and abs(number(closed.get('volume'), 'Historical entry volume')-volume) <= 1e-8
-            and abs(number(closed.get('fillPrice'), 'Historical entry price')-price) <= 1e-8)
+            and (price_from_broker or abs(number(closed.get('fillPrice'), 'Historical entry price')-price) <= 1e-8))
         if closed_row:
             row = dict(ticket=closed['positionId'], lots=closed['volume'], type=closed['side'],
-                       sl=closed.get('sl'), tp=closed.get('tp'))
+                       sl=closed.get('sl'), tp=closed.get('tp'), open_price=closed.get('fillPrice'))
         if not row or abs(float(row['lots']) - volume) > 1e-8 or row.get('type') != payload['side']:
             raise ValueError('Confirmed entry position is not visible or changed; inspect every account')
-        hybrid = payload.get('executionPolicy') == 'hybrid-market-limit-v1'
+        if price_from_broker:
+            price = number(row.get('open_price'), 'Broker-confirmed fill price')
+        if partial and abs(number(row.get('open_price'), 'Broker-confirmed partial fill price')-price) > 1e-8:
+            raise ValueError('Partial fill price differs from exact terminal history')
         expected_sl = self._hybrid_stop(payload, state, account, child.get('prices', {}).get(account, price)) if hybrid else payload['sl']
         expected_tp = self._hybrid_tp(payload, state, account) if hybrid else payload.get('tp', 0)
         distance = self._hybrid_distance(payload, state, account) if hybrid else entry_stop_distance(payload)
@@ -2481,7 +2924,7 @@ class ChunkEntries:
             raise ValueError('Entry protection differs from the fixed SL/TP; inspect every account')
         position=dict(ticket=str(row['ticket']), openingTicket=opening, volume=volume, fillPrice=price,
                       sl=expected_sl, tp=expected_tp, **({'closedAtBroker': True} if closed_row else {}))
-        if payload.get('initialSizingOnly') is True and not closed_row:
+        if payload.get('initialSizingOnly') is True and not closed_row and not partial:
             captured=[item['positions'][account] for item in state['children']
                 if account in item.get('positions',{}) and not item['positions'][account].get('closed')
                 and account not in item.get('closedOpenings',{})]+[position]
@@ -2492,6 +2935,92 @@ class ChunkEntries:
                 self.position_proof=getattr(self,'position_proof',{})
                 self.position_proof[account]=(time.monotonic(),digest(dict(positions=captured)))
         return position
+
+    def _recover_stopped_zero_price_fill(self, payload, state, accounts, evidence=None):
+        """Reconcile a stopped lane from its exact native receipt and live positions."""
+        account = getattr(self, 'account_id', None)
+        if (state['phase'] != 'stopped' or payload.get('initialSizingOnly') is not True
+                or accounts != [account] or set(state['accounts']) != {account}
+                or state.get('protectionPending') or state.get('closurePending') or state.get('positionsClosed')
+                or state['accounts'][account].get('commonStopUncertain')):
+            return False
+        unsettled = [child for child in state['children'] if child['state'] not in ('confirmed','cancelled','rejected')]
+        if len(unsettled) != 1:
+            return False
+        child = unsettled[0]
+        if child['type'] != 'market' or child['state'] != 'unknown' or set(child['volumes']) != {account} or child.get('positions'):
+            return False
+        captured = self._limit_results(state, child).get(account, {})
+        if (captured.get('status') != 'ok' or captured.get('fillPrice') != 0
+                or captured.get('filledVolume') != child['volumes'][account]
+                or not re.fullmatch(r'[1-9][0-9]{0,19}', str(captured.get('providerOrderId', '')))):
+            return False
+        reply = self._call(account, 'receipt', self._native_opening_id(child, account))
+        outcome = reply.get('result') or {}
+        if (str(reply.get('account')) != account or reply.get('server') != self.bridge.config['server']
+                or outcome.get('status') != 'ok' or outcome.get('retcode') != 10009 or outcome.get('fillPrice') != 0
+                or outcome.get('filledVolume') != captured['filledVolume']
+                or str(outcome.get('providerOrderId')) != str(captured['providerOrderId'])):
+            return False
+        opening = str(outcome['providerOrderId'])
+        data = evidence if evidence is not None else self._call(account, 'entry_positions')
+        if (str(data.get('account')) != account or data.get('server') != self.bridge.config['server']
+                or not 0 <= time.time()*1000-number(data.get('checkedAt'), 'Native snapshot time') <= 2500):
+            return False
+        rows = [row for row in data['orders'] if row['symbol'] == payload['symbol']]
+        matches = [row for row in rows if opening in (str(row['ticket']),str(row.get('identifier')))]
+        if len(matches) != 1:
+            return False
+
+        def live_position(row, captured):
+            if (row.get('__isPosition') is not True or row.get('type') != payload['side']
+                    or abs(number(row.get('lots'), 'Native volume')-captured['volume']) > 1e-8):
+                raise ValueError('Recovered position side or volume differs from the original fill')
+            fill = number(row.get('open_price'), 'Native fill price')
+            if 'fillPrice' in captured and abs(fill-captured['fillPrice']) > 1e-8:
+                raise ValueError('Existing position fill price differs')
+            take = number(row.get('tp'), 'Native take profit', positive=False)
+            if take < 0:
+                raise ValueError('Invalid native take profit')
+            return dict(captured, ticket=str(row['ticket']), fillPrice=fill,
+                        sl=number(row.get('sl'), 'Native stop'), tp=take)
+
+        position = live_position(matches[0], dict(openingTicket=opening, volume=outcome['filledVolume']))
+        others = {}
+        by_ticket = {str(row['ticket']):row for row in rows}
+        for other in state['children']:
+            saved = other.get('positions', {}).get(account)
+            if not saved or saved.get('closed') or account in other.get('closedOpenings', {}):
+                continue
+            current = by_ticket.get(saved['ticket'])
+            if not current or saved['ticket'] == position['ticket'] or self.owned_entry(account,saved['ticket']) != state['id']:
+                return False
+            others[other['id']] = live_position(current,saved)
+        if self.owned_entry(account, opening) != state['id']:
+            return False
+        live = [position, *others.values()]
+        details = state['accounts'][account]
+        volume = sum(row['volume'] for row in live)
+        if volume > details['targetVolume']+1e-8:
+            return False
+        child.update(state='confirmed', positions={account:position},
+                     reconciledResult=dict(status='ok',accountResults={account:dict(hybrid_receipt(outcome),fillPrice=position['fillPrice'])}))
+        for other in state['children']:
+            if other['id'] in others:
+                other['positions'][account] = others[other['id']]
+        stops = {row['sl'] for row in live}; takes = {row['tp'] for row in live}
+        details.update(sl=next(iter(stops)) if len(stops)==1 else None,
+                       tp=next(iter(takes)) if len(takes)==1 else None,
+                       averagePrice=rounded(sum(row['volume']*row['fillPrice'] for row in live)/volume),
+                       recoveredZeroPriceFill=True, entryStatus='stopped',
+                       entryReason='Exact broker fill confirmed; acquisition remains stopped')
+        details.pop('stopSignature',None)
+        if state.get('reconciliation', {}).get('status') == 'checking':
+            state['reconciliation'].update(status='confirmed', resumeAllowed=False, checkedAt=time.time()*1000)
+        state['nextChunk'] += 1
+        self._hybrid_recount(payload, state, allow_excess_risk=True)
+        self._save(state)
+        return True
 
     def _confirm(self, payload, state, child, result):
         accounts = child['volumes'] if payload.get('executionPolicy') == 'hybrid-market-limit-v1' else state['accounts']
@@ -2973,22 +3502,28 @@ class ChunkEntries:
             signature = digest(dict(positions=[{key: row[key] for key in ('ticket', 'volume', 'fillPrice')} for row in positions]))
             if not recovering and details.get('stopSignature') == signature:
                 continue
+            take_distance = (payload.get('entryTakeDistance')
+                             if 'tp' not in details.get('protectionOverride', {}) else None)
+            direction = 1 if payload['side']=='buy' else -1
+            average = sum(row['volume']*row['fillPrice'] for row in positions)/sum(row['volume'] for row in positions)
             if not recovering and payload.get('initialSizingOnly') is True and not details.get('stopCheckRejected'):
                 # Only a current full position proof can avoid a no-op native
                 # stop command. A real weighted-stop change still uses the
                 # durable broker operation and verifies every affected ticket.
                 proof = getattr(self,'position_proof',{}).get(account)
                 distance = self._hybrid_distance(payload,state,account)
-                average = sum(row['volume']*row['fillPrice'] for row in positions)/sum(row['volume'] for row in positions)
-                direction = 1 if payload['side']=='buy' else -1
                 if distance is None:
                     target = self._hybrid_stop(payload,state,account,average)
                 else:
                     units=Decimal(str(average-direction*distance))/Decimal(str(payload['tickSize']))
                     target=float(units.to_integral_value(rounding=ROUND_CEILING if direction==1 else ROUND_FLOOR)*Decimal(str(payload['tickSize'])))
+                take = (entry_take_price(average, direction, take_distance, payload['tickSize'])
+                        if take_distance is not None else self._hybrid_tp(payload,state,account))
                 if (proof and time.monotonic()-proof[0]<=.25 and proof[1]==digest(dict(positions=positions))
-                        and all(abs(row['sl']-target)<=1e-8 and abs(row['tp']-self._hybrid_tp(payload,state,account))<=1e-8 for row in positions)):
+                        and all(abs(row['sl']-target)<=1e-8 and abs(row['tp']-take)<=1e-8 for row in positions)):
                     details.update(stopSignature=signature,sl=target,averagePrice=rounded(average))
+                    if take_distance is not None:
+                        details['tp'] = take
                     self._save(state)
                     continue
             observation_started = time.monotonic()
@@ -3027,6 +3562,8 @@ class ChunkEntries:
                     request['stopDistance'] = distance
                 if weighted_nasdaq_stop(payload) and distance is not None:
                     request['weightedEntryStop'] = True
+                if take_distance is not None:
+                    request['takeDistance'] = take_distance
                 details.update(commonStopUncertain=True,commonStopRequest=request)
                 self._save(state)
                 try:
@@ -3078,15 +3615,29 @@ class ChunkEntries:
             rows = {str(row['ticket']): row for row in result.get('positions', [])}
             if set(rows) != {row['ticket'] for row in positions}:
                 raise ValueError('Common stop returned different position identities')
+            take = None
+            if 'takeDistance' in request:
+                take = entry_take_price(average, direction, request['takeDistance'], payload['tickSize'])
+                if abs(number(result.get('tp'), 'Common take profit') - take) > 1e-8:
+                    raise ValueError('Common take profit does not match the weighted entry')
+            verified = {}
             for child in state['children']:
                 position = child.get('positions', {}).get(account)
                 if position and not position.get('closed') and account not in child.get('closedOpenings', {}):
                     updated = rows[position['ticket']]
-                    if any(abs(float(updated[key])-position[key]) > 1e-8 for key in ('volume', 'fillPrice', 'tp')):
+                    if (any(abs(number(updated[key], key)-position[key]) > 1e-8 for key in ('volume', 'fillPrice'))
+                            or abs(number(updated['tp'], 'Confirmed take profit', positive=False)
+                                   - (position['tp'] if take is None else take)) > 1e-8):
                         raise ValueError('Position changed during common stop update')
-                    position['sl'] = number(updated['sl'], 'Confirmed common stop')
+                    verified[position['ticket']] = number(updated['sl'], 'Confirmed common stop')
+            for position in positions:
+                position['sl'] = verified[position['ticket']]
+                if take is not None:
+                    position['tp'] = take
             details.update(averagePrice=number(result['averagePrice'], 'Average entry price'),
                            sl=number(result['sl'], 'Common stop'), stopSignature=signature, commonStopUncertain=False)
+            if take is not None:
+                details['tp'] = take
             details.pop('commonStopRequest',None)
             details.pop('commonStopRecoveryAllowed',None)
             details.pop('stopCheckRejected', None)
@@ -3201,7 +3752,7 @@ class ChunkEntries:
         return max(details['riskUsd'], rounded(details['riskUsed']+
             max(0.,details['targetVolume']-details['filledVolume'])*max(0.,cost)*details['pointValue']))
 
-    def _hybrid_guards(self, payload, state, prices, volumes, reserved=None, support=False):
+    def _hybrid_guards(self, payload, state, prices, volumes, reserved=None, support=False, *, fixed_limit_accounts=()):
         lower, upper = market_price_bounds(payload)
         direction = 1 if payload['side'] == 'buy' else -1
         guards = {}
@@ -3232,7 +3783,7 @@ class ChunkEntries:
                 guard['fixedProtection'] = dict(tp=self._hybrid_tp(payload, state, account))
                 if 'sl' in override:
                     guard['fixedProtection'].update(sl=stop, riskBudget=budget)
-            if support:
+            if support and account not in fixed_limit_accounts:
                 guard.update(limitPolicy='support', limitPrice=price)
                 if callable(getattr(self.bridge, 'entry_reconcile', None)):
                     guard['supportReprice'] = True
@@ -3275,7 +3826,7 @@ class ChunkEntries:
         self._save(state)
         raise ValueError(state['hybridRemainderStop'])
 
-    def _hybrid_send(self, payload, state, kind, prices, volumes, guards, support=False):
+    def _hybrid_send(self, payload, state, kind, prices, volumes, guards, support=False, *, supplement_accounts=()):
         if payload.get('initialSizingOnly') is True:
             # Native request receipts remain immutable. Only old, proven empty
             # rejections leave the hot parent; unknown or accepted claims stay.
@@ -3331,6 +3882,8 @@ class ChunkEntries:
         child = dict(id=request['id'], index=index+1, state='sending', type=kind, support=support,
             price=request['price'], prices=copy.deepcopy(prices), stops=stops, takes=takes, volumes=volumes,
             guards=copy.deepcopy(guards), positions={}, claimedAt=time.time()*1000)
+        if supplement_accounts:
+            child['edgeSupplementAccounts'] = sorted(supplement_accounts)
         state['children'].append(child)
         self._phase(state, 'sending', 'Hybrid volume reserved; awaiting broker confirmation')
         # The native command does not exist on the wire before its durable
@@ -3342,13 +3895,20 @@ class ChunkEntries:
                 request['entryGuard'] = guards[self.lane_account]
                 if payload.get('initialSizingOnly') is True:request['positionProofRequested']=True
                 try:
-                    reply = self._call(self.lane_account, 'execute', 'place', request)
+                    if deferred_expiry and getattr(self, 'native_opening_guard_after_claim', False):
+                        reply = self._call(self.lane_account, 'execute', 'place', request, None, True)
+                    else:
+                        reply = self._call(self.lane_account, 'execute', 'place', request)
                 except Exception as error:
                     if not getattr(error,'dispatch_not_sent',False):
                         raise
                     reply = dict(result=dict(status='rejected',dispatchNotSent=True,reason=str(error),
                         workerContention=getattr(error,'rpc_diagnostics',{})))
                 outcome = reply['result']
+                if (outcome.get('retryableConnection') is True
+                        and (str(reply.get('account')) != self.lane_account
+                             or reply.get('server') != self.bridge.config['server'])):
+                    raise ValueError('Pre-send connection refusal account or server mismatch')
                 if kind=='market' and outcome.get('status')=='ok' and isinstance(reply.get('positionProof'),dict):
                     self.opening_proofs=getattr(self,'opening_proofs',{})
                     self.opening_proofs[(child['id'],self.lane_account)]=reply['positionProof']
@@ -3435,7 +3995,7 @@ class ChunkEntries:
     def _reconcile_token(state):
         return digest(dict(children=state['children'], accounts=state['accounts'],
             stopRevision=state.get('stopRevision'), protectionPending=state.get('protectionPending'),
-            closurePending=state.get('closurePending')))
+            closurePending=state.get('closurePending'), observeAdmissionHold=state.get('observeAdmissionHold')))
 
     def _adopt_support_price(self, payload, state, child, account, outcome):
         if outcome.get('status') != 'ok' or not outcome.get('supportRepriced'):
@@ -3489,37 +4049,103 @@ class ChunkEntries:
         idle = getattr(worker, 'call_if_idle', None)
         return idle('entry_reconcile', items) if callable(idle) else worker.call('entry_reconcile', items)
 
+    def _read_passive_reconciliation(self, account, items):
+        return self._read_reconciliation(account, items)
+
+    def _passive_reconciliation_allowed(self):
+        return True
+
     def _native_opening_id(self, child, account):
         # Independent lanes send directly to the account journal. Only the
         # legacy grouped dispatcher appends the linked account suffix.
         return child['id'] if hasattr(self, 'lane_account') or account == self.primary else child['id']+':'+account
 
-    def _settle_reconciled_opening(self, payload, child, account, outcome, view):
+    @staticmethod
+    def _reconciled_ioc_market(payload, child, account, receipt, view):
+        proof = view.get('partialMarketProof')
+        if not isinstance(proof, dict) or proof.get('kind') != 'exact-ioc-partial-v1':
+            return None
+        opening = str(receipt.get('providerOrderId', ''))
+        requested = child['volumes'][account]
+        volume = number(proof.get('filledVolume'), 'IOC filled volume')
+        price = number(proof.get('fillPrice'), 'IOC fill price')
+        if (payload.get('initialSizingOnly') is not True or child['type'] != 'market'
+                or receipt.get('status') not in ('unknown','ok') or receipt.get('retcode') != 10010
+                or not re.fullmatch(r'[1-9][0-9]{0,19}', opening) or str(view.get('ticket')) != opening
+                or str(proof.get('openingTicket')) != opening or view.get('pending') != []
+                or not re.fullmatch(r'[1-9][0-9]{0,19}', str(proof.get('positionId', '')))
+                or proof.get('symbol') != payload['symbol'] or proof.get('side') != payload['side']
+                or type(proof.get('closed')) is not bool
+                or abs(number(proof.get('requestedVolume'), 'IOC requested volume')-requested) > 1e-8
+                or volume >= requested-1e-8
+                or abs(number(proof.get('sl'), 'IOC SL')-number(receipt.get('sl'), 'Submitted IOC SL')) > 1e-8
+                or abs(number(proof.get('tp'), 'IOC TP', positive=False)-child['takes'][account]) > 1e-8):
+            raise ValueError('Exact IOC proof differs from the captured reservation or protection')
+        if receipt.get('status') == 'ok' and (receipt.get('nativePartial') is not True
+                or abs(number(receipt.get('filledVolume'), 'Settled IOC volume')-volume) > 1e-8
+                or abs(number(receipt.get('fillPrice'), 'Settled IOC price')-price) > 1e-8):
+            raise ValueError('Exact IOC proof differs from the settled native receipt')
+        return dict(receipt, status='ok', filledVolume=volume, fillPrice=price, nativePartial=True, nativeReconciled=True)
+
+    def _settle_reconciled_opening(self, payload, child, account, outcome, view, position=None):
         if not outcome.get('nativeReconciled') or (view.get('receipt') or {}).get('status') != 'unknown':
             return
-        position = child.get('positions', {}).get(account, {})
+        if position is None:
+            position = child.get('positions', {}).get(account, {})
         expected = dict(id=self._native_opening_id(child, account),
             ticket=str(outcome['providerOrderId']), symbol=payload['symbol'], type=child['type'], side=payload['side'],
             volume=child['volumes'][account], price=position['fillPrice'] if child['type']=='market' else child['prices'][account],
             sl=position['sl'] if child['type']=='market' else child['stops'][account],
             tp=position['tp'] if child['type']=='market' else child['takes'][account])
+        if outcome.get('nativePartial') is True:
+            expected['partialVolume'] = position['volume']
         result = self._call(account, 'entry_confirm_reconciled', expected)
         if result.get('status')!='ok' or str(result.get('providerOrderId'))!=expected['ticket']:
             raise ValueError('Native opening confirmation did not settle its exact journal')
+        if 'partialVolume' in expected and (result.get('nativePartial') is not True
+                or abs(number(result.get('filledVolume'), 'Settled IOC volume')-expected['partialVolume']) > 1e-8
+                or abs(number(result.get('fillPrice'), 'Settled IOC price')-expected['price']) > 1e-8):
+            raise ValueError('Settled native IOC receipt changed its exact fill')
+        return result
+
+    def _record_reconciled_refusal(self, payload, state, child, account, outcome, evidence, now):
+        quote = evidence.get('quotes', {}).get(payload['symbol'], {})
+        volume = child['volumes'][account]
+        if payload.get('initialSizingOnly') is True and hasattr(self, 'lane_account'):
+            if (outcome.get('providerOrderId') not in (None, 0, '0', '')
+                    or outcome.get('filledVolume') not in (None, 0, 0.)):
+                return False
+            bid_ask = [quote.get('bid'), quote.get('ask')] if quote else None
+            return self._record_parallel_refusal(payload, state, child, account, outcome, bid_ask, volume)
+        if child['type'] == 'limit':
+            return self._optional_support_refusal(payload, state, child, account, outcome)
+        if not self._retryable_market_protection_refusal(payload, child, outcome):
+            return False
+        state['accounts'][account].setdefault('priceRejections', {})['market'] = dict(
+            quote=[quote.get('bid'), quote.get('ask')], volume=volume, at=now, retryMs=250, waitForQuoteChange=True)
+        return True
 
     def _reconcile_tick(self, payload, state):
         status = state['reconciliation']
+        passive = bool(state.get('observeAdmissionHold'))
+        identifier = state['id']
         if (self._stopping(state['id']) or time.time()*1000 >= payload['closeAtUtc']
                 or state.get('hybridRemainderStop') and not state.get('reconcileTransientHalt')):
             status['resumeAllowed'] = False
-        job = self.reconcile_jobs.get(state['id'])
+        job = self.reconcile_jobs.get(identifier)
         if job is None:
-            if time.monotonic() < self.reconcile_poll_at.get(state['id'], 0):
+            if time.monotonic() < self.reconcile_poll_at.get(identifier, 0):
                 return
             targets = [child for child in state['children'] if child['state'] in ('sending','unknown','pending')
-                       or child['id'] == state.get('missingNativeChild')][:16]
+                       or child['id'] == state.get('missingNativeChild')]
             if not targets:
                 raise ValueError('Reconciliation lost its captured opening identities')
+            if passive:
+                last = self.passive_reconcile_cursors.get(identifier)
+                start = next((index + 1 for index, child in enumerate(targets) if child['id'] == last), 0)
+                targets = (targets[start:] + targets[:start])[:PASSIVE_RECONCILE_BATCH]
+            else:
+                targets = targets[:16]
             items = {}
             for account in state['accounts']:
                 for child in targets:
@@ -3536,22 +4162,25 @@ class ChunkEntries:
             token = self._reconcile_token(state)
             futures = {}
             try:
+                read = self._read_passive_reconciliation if passive else self._read_reconciliation
                 for account in items:
-                    futures[account] = executor.submit(self._read_reconciliation, account, copy.deepcopy(items[account]))
+                    futures[account] = executor.submit(read, account, copy.deepcopy(items[account]))
             except Exception:
                 # Keep any already submitted reads; a later tick joins them.
                 pass
-            self.reconcile_jobs[state['id']] = dict(token=token, targets=[row['id'] for row in targets],
+            self.reconcile_jobs[identifier] = dict(token=token, targets=[row['id'] for row in targets],
                 items=items, futures=futures)
             for future in futures.values():
                 future.add_done_callback(self._read_finished)
             return
         if any(not future.done() for future in job['futures'].values()):
             return
-        del self.reconcile_jobs[state['id']]
-        self.reconcile_poll_at[state['id']] = time.monotonic()+.25
+        del self.reconcile_jobs[identifier]
+        self.reconcile_poll_at[identifier] = time.monotonic()+(PASSIVE_RECONCILE_INTERVAL if passive else .25)
         if job['token'] != self._reconcile_token(state):
             return  # A stop/protection changed the captured generation.
+        if passive and not self._passive_reconciliation_allowed():
+            return  # Do not start follow-up native proof while acquiring.
         try:
             data = {account: future.result() for account, future in job['futures'].items()}
             if set(data) != set(job['items']):
@@ -3564,6 +4193,8 @@ class ChunkEntries:
                         or row.get('readOnly') is not True or not isinstance(row.get('items'), dict)
                         or not -250 <= now-number(row.get('checkedAt'), 'Native reconciliation time') <= 3000):
                     raise ValueError('Native reconciliation account, freshness or identity mismatch')
+            if passive:
+                self.passive_reconcile_cursors[identifier] = job['targets'][-1]
             unsettled = False
             for child in state['children']:
                 if child['id'] not in job['targets']:
@@ -3571,14 +4202,20 @@ class ChunkEntries:
                 outcomes, views = {}, {}
                 original = self._limit_results(state, child)
                 for account in child['volumes']:
-                    identifier = self._native_opening_id(child, account)
-                    view = data[account]['items'].get(identifier)
+                    opening_id = self._native_opening_id(child, account)
+                    view = data[account]['items'].get(opening_id)
                     if not isinstance(view, dict):
                         raise ValueError('Native opening proof is incomplete')
                     saved = view.get('receipt') or {}
                     previous = original.get(account, {})
                     if saved.get('status') not in ('ok','rejected') and previous.get('status') in ('ok','rejected'):
                         saved = previous
+                    if (payload.get('initialSizingOnly') is True and child['type'] == 'market'
+                            and isinstance(saved.get('marketPartial'), dict)):
+                        saved = self._reconciled_ioc_market(payload, child, account, saved, view)
+                        if saved is None:
+                            unsettled = True
+                            continue
                     if saved.get('status') not in ('ok','rejected'):
                         # Positive exact broker rows can settle an ambiguous
                         # reply. Empty rows alone can never prove rejection.
@@ -3610,26 +4247,39 @@ class ChunkEntries:
                 child['reconciledResult'] = dict(status='ok' if all(row.get('status') == 'ok' for row in outcomes.values()) else
                     'rejected' if all(row.get('status') == 'rejected' for row in outcomes.values()) else 'unknown', accountResults=outcomes)
                 if child['type'] == 'market':
-                    if any(row['status'] == 'rejected' and not self._retryable_market_protection_refusal(
-                            payload, child, row) for row in outcomes.values()):
-                        state['hybridRemainderStop'] = 'Hybrid market was accepted on only some accounts; remainder stopped'
-                        status['resumeAllowed'] = False
                     for account, outcome in outcomes.items():
                         if outcome['status'] == 'rejected':
-                            if self._retryable_market_protection_refusal(payload, child, outcome):
-                                quote = data[account].get('quotes', {}).get(payload['symbol'], {})
-                                state['accounts'][account].setdefault('priceRejections', {})['market'] = dict(
-                                    quote=[quote.get('bid'), quote.get('ask')], volume=child['volumes'][account],
-                                    at=now, retryMs=250, waitForQuoteChange=True)
+                            if not self._record_reconciled_refusal(payload, state, child, account, outcome, data[account], now):
+                                state['hybridRemainderStop'] = 'Definite market rejection confirmed; remainder stopped'
+                                status['resumeAllowed'] = False
                             continue
-                        position = self._confirmed_position(payload, state, child, account, outcome)
+                        partial = outcome.get('nativePartial') is True
+                        if partial:
+                            position = self._confirmed_position(payload, state, child, account, outcome, partial_view=views[account])
+                        else:
+                            position = self._confirmed_position(payload, state, child, account, outcome)
+                        settled = self._settle_reconciled_opening(payload, child, account, outcome, views[account], position)
+                        if settled is not None:
+                            outcomes[account] = hybrid_receipt(settled)
+                        if partial and (views[account]['partialMarketProof']['closed']
+                                or (settled or outcome).get('nativeProof', {}).get('terminal') == 'closed'):
+                            position['closedAtBroker'] = True
                         child.setdefault('positions', {})[account] = position
-                        self._settle_reconciled_opening(payload, child, account, outcome, views[account])
                         if position.get('closedAtBroker'):
                             child.setdefault('closedOpenings', {})[account] = dict(openingTicket=position['openingTicket'], positionId=position['ticket'])
                             state['hybridRemainderStop'] = 'Captured opening is confirmed fully closed; remainder stopped'
                             status['resumeAllowed'] = False
                             state.pop('reconcileTransientHalt', None)
+                        elif partial:
+                            direction = 1 if payload['side'] == 'buy' else -1
+                            price, guard = position['fillPrice'], child['guards'][account]
+                            if (direction*(price-position['sl']) <= 0
+                                    or direction*(price-guard['anchor']) > guard['maxGap']+1e-8
+                                    or direction*(price-guard['maxRiskPrice']) > 1e-8
+                                    or fill_outside_zone(payload, price, guard['priceFloor'], guard['priceCeiling'])):
+                                child['fillGuardViolated'] = True
+                                state['hybridRemainderStop'] = 'Exact IOC fill exceeded captured bounds; remainder stopped'
+                                status['resumeAllowed'] = False
                     if child['state'] not in ('confirmed','rejected'):
                         state['nextChunk'] += 1
                     child['state'] = 'confirmed' if any(row['status'] == 'ok' for row in outcomes.values()) else 'rejected'
@@ -3637,8 +4287,8 @@ class ChunkEntries:
                     pending = False
                     for account, outcome in outcomes.items():
                         if outcome['status'] == 'rejected':
-                            if not self._optional_support_refusal(payload, state, child, account, outcome):
-                                state['hybridRemainderStop'] = 'Hybrid limit was accepted on only some accounts; remainder stopped'
+                            if not self._record_reconciled_refusal(payload, state, child, account, outcome, data[account], now):
+                                state['hybridRemainderStop'] = 'Definite limit rejection confirmed; remainder stopped'
                                 status['resumeAllowed'] = False
                             continue
                         view = views[account]
@@ -3653,16 +4303,23 @@ class ChunkEntries:
                             for key in ('pending','positions','terminal')})
                         live, _ = self._hybrid_apply_limit_view(payload, state, child, account,
                             str(outcome.get('providerOrderId')), current, cancel=not bool(current['pending']), retain_pending_fill=True)
-                        self._settle_reconciled_opening(payload, child, account, outcome, view)
+                        settled = self._settle_reconciled_opening(payload, child, account, outcome, view)
+                        if settled is not None:
+                            outcomes[account] = hybrid_receipt(settled)
                         pending |= live
                     child['state'] = ('rejected' if all(row['status']=='rejected' for row in outcomes.values())
                         else 'pending' if pending else 'confirmed' if child.get('positions') else 'cancelled')
-                    if pending and child.get('cancellations'):
-                        if not self._allow_frozen_cancel_retry(payload, state, child, data):
-                            unsettled = True
+                    if pending and (state.get('observeAdmissionHold') or child.get('cancellations')
+                                    and not self._allow_frozen_cancel_retry(payload, state, child, data)):
+                        unsettled = True
                 # Publish final native receipts consistently. Original replies
                 # remain in both journals for audit, never used to resend.
-                if child.get('result', {}).get('status') == 'unknown':
+                if payload.get('initialSizingOnly') is True and hasattr(self, 'lane_account'):
+                    if child.get('result', {}).get('status') == 'unknown':
+                        child.setdefault('originalResult', child['result'])
+                    final = outcomes[self.lane_account]
+                    child['result'] = child['reconciledResult'] = dict(final, accountResults=outcomes)
+                elif child.get('result', {}).get('status') == 'unknown':
                     if hasattr(self, 'lane_account'):
                         native = self._call(self.lane_account, 'receipt', self._native_opening_id(child, self.lane_account))['result']
                         final = dict(native, accountResults={self.lane_account:copy.deepcopy(native)})
@@ -3674,10 +4331,15 @@ class ChunkEntries:
                     child['result'] = child['reconciledResult'] = hybrid_receipt(final)
                 self._hybrid_recount(payload, state, allow_excess_risk=True)
                 self._save(state)
-            if unsettled or any(child['state'] in ('sending','unknown') for child in state['children']):
+            unfinished = ('sending','unknown','pending') if passive else ('sending','unknown')
+            if unsettled or any(child['state'] in unfinished for child in state['children']):
                 return
             status.update(status='confirmed', checkedAt=now)
             state.pop('missingNativeChild', None)
+            if state.pop('observeAdmissionHold', False):
+                self.passive_reconcile_cursors.pop(identifier, None)
+                self._phase(state, 'stopped', 'Prior broker opening settled; previous entry will not resume')
+                return
             if status.get('resumeAllowed') and not self._stopping(state['id']):
                 if state.pop('reconcileTransientHalt', False):
                     state.pop('hybridRemainderStop', None)
@@ -4139,12 +4801,110 @@ class ChunkEntries:
     def _parallel_pending(self, state, account):
         return [child for child in state['children'] if child['type'] == 'limit' and account in pending_accounts(child)]
 
+    @staticmethod
+    def _limit_at_edge(child, account, edge):
+        return abs(child['prices'][account]-edge) <= 1e-8
+
+    @staticmethod
+    def _pending_remainder(pending, account):
+        return sum(max(0., child['volumes'][account]-child.get('positions', {}).get(account, {}).get('volume', 0.))
+                   for child in pending)
+
+    def _edge_capacity_basis(self, state, account, retcode, *, excluded=None):
+        pending = [child for child in self._parallel_pending(state, account) if child['id'] != excluded]
+        if retcode == 10033:
+            return sorted(child['id'] for child in pending)
+        return rounded(state['accounts'][account]['filledVolume'] + self._pending_remainder(pending, account))
+
+    @staticmethod
+    def _account_capacity_refusal(payload, result):
+        return (payload.get('initialSizingOnly') is True
+                and result.get('status') == 'rejected' and result.get('retcode') in (10033, 10034)
+                and result.get('emptyCapacityRefusal') is True
+                and result.get('providerOrderId') in (None, 0, '0', '')
+                and result.get('filledVolume', 0) in (None, 0, 0.))
+
+    def _hold_account_capacity(self, state, child, account, result, volume):
+        retcode = result['retcode']
+        holds = state['accounts'][account].setdefault('capacityRefusals', {})
+        kind = child['type']
+        basis = self._edge_capacity_basis(state, account, retcode, excluded=child['id'])
+        previous = holds.get(kind, {})
+        failures = (min(previous.get('failures', 0)+1, 4)
+                    if previous.get('retcode') == retcode and previous.get('basis') == basis
+                    and previous.get('volume') == volume else 1)
+        holds[kind] = dict(retcode=retcode, basis=basis, volume=volume, failures=failures,
+            supplement=account in child.get('edgeSupplementAccounts', ()),
+            retryAt=time.time()*1000+min(5000, 1000*2**(failures-1)),
+            reason=str(result.get('reason', 'Broker capacity limit'))[:192])
+
+    def _account_capacity_hold(self, state, account, kind, volume):
+        # Capacity also changes when another plan/manual order settles. A
+        # bounded probe uses the current native guard and reserves only free
+        # volume without disturbing an already accepted order.
+        for rejected_kind, hold in state['accounts'][account].get('capacityRefusals', {}).items():
+            same_capacity = ((rejected_kind == kind or hold['retcode'] == 10034 and hold.get('supplement'))
+                             and (hold['retcode'] == 10033 or volume >= hold['volume']-1e-8))
+            if (same_capacity and time.time()*1000 < hold['retryAt']
+                    and self._edge_capacity_basis(state, account, hold['retcode']) == hold['basis']):
+                return hold
+        return None
+
+    @staticmethod
+    def _pending_fill_ahead(child, account, proof):
+        position = child.get('positions', {}).get(account)
+        return position is not None and any(
+            row.get('__isPosition') and str(row.get('ticket')) == position['ticket']
+            and float(row['lots']) > position['volume']+1e-8 for row in (proof or {}).get('orders', []))
+
+    def _safe_edge_partial(self, child, account, edge, direction):
+        return (self._limit_at_edge(child, account, edge)
+                and direction*(child['positions'][account]['fillPrice']-edge) <= 1e-8)
+
+    def _refresh_racing_edge_fill(self, payload, state, quotes, edge, direction):
+        """An exact advancing fill can race even a refreshed position read."""
+        for child in state['children']:
+            if child['type'] != 'limit':
+                continue
+            for account in pending_accounts(child).intersection(quotes, child.get('positions', {})):
+                if account in child.get('cancellations', {}) or not self._safe_edge_partial(child, account, edge, direction):
+                    continue
+                previous = child['positions'][account]
+                self._hybrid_limit(payload, state, child, accounts={account})
+                current = child['positions'][account]
+                if (current['ticket'] == previous['ticket'] and current['volume'] > previous['volume']+1e-8
+                        and self._safe_edge_partial(child, account, edge, direction)):
+                    self.pending_poll_at[child['id']] = time.monotonic()+.25
+                    return True
+        return False
+
     def _parallel_cancel(self, payload, state, child, accounts):
         started = time.monotonic()
         self._hybrid_limit(payload, state, child, cancel=True, accounts=accounts)
         for account in accounts:
             self._parallel_note(state, account, 'ready', 'Exact cancellation/fill proof received',
                                 lastCancelMs=round((time.monotonic()-started)*1000, 3))
+
+    def _observe_pending_without_quote(self, payload, state, accounts):
+        """Persist broker-proved fills while the market price is unusable."""
+        for child in state['children']:
+            if child['type'] != 'limit' or time.monotonic() < self.pending_poll_at.get(child['id'], 0):
+                continue
+            selected = pending_accounts(child).intersection(accounts).difference(child.get('cancellations', {}))
+            if not selected:
+                continue
+            self.pending_poll_at[child['id']] = time.monotonic()+.25
+            try:
+                self._hybrid_limit(payload, state, child, accounts=selected)
+            except Exception as error:
+                if (getattr(error, 'dispatch_not_sent', False) or isinstance(error, (OSError, TimeoutError))
+                        or str(error) == 'MT5 is disconnected' or str(error).startswith('Linked MT5 response unknown;')):
+                    continue  # A failed observer read made no broker changes.
+                state['hybridRemainderStop'] = 'Pending limit could not be verified; further entry stopped'
+                if not self._begin_reconciliation(payload, state, error):
+                    self._phase(state, 'unknown', str(error))
+                return False
+        return True
 
     @staticmethod
     def _retryable_market_protection_refusal(payload, child, result):
@@ -4175,6 +4935,14 @@ class ChunkEntries:
             and result.get('mutationStarted') is False and result.get('finalPreMutationRejection') is True
             and result.get('retcode') is None and result.get('providerOrderId') in (None,0,'0','')
             and result.get('filledVolume',0) in (None,0,0.))
+
+    @staticmethod
+    def _retryable_connection_refusal(payload, result):
+        return (payload.get('initialSizingOnly') is True and independent_accounts(payload)
+                and result.get('status') == 'rejected' and result.get('retryableConnection') is True
+                and result.get('mutationStarted') is False and result.get('finalPreMutationRejection') is True
+                and result.get('retcode') is None and result.get('providerOrderId') in (None, 0, '0', '')
+                and result.get('filledVolume', 0) in (None, 0, 0.))
 
     @staticmethod
     def _parallel_price_refusal(result):
@@ -4212,11 +4980,57 @@ class ChunkEntries:
             return False
         return not last or time.time()*1000-last['at'] >= last.get('retryMs', 250)
 
-    def _parallel_batch(self, payload, state, kind, plans):
+    def _record_parallel_refusal(self, payload, state, child, account, result, quote, volume):
+        """Record an exact nonterminal refusal, including one recovered from the journal."""
+        if result.get('status') != 'rejected':
+            return False
+        if self._account_capacity_refusal(payload, result):
+            self._hold_account_capacity(state, child, account, result, volume)
+            return True
+        # Only final refusals can release a reservation and wait for a new quote.
+        retry_market = self._retryable_market_protection_refusal(payload, child, result)
+        # A growing partial can also race the terminal's final SL/TP/size
+        # guard. Recheck the exact order and position before any next send.
+        position_changed = (payload.get('initialSizingOnly') is True and account in child.get('edgeSupplementAccounts', ())
+                            and result.get('retcode') is None and result.get('providerOrderId') in (None, 0, '0', '')
+                            and result.get('filledVolume', 0) in (None, 0, 0.)
+                            and result.get('reason') == 'Previous entry position closed or changed; no further entry')
+        if not (self._parallel_price_refusal(result) or retry_market or position_changed
+                or self._optional_support_refusal(payload, state, child, account, result)
+                or self._retryable_expiry_refusal(payload, result)
+                or self._retryable_connection_refusal(payload, result)):
+            return False
+        kind = child['type']
+        rejection = dict(quote=quote, volume=volume, at=time.time()*1000,
+                         retryMs=500 if result.get('retcode') == 10024 else 250)
+        proof = result.get('entryDiagnostics', {})
+        if (kind == 'market' and result.get('retcode') is None
+                and result.get('providerOrderId') in (None, 0, '0', '')
+                and result.get('filledVolume', 0) in (None, 0, 0.)
+                and isinstance(proof, dict) and proof.get('mutationStarted') is False
+                and proof.get('rejectionStage') == 'native-entry-price-guard'
+                and proof.get('account') == account and proof.get('symbol') == payload['symbol']
+                and proof.get('side') == payload['side'] and proof.get('kind') == kind
+                and all(isinstance(proof.get(key), (int, float)) and not isinstance(proof[key], bool)
+                        and math.isfinite(proof[key]) and proof[key] > 0
+                        for key in ('bid', 'ask', 'tickUtcMs', 'checkedAtMs'))):
+            rejection['fastQuoteProof'] = dict(quote=[proof['bid'], proof['ask']],
+                tickUtcMs=proof['tickUtcMs'], checkedAtMs=proof['checkedAtMs'])
+        if retry_market:
+            rejection.update(waitForQuoteChange=True, recheckMs=1000)
+        state['accounts'][account].setdefault('priceRejections', {})[kind] = rejection
+        return True
+
+    def _parallel_batch(self, payload, state, kind, plans, *, fixed_limit_accounts=(), supplement_accounts=()):
         """One durable batch reserves ready accounts, then native sends overlap."""
         selected = {}
         for account, plan in plans.items():
             price, volume, bid, ask, reserved = plan
+            capacity = self._account_capacity_hold(state, account, kind, volume)
+            if capacity:
+                self._parallel_note(state, account, 'limit', 'Existing limit retained; supplement refused: '+capacity['reason']
+                    if account in supplement_accounts else 'Waiting for broker capacity: '+capacity['reason'])
+                continue
             volume = self._priority_volume(payload,state,account,kind,price,volume,{account:reserved})
             if volume <= 0:
                 self._parallel_note(state,account,'waiting-risk','Remaining risk does not permit the broker minimum; waiting for a permitted price')
@@ -4232,9 +5046,12 @@ class ChunkEntries:
         prices = {account: row[0] for account, row in selected.items()}
         volumes = {account: row[1] for account, row in selected.items()}
         reserved = {account: row[4] for account, row in selected.items()}
-        self._hybrid_send(payload, state, kind, prices, volumes,
-            self._hybrid_guards(payload, state, prices, volumes, reserved=reserved, support=kind == 'limit'),
-            support=kind == 'limit')
+        support = kind == 'limit'
+        guards = self._hybrid_guards(payload, state, prices, volumes, reserved=reserved, support=support,
+                                     fixed_limit_accounts=fixed_limit_accounts)
+        supplements = set(supplement_accounts).intersection(selected)
+        options = dict(supplement_accounts=supplements) if supplements else {}
+        self._hybrid_send(payload, state, kind, prices, volumes, guards, support=support, **options)
         child = state['children'][-1]
         results = self._limit_results(state, child)
         for account, (_, volume, bid, ask, _) in selected.items():
@@ -4246,34 +5063,13 @@ class ChunkEntries:
                     self._parallel_note(state,account,'waiting-read','Account worker busy before send; waiting for a fresh account snapshot')
                     self.entry_clocks[(state['id'],account)]['transportRetryAt']=time.monotonic()+.05
                     continue
-                # New captured policies may continue automatically after an
-                # exact, unfilled support refusal. Legacy plans retain their
-                # explicit recovery contract. Each market part still passes
-                # its own native price, SL/TP, risk and broker checks.
-                optional_support = self._optional_support_refusal(payload, state, child, account, result)
-                retry_market = self._retryable_market_protection_refusal(payload, child, result)
-                transient = (self._parallel_price_refusal(result) or optional_support or retry_market
-                    or self._retryable_expiry_refusal(payload,result))
-                if transient:
-                    rejections[kind] = dict(quote=[bid, ask], volume=volume, at=time.time()*1000,
-                        retryMs=500 if result.get('retcode') == 10024 else 250)
-                    proof = result.get('entryDiagnostics', {})
-                    if (kind == 'market' and result.get('retcode') is None
-                            and result.get('providerOrderId') in (None, 0, '0', '')
-                            and result.get('filledVolume', 0) in (None, 0, 0.)
-                            and isinstance(proof, dict) and proof.get('mutationStarted') is False
-                            and proof.get('rejectionStage') == 'native-entry-price-guard'
-                            and proof.get('account') == account and proof.get('symbol') == payload['symbol']
-                            and proof.get('side') == payload['side'] and proof.get('kind') == 'market'
-                            and all(isinstance(proof.get(key), (int, float)) and not isinstance(proof[key], bool)
-                                and math.isfinite(proof[key]) and proof[key] > 0
-                                for key in ('bid', 'ask', 'tickUtcMs', 'checkedAtMs'))):
-                        rejections[kind]['fastQuoteProof'] = dict(quote=[proof['bid'], proof['ask']],
-                            tickUtcMs=proof['tickUtcMs'], checkedAtMs=proof['checkedAtMs'])
-                    if retry_market:
-                        rejections[kind]['waitForQuoteChange'] = True
-                        rejections[kind]['recheckMs'] = 1000
-                    self._parallel_note(state, account, 'waiting-price', reason)
+                if self._record_parallel_refusal(payload, state, child, account, result, [bid, ask], volume):
+                    if self._account_capacity_refusal(payload, result):
+                        self._parallel_note(state, account, 'limit', 'Existing limit retained; supplement refused: '+reason
+                            if account in supplement_accounts else 'Waiting for broker capacity: '+reason)
+                        self._save(state)
+                    else:
+                        self._parallel_note(state, account, 'waiting-price', reason)
                 else:
                     state['accounts'][account]['entryHalted'] = reason
                     if kind=='limit' and result.get('retcode')==10016 and result.get('providerOrderId') in (None,0,'0','') and result.get('filledVolume',0) in (None,0,0.):
@@ -4283,6 +5079,7 @@ class ChunkEntries:
                     self._save(state)
             elif result.get('status') == 'ok':
                 rejections.pop(kind, None)
+                state['accounts'][account].get('capacityRefusals', {}).pop(kind, None)
                 self._parallel_note(state, account, 'limit' if kind == 'limit' else 'filled',
                                     'Broker confirmed the account order')
             else:
@@ -4309,10 +5106,17 @@ class ChunkEntries:
                 return
             lower, upper = market_price_bounds(payload)
             direction = 1 if payload['side'] == 'buy' else -1
+            edge = upper if direction == 1 else lower
+            initial_sizing_only = payload.get('initialSizingOnly') is True
             for _ in range(HYBRID_ROUNDS_PER_TICK):
                 if self._stopping(state['id']) or self._protecting(state['id']):
                     return
                 quotes, evidence = self._parallel_quotes(payload, state)
+                if initial_sizing_only and hasattr(self, 'lane_account'):
+                    without_quote = {account for account in state['accounts']
+                                     if account not in quotes and (state['id'], account) not in self.snapshot_jobs}
+                    if without_quote and not self._observe_pending_without_quote(payload, state, without_quote):
+                        return
                 if not quotes:
                     break
                 # Consume fills and cancellations before releasing any volume.
@@ -4321,11 +5125,20 @@ class ChunkEntries:
                     if not selected:
                         continue
                     due = time.monotonic() >= self.pending_poll_at.get(child['id'], 0)
+                    if initial_sizing_only and not due:
+                        # A fresh position snapshot can see the next partial
+                        # before the scheduled order read catches up.
+                        due = any(self._limit_at_edge(child, account, edge)
+                                  and self._pending_fill_ahead(child, account, evidence.get(account)) for account in selected)
+                    # Direct and supplementary edge orders stay working through the return tick.
                     inside = {account for account in selected if lower-1e-8 <= quotes[account][1 if direction == 1 else 0] <= upper+1e-8
+                              and (not initial_sizing_only or not self._limit_at_edge(child, account, edge))
                               and self._parallel_retry_ready(state, account, 'market', list(quotes[account]))}
-                    relocate = {account for account in selected if direction*(quotes[account][1 if direction == 1 else 0]
-                                -(upper if direction == 1 else lower)) > 1e-8
-                                and child.get('edgePlaced', {}).get(account) != (upper if direction == 1 else lower)}
+                    # A support limit can already be at the edge after native repricing.
+                    relocate = {account for account in selected
+                                if direction*(quotes[account][1 if direction == 1 else 0]-edge) > 1e-8
+                                and child.get('edgePlaced', {}).get(account) != edge
+                                and (not initial_sizing_only or abs(child['prices'][account]-edge) > 1e-8)}
                     halt = {account for account in selected if state['accounts'][account].get('entryHalted')}
                     if inside or relocate or halt:
                         self._parallel_cancel(payload, state, child, inside | relocate | halt)
@@ -4333,9 +5146,12 @@ class ChunkEntries:
                     elif due:
                         before = {account: child.get('positions', {}).get(account, {}).get('volume', 0.) for account in selected}
                         self._hybrid_limit(payload, state, child, accounts=selected)
-                        changed = {account for account in selected if child.get('positions', {}).get(account, {}).get('volume', 0.) > before[account]+1e-8}
-                        if changed.intersection(pending_accounts(child)):
-                            self._parallel_cancel(payload, state, child, changed.intersection(pending_accounts(child)))
+                        partial = selected.intersection(pending_accounts(child), child.get('positions', {}))
+                        unprotected = {account for account in partial
+                            if (initial_sizing_only and not self._safe_edge_partial(child, account, edge, direction)
+                                or not initial_sizing_only and child['positions'][account]['volume'] > before[account]+1e-8)}
+                        if unprotected:
+                            self._parallel_cancel(payload, state, child, unprotected)
                         self.pending_poll_at[child['id']] = time.monotonic()+.25
                     # A quote-only round must not postpone the next native
                     # limit read: frequent quotes otherwise starve fill proof.
@@ -4344,18 +5160,29 @@ class ChunkEntries:
                     if (proof and str(proof.get('account'))==account and proof.get('server')==self.bridge.config['server']
                             and 0 <= time.time()*1000-proof.get('checkedAt',0) <= 1000):
                         evidence[account]=proof
-                # Fills consumed above can introduce a ticket absent from the
-                # earlier immutable watch. Such an account needs a fresh proof.
+                # A fill read after the quote can add a ticket or grow its lot
+                # size. Refresh any position proof from before that fill.
                 for account in list(evidence):
                     if evidence[account] is not None:
-                        tickets = {str(row.get('ticket')) for row in evidence[account].get('orders', []) if row.get('__isPosition')}
-                        if any(account in child.get('positions', {}) and child['positions'][account]['ticket'] not in tickets
-                               for child in state['children']):
+                        lots = {str(row['ticket']): float(row['lots']) for row in evidence[account].get('orders', [])
+                                if row.get('__isPosition') and row.get('symbol') == payload['symbol']}
+                        if any(lots.get(position['ticket'], -1.) < position['volume']-1e-8 for child in state['children']
+                               for position in [child.get('positions', {}).get(account)] if position):
                             evidence[account] = None
-                self._positions(payload, state, accounts=set(quotes), evidence=evidence)
+                try:
+                    self._positions(payload, state, accounts=set(quotes), evidence=evidence)
+                except ValueError:
+                    if (not initial_sizing_only or state.get('hybridRemainderStop')
+                            or not self._refresh_racing_edge_fill(payload, state, quotes, edge, direction)):
+                        raise
+                    # No supplemental order is sent until the complete
+                    # position proof is verified in the next cycle.
+                    self._phase(state, 'running', 'Additional edge fill confirmed; checking its protection')
+                    return
                 if state.get('hybridRemainderStop') or self._hybrid_fill_violation(state):
                     raise ValueError(state.get('hybridRemainderStop', 'Actual fill exceeded captured bounds'))
-                limits, markets, edges = {}, {}, {}
+                limits, markets, edges, edge_top_ups = {}, {}, {}, {}
+                market_supplements = set()
                 for account, (bid, ask) in quotes.items():
                     details = state['accounts'][account]
                     pending = self._parallel_pending(state, account)
@@ -4370,10 +5197,33 @@ class ChunkEntries:
                             or child['positions'][account].get('tp') and direction*(closing-child['positions'][account]['tp']) >= 0)
                            for child in state['children']):
                         raise ValueError('Captured SL or TP reached; remainder stopped')
+                    quote = ask if direction == 1 else bid
+                    inside = lower-1e-8 <= quote <= upper+1e-8
+                    adverse = direction*(quote-edge) > 1e-8
                     if pending:
-                        quote = ask if direction == 1 else bid
+                        if (initial_sizing_only and (adverse or inside)
+                                and all(self._limit_at_edge(child, account, edge) and account not in child.get('cancellations', {})
+                                        for child in pending)
+                                and not any(child.get('actualPriceWarning') and account in child.get('positions', {})
+                                            for child in state['children'])):
+                            # An unobserved fill remains reserved. Observed
+                            # partials move from pending remainder to filled.
+                            reserved = self._pending_remainder(pending, account)
+                            free = rounded(details['targetVolume']-details['filledVolume']-reserved)
+                            spec = details['spec']
+                            cap = spec['maxQty'] if adverse else min(details['parts'][0], spec['maxQty'])
+                            volume = min(free, cap)
+                            if 1e-8 < free-volume < spec['minQty']-1e-8:
+                                volume = rounded(free-spec['minQty'])
+                            if volume >= spec['minQty']-1e-8:
+                                if adverse:
+                                    edge_top_ups[account] = (edge, volume, bid, ask, 0.)
+                                else:
+                                    markets[account] = (quote, volume, bid, ask, 0.)
+                                    market_supplements.add(account)
+                                continue
                         wait_reason = ('Return limit reserved; market quote outside captured zone'
-                            if not lower-1e-8 <= quote <= upper+1e-8 else
+                            if not inside else
                             'Return limit reserved; waiting for account retry'
                             if not self._parallel_retry_ready(state, account, 'market', [bid, ask]) else
                             'Return limit reserved; waiting for exact pending result')
@@ -4385,9 +5235,6 @@ class ChunkEntries:
                     if residual <= 1e-8:
                         self._parallel_note(state, account, 'completed', 'Target and common stop confirmed')
                         continue
-                    quote = ask if direction == 1 else bid
-                    inside = lower-1e-8 <= quote <= upper+1e-8
-                    adverse = direction*(quote-(upper if direction == 1 else lower)) > 1e-8
                     spec = details['spec']
                     if inside:
                         if not self._parallel_retry_ready(state, account, 'market', [bid, ask]):
@@ -4408,12 +5255,12 @@ class ChunkEntries:
                                 volume*max(0., distance if distance is not None else direction*(worst-self._hybrid_stop(payload,state,account,quote)))*details['pointValue'])
                             limits[account] = (max(lower, bid) if direction == 1 else min(upper, ask), support, bid, ask, risk)
                     elif adverse:
-                        edge = upper if direction == 1 else lower
                         limits[account] = (edge, min(residual, spec['maxQty']), bid, ask, 0.)
                         edges[account] = edge
                     else:
                         self._parallel_note(state, account, 'waiting-price', 'No valid limit inside the captured zone')
-                progress = self._parallel_batch(payload, state, 'limit', limits)
+                progress = self._parallel_batch(payload, state, 'limit', limits,
+                                                fixed_limit_accounts=edges if initial_sizing_only else ())
                 if limits and progress:
                     child = state['children'][-1]
                     marked = {account: edge for account, edge in edges.items() if account in pending_accounts(child)}
@@ -4430,7 +5277,11 @@ class ChunkEntries:
                         max(0., child['volumes'][account]-child.get('positions', {}).get(account, {}).get('volume', 0.))
                         *max(0., direction*(child['prices'][account]-child['stops'][account]))*state['accounts'][account]['pointValue'] for child in pending))
                     markets[account] = (*plan[:4], reserved)
-                progress |= self._parallel_batch(payload, state, 'market', markets)
+                market_options = dict(supplement_accounts=market_supplements) if market_supplements else {}
+                progress |= self._parallel_batch(payload, state, 'market', markets, **market_options)
+                if edge_top_ups:
+                    progress |= self._parallel_batch(payload, state, 'limit', edge_top_ups, fixed_limit_accounts=edge_top_ups,
+                                                     supplement_accounts=edge_top_ups)
                 if state['phase'] not in ACTIVE or not progress or time.monotonic()-started >= .25:
                     break
             complete = all(row['filledVolume'] >= row['targetVolume']-1e-8 and row.get('entryStatus') == 'completed' for row in state['accounts'].values())
@@ -4897,6 +5748,7 @@ class AccountEntryLane(ChunkEntries):
         self.lock = threading.RLock()
         self.snapshot_jobs, self.reconcile_jobs = {}, {}
         self.pending_poll_at, self.reconcile_poll_at, self.entry_clocks = {}, {}, {}
+        self.passive_reconcile_cursors = {}
         self.retired_snapshot_jobs = set()
         self.cancel_proofs = {}
         self.read_ready = threading.Event()
@@ -5104,6 +5956,20 @@ class AccountPlanBridge:
     def validate_deadline(self, payload):
         return self.owner.bridge.validate_deadline(payload)
 
+    def entry_reconcile_if_idle(self, items):
+        bridge = self.owner.bridge
+        worker = (getattr(bridge,'primary_worker',None) if self.account_id==self.owner.primary
+                  else bridge.linked[self.account_id])
+        if worker is not None:
+            idle = getattr(worker, 'call_if_idle', None)
+            return idle('entry_reconcile', items, True) if callable(idle) else dict(deferred=True)
+        if not bridge.lock.acquire(blocking=False):
+            return dict(deferred=True)
+        try:
+            return bridge.entry_reconcile(items, True)
+        finally:
+            bridge.lock.release()
+
     def __getattr__(self, method):
         if method.startswith('_'):
             raise AttributeError(method)
@@ -5130,7 +5996,172 @@ class AccountPlanEntries(ChunkEntries):
         self.accepted_intents = set()
         self.ready_to_publish = False
         super().__init__(bridge)
+        self._index_directions(self.storage)
         self.ready_to_publish = True
+
+    @staticmethod
+    def _index_directions(storage):
+        with storage.lock:
+            storage.db.execute("""CREATE INDEX IF NOT EXISTS chunk_entry_direction ON chunk_entries
+                (json_extract(state,'$.symbol'), json_extract(state,'$.side'))""")
+            storage.db.commit()
+
+    @staticmethod
+    def _holds_account_direction(state, account):
+        details = state.get('accounts', {}).get(account)
+        if details is None:
+            return False
+        phase = state.get('lanePhases', {}).get(account, state['phase'])
+        # An aggregate stop can report an unknown phase even on a settled
+        # peer. Only that account's unresolved durable claims reserve it.
+        return (phase in ACTIVE or state.get('protectionPending')
+                or state.get('closurePending') or state.get('missingNativeChild')
+                or details.get('commonStopUncertain') or details.get('riskRepairRequired')
+                or any(account in pending_accounts(child) for child in state.get('children', [])))
+
+    @staticmethod
+    def _direction_rows(storage, payload, legacy_only=False):
+        with storage.lock:
+            rows = storage.db.execute("""SELECT payload,state FROM chunk_entries
+                WHERE json_extract(state,'$.symbol')=? AND json_extract(state,'$.side')=?
+                AND (?=0 OR json_extract(payload,'$.accountExecution') IS NOT 'independent-v5')
+                AND (json_extract(state,'$.phase') IN ('armed','running','paused','sending','unknown')
+                     OR json_extract(state,'$.protectionPending') IS NOT NULL
+                     OR json_extract(state,'$.closurePending') IS NOT NULL
+                     OR json_extract(state,'$.missingNativeChild') IS NOT NULL
+                     OR EXISTS (SELECT 1 FROM json_each(state,'$.children')
+                                WHERE json_extract(value,'$.state') IN ('pending','sending','unknown'))
+                     OR EXISTS (SELECT 1 FROM json_each(state,'$.accounts')
+                                WHERE json_extract(value,'$.commonStopUncertain')=1
+                                   OR json_extract(value,'$.riskRepairRequired')=1))
+                ORDER BY rowid""", (payload['symbol'], payload['side'], legacy_only)).fetchall()
+        return ((json.loads(old_payload), json.loads(old_state)) for old_payload, old_state in rows)
+
+    @staticmethod
+    def _legacy_direction_openings(payload, state, account):
+        details = state.get('accounts', {}).get(account, {})
+        if (state.get('accountExecution') != 'independent-v4' or state.get('executionPolicy') != 'hybrid-market-limit-v1'
+                or state.get('phase') not in ('stopped','unknown','completed')
+                or state.get('lanePhases', {}).get(account) not in ('stopped','unknown','completed')
+                or any(payload.get(key) != state.get(key) for key in ('id','symbol','side','executionPolicy','accountExecution'))
+                or not (details.get('commonStopUncertain') or details.get('riskRepairRequired'))
+                or any(state.get(key) or details.get(key) for key in ('protectionPending','closurePending','missingNativeChild',
+                                                                      'protectionOnlyWait','admissionWaiting','pendingVolume'))
+                or state.get('reconciliation', {}).get('status') == 'checking'
+                or state.get('laneReconciliation', {}).get(account, {}).get('status') == 'checking'):
+            return None
+        openings = {}
+        positions = set()
+        child_ids = set()
+        captured = 0.
+        for child in state['children']:
+            volumes = child.get('volumes', {})
+            owned = child.get('positions', {})
+            result = child.get('result', {})
+            results = result.get('accountResults', {})
+            if account not in volumes:
+                if any(account in rows for rows in (owned,results,child.get('cancellations', {}),child.get('cancelIds', {}))):
+                    return None
+                continue
+            index = child.get('index')
+            if (set(volumes) != {account} or set(owned)-{account} or set(results)-{account}
+                    or type(index) is not int or index < 1 or child.get('id') != state['id']+':h'+str(index)
+                    or index in child_ids or child.get('type') not in ('market','limit')
+                    or child.get('state') not in ('confirmed','cancelled','rejected')):
+                return None
+            child_ids.add(index)
+            receipt = results.get(account, result)
+            cancellation = child.get('cancellations', {}).get(account)
+            if (cancellation is not None and cancellation.get('status') not in ('ok','rejected')
+                    or account in child.get('cancelIds', {}) and cancellation is None):
+                return None
+            position = owned.get(account)
+            if child['state'] == 'rejected':
+                if position or receipt.get('status') != 'rejected' or receipt.get('providerOrderId'):
+                    return None
+                continue
+            if receipt.get('status') != 'ok':
+                return None
+            provider = receipt.get('providerOrderId')
+            if position:
+                ticket = str(position['ticket'])
+                opening = str(position.get('openingTicket') or ticket)
+                if (ticket in positions or not re.fullmatch(r'[1-9][0-9]{0,19}',ticket)
+                        or provider is not None and str(provider) != opening):
+                    return None
+                volume = number(position['volume'],'Captured position volume')
+                acquired = number(position.get('acquiredVolume',volume),'Captured opening volume')
+                if acquired < volume-1e-8 or acquired > number(volumes[account],'Captured reservation')+1e-8:
+                    return None
+                positions.add(ticket)
+                captured += volume
+                expected = dict(positionId=ticket,volume=acquired,fillPrice=number(position['fillPrice'],'Captured opening price'))
+            elif child['state'] == 'cancelled' and child['type'] == 'limit':
+                opening = str(provider)
+                expected = None
+            else:
+                return None
+            if opening in openings or not re.fullmatch(r'[1-9][0-9]{0,19}',opening):
+                return None
+            openings[opening] = expected
+        if not positions or len(openings) > HYBRID_MAX_POSITIONS or abs(captured-number(details['filledVolume'],'Captured fill total')) > 1e-8:
+            return None
+        return openings
+
+    @classmethod
+    def _legacy_direction_candidate(cls, payload, state, account):
+        try:
+            return cls._legacy_direction_openings(payload,state,account)
+        except (AttributeError,KeyError,OverflowError,TypeError,ValueError):
+            return None
+
+    def _restore_admission_hold(self, payload, state):
+        if state['phase'] not in ('stopped', 'unknown'):
+            return
+        # Restart/stop revoked the old plan's permission to acquire. Check
+        # exact receipts and native rows without cancelling a working order,
+        # changing protection or allowing an absent receipt to release lots.
+        recovery = copy.deepcopy(state)
+        recovery['observeAdmissionHold'] = True
+        recovery['hybridRemainderStop'] = 'Previous entry stopped; waiting for exact broker outcome'
+        recovery.pop('reconcileTransientHalt', None)
+        if self._begin_reconciliation(payload, recovery, recovery['hybridRemainderStop']):
+            state.update(recovery)
+            self.wake_event.set()
+
+    def _check_direction(self, payload):
+        for old_payload, old_state in self._direction_rows(self.storage, payload):
+            if self._holds_account_direction(old_state, self.account_id):
+                if self._reconcile_admission_control(old_state):
+                    old_state = self._load(old_state['id'])[2]
+                    if not self._holds_account_direction(old_state, self.account_id):
+                        continue
+                self._restore_admission_hold(old_payload, old_state)
+                raise ValueError('Previous entry on this account and direction remains active or unconfirmed')
+
+    def _reconcile_admission_control(self, state):
+        if pending := state.get('closurePending'):
+            return self.reconcile_closed_position(pending,state['id'])
+        if pending := state.get('protectionPending'):
+            return self._reconcile_timed_out_protection(pending,self._protection_receipt(pending))
+        return False
+
+    def reconcile_startup_controls(self):
+        with self.storage.lock:
+            candidates = self.storage.db.execute("""SELECT state FROM chunk_entries
+                WHERE json_extract(state,'$.phase') IN ('unknown','stopped') AND
+                    (json_extract(state,'$.closurePending') IS NOT NULL OR json_extract(state,'$.protectionPending') IS NOT NULL)
+                ORDER BY rowid DESC LIMIT 4""").fetchall()
+        for (raw,) in candidates:
+            if self.stop_event.is_set():
+                break
+            self._reconcile_admission_control(json.loads(raw))
+
+    def arm(self, payload, received=None):
+        with self.lock:
+            if not self._load(payload['id']) and not self._cancelled(payload['id']):
+                self._check_direction(payload)
+            return super().arm(payload, received)
 
     def _expiry(self, payload):
         # The short network admission deadline was checked before the root
@@ -5159,10 +6190,40 @@ class AccountPlanEntries(ChunkEntries):
         key=(state['id'],self.account_id)
         if key not in self.lanes:
             self.lanes[key]=SingleAccountLane(self,self.account_id,payload['accountLaneSlot'])
+        # A shard saves its own reconciliation directly. The shared scheduler
+        # reads the per-account map, which also carries explicit continuation.
+        if reconciliation := state.get('reconciliation'):
+            if self.account_id not in state.get('laneReconciliation', {}):
+                state = dict(state, laneReconciliation={self.account_id: reconciliation})
+            # Restart/admission can pause a stopped shard for broker reads
+            # while its per-account phase still records the acquisition stop.
+            if (state['phase'] == 'paused' and state.get('observeAdmissionHold') is True
+                    and reconciliation.get('status') == 'checking' and reconciliation.get('resumeAllowed') is False):
+                state = dict(state, lanePhases={self.account_id: 'paused'})
         return super()._schedule_lanes(payload,state)
 
 
 class SingleAccountLane(AccountEntryLane):
+    # This lane owns its opening claim and does not use a group preflight.
+    native_opening_guard_after_claim = True
+
+    def _passive_reconciliation_allowed(self):
+        owner = self.owner
+        if not owner.lock.acquire(blocking=False):
+            return False
+        try:
+            return not owner.accepted_intents and all(json.loads(state).get('observeAdmissionHold')
+                for _, state in owner._active_rows())
+        finally:
+            owner.lock.release()
+
+    def _read_passive_reconciliation(self, account, items):
+        if account != self.lane_account:
+            raise ValueError('Reconciliation cannot cross an account lane')
+        if not self._passive_reconciliation_allowed():
+            return dict(deferred=True)
+        return self.bridge.entry_reconcile_if_idle(items)
+
     def _handoff_ready_read(self, payload, state):
         # A short account-local handoff lets the current lane consume a read
         # which is about to finish, instead of reloading/deep-copying the same
@@ -5189,6 +6250,8 @@ class SingleAccountLane(AccountEntryLane):
         # No other account can modify this parent. Parent controls raise their
         # pause flag and drain this lane before writing, as in the v4 engine.
         state['lanePhases']={self.lane_account:state['phase']}
+        if state.get('reconciliation'):
+            state.pop('laneReconciliation', None)
         if durable:
             self.owner._save(state)
         else:
@@ -5218,6 +6281,7 @@ class IsolatedEntries(ChunkEntries):
         self.projection_lock = threading.RLock()
         self.projections = {}
         self.account_states = {}
+        self.stopped_fill_checks = {}
         self.dirty_projections = set()
         self.admitting = {}
         self.admission_retries = {}
@@ -5228,8 +6292,10 @@ class IsolatedEntries(ChunkEntries):
         self.checkpoint_signatures = {}
         self.account_stop_executor = ThreadPoolExecutor(max_workers=17,thread_name_prefix='iscc-account-stop')
         self.account_stop_jobs = {}
+        self.startup_controls_scheduled = False
         self.restoring = True
         super().__init__(bridge)
+        AccountPlanEntries._index_directions(self.storage)
         self.database_path = pathlib.Path(bridge.db.execute('PRAGMA database_list').fetchone()[2])
         for state in list(self.projections.values()):
             self._restore_root(state)
@@ -5246,18 +6312,120 @@ class IsolatedEntries(ChunkEntries):
 
     def get(self, identifier):
         record = super().get(identifier)
+        if record and record.get('accountExecution') == 'independent-v4':
+            checks = {}
+            for account, details in record['accounts'].items():
+                if not (details.get('commonStopUncertain') or details.get('riskRepairRequired')):
+                    continue
+                found = ChunkEntries._load(self,identifier)
+                failure = self._reconcile_legacy_direction(found[1],found[2],account) if found else 'entry-missing'
+                if failure is None:
+                    record = super().get(identifier)
+                else:
+                    checks[account] = failure
+            for account, failure in checks.items():
+                record['accounts'][account]['legacyDirectionCheck'] = failure
         if (record and record.get('accountExecution') == 'independent-v5' and record['phase'] == 'unknown'
-                and not record.get('protectionPending') and not record.get('closurePending')
                 and all(phase in ('completed','stopped','unknown') for phase in record.get('lanePhases', {}).values())):
             changed = False
             for account, details in record.get('accounts', {}).items():
-                pending = details.get('closurePending')
+                pending = details.get('closurePending') or record.get('closurePending')
                 engine = self.shards.get(account)
-                if pending and engine is not None:
-                    changed |= engine.reconcile_closed_position(pending)
+                if pending and engine is not None and account in (self.primary,*self.bridge.linked):
+                    changed |= engine.reconcile_closed_position(pending,identifier)
             if changed:
                 record = super().get(identifier)
         return record
+
+    def _reconcile_legacy_direction(self, payload, state, account):
+        """Release only a proved closed account, or return its failed proof stage."""
+        openings = AccountPlanEntries._legacy_direction_candidate(payload,state,account)
+        if not openings:
+            return 'settled-opening-journal-unconfirmed'
+        if account not in (self.primary,*self.bridge.linked):
+            return 'account-unavailable'
+        worker = (getattr(self.bridge,'primary_worker',None) if account == self.primary else self.bridge.linked[account])
+        call = worker.call if worker is not None else lambda method,*args: self._call(account,method,*args)
+        identifier, symbol = state['id'], state['symbol']
+        details = state['accounts'][account]
+        failure = 'captured-ownership-unconfirmed'
+        try:
+            if any(self.owned_entry(account,expected['positionId'] if expected is not None else ticket) != identifier
+                   for ticket, expected in openings.items()):
+                return failure
+            failure = 'native-common-stop-unconfirmed'
+            if details.get('commonStopUncertain') or details.get('commonStopRequest'):
+                stop = call('entry_common_stop_receipt',dict(entryId=identifier,stopRevision=state.get('stopRevision')))
+                receipt = stop.get('result') or {}
+                request = details.get('commonStopRequest') or {}
+                if (stop.get('account') != account or stop.get('server') != self.bridge.config['server']
+                        or stop.get('unresolved') is not False
+                        or request and (request.get('id') != stop.get('id') or digest(request) != stop.get('digest'))
+                        or receipt.get('status') != 'rejected'
+                        or str(receipt.get('account')) != account or receipt.get('symbol') != symbol
+                        or receipt.get('mutationStarted',False) is not False or receipt.get('finalPreMutationRejection',True) is not True
+                        or receipt.get('reason') not in ('Captured entry position closed or changed',
+                                                         'Common stop exceeds the reserved risk budget')):
+                    return failure
+            failure = 'native-positions-unconfirmed'
+            watch = [dict(account=account,ticket=ticket,symbol=symbol) for ticket in openings]
+            view = call('entry_management',watch)
+            checked = view.get('checkedAt')
+            if (str(view.get('account')) != account or view.get('server') != self.bridge.config['server']
+                    or type(checked) not in (int,float) or not -.25 <= time.time()-checked/1000 <= 2.5
+                    or not isinstance(view.get('orders'),list) or not isinstance(view.get('openingStates'),dict)):
+                return failure
+            captured = set(openings) | {row['positionId'] for row in openings.values() if row is not None}
+            for row in view['orders']:
+                if (captured.intersection(str(row.get(key)) for key in ('ticket','identifier','positionId'))
+                        or row.get('symbol') == symbol and self.owned_entry(account,str(row.get('ticket'))) == identifier):
+                    return 'owned-order-or-position-still-present'
+            failure = 'exact-full-exit-unconfirmed'
+            for ticket, expected in openings.items():
+                history = view['openingStates'].get(ticket,{})
+                if expected is None:
+                    if history.get('phase') != 'cancelled':return 'cancelled-opening-unconfirmed'
+                    continue
+                proof = history.get('openingProof', {})
+                if (history.get('phase') != 'closed' or proof.get('kind') != 'exact-balanced-opening-v1'
+                        or proof.get('openingTicket') != ticket or proof.get('positionId') != expected['positionId']
+                        or proof.get('symbol') != symbol or proof.get('side') != state['side']
+                        or any(abs(number(proof.get(key),'Broker full exit')-expected[key]) > 1e-8 for key in ('volume','fillPrice'))):
+                    return failure
+        except (AttributeError,KeyError,OSError,OverflowError,RuntimeError,TypeError,ValueError):
+            return failure
+        with self.lock:
+            current = ChunkEntries._load(self,identifier)
+            if current and current[1] == payload and not AccountPlanEntries._holds_account_direction(current[2],account):
+                return None  # A concurrent exact read already released this hold.
+            if (not current or current[1:] != (payload,state) or not -.25 <= time.time()-checked/1000 <= 2.5
+                    or self._protecting(identifier) or self._stopping(identifier)):
+                return 'entry-changed-during-check'
+            updated = current[2]
+            updated['accounts'][account].update(positionsClosed=True,commonStopUncertain=False,riskRepairRequired=False,
+                entryStatus='stopped',entryReason='Exact broker full exits confirmed; further entry remains stopped')
+            updated['updatedAt'] = time.time()*1000
+            with self.storage.lock:
+                try:
+                    self.storage.db.execute('UPDATE chunk_entries SET state=? WHERE id=?',(json.dumps(updated,allow_nan=False),identifier))
+                    self.storage.db.commit()
+                except Exception:
+                    self.storage.db.rollback()
+                    raise
+            self._index_committed(updated)
+            self._remember(updated)
+        return None
+
+    def schedule_startup_controls(self):
+        """Warm exact proofs on the first idle panel read, once per receiver."""
+        with self.admission_lock:
+            if self.startup_controls_scheduled or self.stop_event.is_set():
+                return
+            self.startup_controls_scheduled = True
+            for account in (self.primary,*self.bridge.linked):
+                engine = self.shards.get(account)
+                if engine:
+                    self.account_stop_executor.submit(engine.reconcile_startup_controls)
 
     def account_readiness(self):
         primary_worker=getattr(self.bridge,'primary_worker',None)
@@ -5300,9 +6468,11 @@ class IsolatedEntries(ChunkEntries):
                 current = json.loads(self.storage.db.execute('SELECT result FROM '+table+' WHERE id=?', (identifier,)).fetchone()[0])
                 before = copy.deepcopy(current)
                 current['accountResults'].update(updates)
-                statuses = [row['status'] for row in current['accountResults'].values()]
+                outcomes = current['accountResults'].values()
+                statuses = [row['status'] for row in outcomes]
                 current.update(status='unknown' if 'unknown' in statuses else 'ok' if all(s=='ok' for s in statuses) else 'rejected',
-                    partialProtection=operation=='protection' and 'ok' in statuses and any(s!='ok' for s in statuses),
+                    partialProtection=operation=='protection' and any(s!='ok' for s in statuses)
+                    and any(row['status']=='ok' and row.get('noPosition') is not True for row in outcomes),
                     reason='Each account retains its own control outcome; no automatic replay')
                 if current != before:
                     self.storage.db.execute('UPDATE '+table+' SET result=? WHERE id=?', (json.dumps(current), identifier))
@@ -5320,6 +6490,37 @@ class IsolatedEntries(ChunkEntries):
         if not found or found[1].get('accountExecution') != 'independent-v5':
             return super().close_position(command)
         return self._account_control(command, found, 'close')
+
+    @staticmethod
+    def _stopped_before_admission(parent, account):
+        details = parent['accounts'].get(account, {})
+        # These two states explicitly record that the lane did not start. A
+        # generic error or a stopped lane with order evidence is not enough.
+        return (parent.get('lanePhases', {}).get(account) == 'stopped'
+                and details.get('entryStatus') == 'stopped'
+                and details.get('entryReason') in (
+                    'Previous entry on this account and direction remains active or unconfirmed',
+                    'Receiver restarted before account admission; no automatic resumption')
+                and details.get('filledVolume') == 0 and details.get('pendingVolume', 0) == 0
+                and not any(details.get(flag) for flag in ('admissionWaiting', 'commonStopUncertain',
+                    'riskRepairRequired', 'protectionPending', 'closurePending'))
+                and not any(account in rows for child in parent['children']
+                    for rows in (child.get('volumes', {}), child.get('positions', {}),
+                                 child.get('result', {}).get('accountResults', {}))))
+
+    def account_was_not_admitted(self, parent, account):
+        identifier = parent['id']
+        key = (identifier, account)
+        with self.admission_lock:
+            admission = self.admitting.get(key)
+            if admission and not admission.done():
+                return False
+        with self.projection_lock:
+            current = self.projections.get(identifier, parent)
+            if key in self.admission_retries or not self._stopped_before_admission(current, account):
+                return False
+        engine = self.shards.get(account)
+        return engine is None or engine._load(identifier) is None
 
     def _account_control(self, command, found, operation):
         """Each captured account owns its pause, preflight, mutation and receipt.
@@ -5415,10 +6616,16 @@ class IsolatedEntries(ChunkEntries):
                     # account only. The peer is already free to proceed.
                     with self.admission_lock: admission=self.admitting.get((entry_id,account))
                     if admission: admission.result(timeout=5)
-                    engine=self._shard(account)
-                    response=(engine.protection(local) if operation=='protection' else engine.close_position(local))
-                    outcome=dict(response['result'].get('accountResults',{}).get(account,{}),
-                        status=response['result']['status'],reason=response['result'].get('reason',''),controlId=local['id'])
+                    if (operation == 'close' or account != str(command['account'])) and self.account_was_not_admitted(state,account):
+                        outcome = dict(status='ok', noPosition=True, reason='Account was not admitted to this parent')
+                        if operation == 'close':
+                            outcome.update(filledVolume=0, remainingVolume=0)
+                    else:
+                        engine=self._shard(account)
+                        response=(engine.protection(local,allow_empty_mirror=account!=str(command['account']))
+                                  if operation=='protection' else engine.close_position(local))
+                        outcome=dict(response['result'].get('accountResults',{}).get(account,{}),
+                            status=response['result']['status'],reason=response['result'].get('reason',''),controlId=local['id'])
                 except Exception as error:
                     receipt=((engine._protection_receipt(local['id']) if operation=='protection' else engine._closure_receipt(local['id']))
                              if engine else None)
@@ -5456,6 +6663,8 @@ class IsolatedEntries(ChunkEntries):
             engine=self._shard(account)
             found=engine._load(identifier)
             if found:
+                if self.restoring:
+                    engine._restore_admission_hold(found[1], found[2])
                 self._index_owners(found[2])
                 self.account_states[(identifier,account)]=copy.deepcopy(found[2])
             else:
@@ -5537,6 +6746,10 @@ class IsolatedEntries(ChunkEntries):
             token=diagnostic.begin('account-admission',account=account,entry_id=identifier,
                 symbol=local['symbol'],reason='Checking captured plan and this account',announce=True) if diagnostic else None
             try:
+                for old_payload, old_state in AccountPlanEntries._direction_rows(self.storage,local,legacy_only=True):
+                    if (AccountPlanEntries._holds_account_direction(old_state,account)
+                            and self._reconcile_legacy_direction(old_payload,old_state,account) is not None):
+                        raise ValueError('Previous entry on this account and direction remains active or unconfirmed')
                 # Cold storage initialization belongs only to this account.
                 # The root intent is already durable and its peer can run.
                 if selected is None:selected=self._shard(account)
@@ -5642,6 +6855,46 @@ class IsolatedEntries(ChunkEntries):
         self._refresh_projections()
         return super().list()
 
+    def decorate_management(self, states):
+        # Reuse the normal management snapshot. Only a live, exact legacy
+        # ticket can trigger one journal lookup, with no scheduled native reads.
+        self._refresh_projections()
+        now = time.monotonic()
+        for account, evidence in states.items():
+            if evidence.get('connected') is not True or evidence.get('evidenceReady') is False:
+                continue
+            engine = self.shards.get(account)
+            if engine is None:
+                continue
+            for row in evidence.get('orders', []):
+                if row.get('__isPosition') is not True:
+                    continue
+                ticket = str(row['ticket'])
+                identifier = self.owned_entry(account,ticket)
+                key = (identifier,account)
+                with self.projection_lock:
+                    local = self.account_states.get(key)
+                    if (not local or local['phase'] != 'stopped' or now < self.stopped_fill_checks.get(key, 0)
+                            or not any(child['type']=='market' and child['state']=='unknown'
+                                and str(engine._limit_results(local,child).get(account,{}).get('providerOrderId')) == ticket
+                                for child in local['children'])):
+                        continue
+                    if len(self.stopped_fill_checks) >= 32:
+                        self.stopped_fill_checks.pop(next(iter(self.stopped_fill_checks)))
+                    self.stopped_fill_checks[key] = now + 15
+                if not engine.lock.acquire(blocking=False):
+                    continue
+                try:
+                    found = engine._load(identifier)
+                    if found and not engine._protecting(identifier):
+                        engine._recover_stopped_zero_price_fill(found[1], found[2], [account], evidence)
+                except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                    pass  # The prior receipt and acquisition stop stay intact.
+                finally:
+                    engine.lock.release()
+                return super().decorate_management(states)
+        return super().decorate_management(states)
+
     def _publish_root(self, identifier, checkpoint=True):
         with self.projection_lock:
             parent = copy.deepcopy(self.projections[identifier])
@@ -5651,12 +6904,16 @@ class IsolatedEntries(ChunkEntries):
                     continue
                 multiplier = parent['accounts'][account]['multiplier']
                 parent['accounts'][account] = dict(copy.deepcopy(local['accounts'][account]),multiplier=multiplier)
+                if local.get('positionsClosed'):
+                    parent['accounts'][account]['positionsClosed'] = True
                 for control in ('protectionPending','closurePending'):
                     if local.get(control): parent['accounts'][account][control]=local[control]
                     else: parent['accounts'][account].pop(control,None)
                 parent['children'] = [child for child in parent['children'] if account not in child.get('volumes',{})]
                 parent['children'].extend(copy.deepcopy(local['children']))
-                parent.setdefault('lanePhases',{})[account] = local['phase']
+                # Receipt-only recovery holds this account direction without
+                # consuming a normal acquisition slot on the coordinator.
+                parent.setdefault('lanePhases',{})[account] = ('unknown' if local.get('observeAdmissionHold') else local['phase'])
                 reconciliation=local.get('reconciliation') or local.get('laneReconciliation',{}).get(account)
                 if reconciliation:
                     parent.setdefault('laneReconciliation',{})[account] = copy.deepcopy(reconciliation)
@@ -5673,7 +6930,9 @@ class IsolatedEntries(ChunkEntries):
                 if (identifier,account) in self.account_states])
             parent['reason'] = 'Independent account engines; exact account outcomes retained'
             parent['independentAccountControls'] = True
-            if all(self.account_states.get((identifier,account),{}).get('positionsClosed') for account in parent['accounts']):
+            if all(self.account_states.get((identifier,account),{}).get('positionsClosed')
+                   or (identifier,account) not in self.account_states and self._stopped_before_admission(parent,account)
+                   for account in parent['accounts']):
                 parent.update(positionsClosed=True,hasOpenPositions=False,positionsConfirmed=True,positionLifecycle='closed')
             if parent.get('protectionPending') or parent.get('closurePending'):
                 if self._protecting(identifier):
@@ -5795,19 +7054,52 @@ class IsolatedEntries(ChunkEntries):
 
     def arm(self, payload, received=None):
         if payload.get('accountExecution')!='independent-v5':
+            if 'primaryRiskRequest' in payload:
+                raise ValueError('Primary balance risk requires the independent entry engine')
             with self.lock:
-                if not self._load(str(payload.get('id',''))) and any(
-                        row.get('accountExecution')=='independent-v5' and row['phase'] in ACTIVE
-                        and row.get('symbol')==payload.get('symbol') and row.get('side')==payload.get('side') for row in self.list()):
-                    raise ValueError('An independent entry is already active in this direction')
-            return super().arm(payload,received)
+                if (not self._load(str(payload.get('id',''))) and payload.get('symbol') in self.bridge.config['symbols']
+                        and payload.get('side') in ('buy', 'sell')):
+                    if any(row.get('accountExecution')=='independent-v5' and row['phase'] in ACTIVE
+                           and row.get('symbol')==payload['symbol'] and row.get('side')==payload['side'] for row in self.list()):
+                        raise ValueError('An independent entry is already active in this direction')
+                    followers = (self.bridge.requested_followers(payload)
+                                 if payload.get('mirrorAccounts') or payload.get('mirrorAccount') else {})
+                    for account in (self.primary, *followers):
+                        if account in self.shards or self.database_path.with_name('entry-plans-'+account+'.sqlite3').is_file():
+                            engine = self._shard(account)
+                            with engine.lock:
+                                engine._check_direction(payload)
+                return super().arm(payload,received)
         identifier = str(payload.get('id',''))
         if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,100}',identifier):
             raise ValueError('Invalid chunk entry ID')
+        intent = payload
+        fingerprint = digest(intent)
+        primary_risk = None
+        if 'primaryRiskRequest' in payload:
+            if (payload.get('executionPolicy')!='hybrid-market-limit-v1' or payload.get('entryMode')!='side-zone'
+                    or payload.get('symbol') not in self.bridge.config['symbols'] or payload.get('side') not in ('buy','sell')
+                    or any(key in payload for key in ('volume','chunkVolume','riskUsd'))):
+                raise ValueError('Invalid primary balance risk request')
+            with self.lock:
+                found = self._load(identifier)
+                if found:
+                    if found[0]!=fingerprint:
+                        raise ValueError('Chunk entry ID reused with different parameters')
+                    return public_record(found[2])
+                cancelled = self._cancelled(identifier)
+                if cancelled is not None:
+                    return public_record(cancelled)
+            self._expiry(payload)
+            self.bridge.validate_deadline(payload)
+            # No coordinator lock spans the native read. The second check
+            # below honours a stop or duplicate that arrived during sizing.
+            primary_risk = self.bridge.entry_primary_sizing(payload)
+            payload = dict(payload,**{key:primary_risk[key] for key in ('volume','chunkVolume','riskUsd')})
         with self.lock:
             found = self._load(identifier)
             if found:
-                if found[0]!=digest(payload):
+                if found[0]!=fingerprint:
                     raise ValueError('Chunk entry ID reused with different parameters')
                 return public_record(found[2])
             cancelled = self._cancelled(identifier)
@@ -5820,6 +7112,12 @@ class IsolatedEntries(ChunkEntries):
                 raise ValueError('Unsupported independent entry engine contract')
             for key in ('trigger','volume','chunkVolume','riskUsd','sl','tickSize','stopOffsetPts','chunkPercent'):
                 number(payload.get(key),key)
+            take_distance = None
+            if payload['symbol'] == 'SPX500' or weighted_nasdaq_stop(payload):
+                take = number(payload.get('tp', 0), 'Take profit', positive=False)
+                if take:
+                    direction = 1 if payload['side']=='buy' else -1
+                    take_distance = number(rounded(direction * (take-payload['trigger'])), 'Entry take distance')
             if payload['chunkVolume']>payload['volume'] or payload['chunkPercent']>100:
                 raise ValueError('Invalid independent entry size')
             for cap in (self.bridge.config.get('entryRiskLimitUsd',0),payload.get('entryRiskLimitUsd',0)):
@@ -5836,9 +7134,19 @@ class IsolatedEntries(ChunkEntries):
                         raise ValueError('Balance risk requires a valid percentage and stop')
                     balance_policies[str(row['account'])]=percent
             current = [row for row in self.list() if row['phase'] in ACTIVE]
-            if len(current)>=4 or any(row['symbol']==payload['symbol'] and row['side']==payload['side'] for row in current):
-                raise ValueError('An entry is already active in this direction, or the active entry limit was reached')
+            if len(current)>=4:
+                raise ValueError('The active entry limit was reached')
+            blocked = {account for old_payload, old_state in AccountPlanEntries._direction_rows(self.storage, payload, legacy_only=True)
+                       for account in accounts if AccountPlanEntries._holds_account_direction(old_state, account)
+                       and not AccountPlanEntries._legacy_direction_candidate(old_payload,old_state,account)}
+            blocked.update(account for row in current if row.get('accountExecution') == 'independent-v5'
+                           and row['symbol'] == payload['symbol'] and row['side'] == payload['side']
+                           for account in accounts if row.get('lanePhases', {}).get(account) in ACTIVE)
+            if blocked == set(accounts):
+                raise ValueError('A previous entry remains active or unconfirmed on every selected account in this direction')
             state = {key:copy.deepcopy(payload[key]) for key in PUBLIC_FIELDS if key in payload}
+            if primary_risk is not None:
+                state['primaryRiskSizing'] = primary_risk
             state.update(id=identifier,accountExecution='independent-v5',initialSizingOnly=True,phase='armed',
                          reason='Account admission in progress',children=[],nextChunk=0,childCount=0,
                          createdAt=time.time()*1000,updatedAt=time.time()*1000,lanePhases={account:'armed' for account in accounts},
@@ -5847,17 +7155,25 @@ class IsolatedEntries(ChunkEntries):
                              for account,multiplier in accounts.items()})
             for account,percent in balance_policies.items():
                 state['accounts'][account].update(riskPercent=percent,targetVolume=0,riskUsd=0)
+            for account in blocked:
+                state['accounts'][account].update(entryStatus='stopped',
+                    entryReason='Previous entry on this account and direction remains active or unconfirmed')
+                state['lanePhases'][account] = 'stopped'
             with self.storage.lock:
                 self.storage.db.execute('INSERT INTO chunk_entries VALUES (?,?,?,?)',
-                    (identifier,digest(payload),json.dumps(payload,allow_nan=False),json.dumps(state,allow_nan=False)))
+                    (identifier,fingerprint,json.dumps(intent,allow_nan=False),json.dumps(state,allow_nan=False)))
                 self.storage.db.commit()
             self.projections[identifier] = copy.deepcopy(state)
             self._index_committed(state);self._remember(state)
             for slot,(account,multiplier) in enumerate(accounts.items()):
+                if account in blocked:
+                    continue
                 engine = self.shards.get(account)
                 local = copy.deepcopy(payload)
-                for key in ('mirrorAccounts','mirrorAccount','requiredCapabilities','admissionContract','entryRiskLimitUsd'):
+                for key in ('mirrorAccounts','mirrorAccount','requiredCapabilities','admissionContract','entryRiskLimitUsd','primaryRiskRequest','entryTakeDistance'):
                     local.pop(key,None)
+                if take_distance is not None:
+                    local['entryTakeDistance'] = take_distance
                 local.update(accountExecution='independent-v4',initialSizingOnly=True,accountLaneSlot=slot,
                              volume=rounded(payload['volume']*multiplier),chunkVolume=rounded(payload['chunkVolume']*multiplier),
                              riskUsd=rounded(payload['riskUsd']*multiplier))

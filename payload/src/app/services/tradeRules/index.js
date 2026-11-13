@@ -10,6 +10,11 @@ class TradeRules {
     this.rules = rules;
   }
 
+  quantityLimit(card) {
+    const limits=this.rules.filter(rule=>rule instanceof MaxQtyRule).map(rule=>rule._max(card)).filter(Number.isFinite);
+    return limits.length ? Math.min(...limits) : null;
+  }
+
   validate(card = {}, quote, {deferMarketPrice=false}={}) {
     for (const rule of this.rules) {
       // Only explicit conditional VPS admission uses this path. The saved LT

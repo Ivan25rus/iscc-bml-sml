@@ -5,8 +5,10 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace as N
+from unittest.mock import patch
 
 import test_hybrid_protection as fixtures
+import test_isolated_entry_engines as isolated
 from mt5_bridge import Bridge
 from chunk_entry import ChunkEntries
 
@@ -71,6 +73,52 @@ class NativeReconciliationTests(unittest.TestCase):
                         self.assertFalse(native.orders)
                         self.assertEqual(len({row.sl for row in native.positions}), 1)
                         self.assertFalse(f.closes(native))
+
+    def test_done_market_with_zero_price_waits_for_exact_broker_position_without_replay(self):
+        for delay_proof in (False, True):
+            with self.subTest(delay_proof=delay_proof):
+                f = self.fixture('sell', accounts=1)
+                f.payload.update(volume=.7, riskUsd=12.5, chunkPercent=50.)
+                native = f.natives[0]
+                native.fill_on_cancel = True
+                send = native.order_send
+                positions_get = native.positions_get
+                hidden = set()
+
+                def done_without_price(request):
+                    result = send(request)
+                    if request['action'] == native.TRADE_ACTION_DEAL and 'position' not in request:
+                        result.price = 0.
+                        if delay_proof:
+                            hidden.add(result.order)
+                    return result
+
+                def positions(*args, **kwargs):
+                    return [row for row in positions_get(*args, **kwargs) if row.ticket not in hidden]
+
+                native.order_send = done_without_price
+                native.positions_get = positions
+                f.engine.arm(f.payload)
+                if delay_proof:
+                    held = self.pump(f, lambda s: s.get('reconciliation', {}).get('status') == 'checking')
+                    self.assertEqual(held['children'][1]['state'], 'unknown')
+                    sent = len(f.markets(native))
+                    for _ in range(5):
+                        f.engine.reconcile_poll_at.clear()
+                        f.tick()
+                    self.assertEqual(len(f.markets(native)), sent)
+                    hidden.clear()
+                    native.order_send = send
+                final = self.pump(f, lambda s: s['phase'] in ('completed', 'stopped'))
+                self.assertEqual(final['phase'], 'completed', final.get('reason'))
+                self.assertAlmostEqual(final['accounts']['900000002']['filledVolume'], .7)
+                self.assertAlmostEqual(sum(row.volume for row in native.positions), .7)
+                self.assertEqual(len(f.markets(native)), 1)
+                self.assertEqual(len({row.sl for row in native.positions}), 1)
+                market = next(child for child in final['children'] if child['type'] == 'market')
+                actual = market['positions']['900000002']
+                self.assertEqual(actual['fillPrice'], next(row.price_open for row in native.positions
+                                                          if str(row.ticket) == actual['ticket']))
 
     def test_missing_ticket_and_empty_native_rows_do_not_prove_rejection_or_allow_replay(self):
         f = self.fixture()
@@ -242,6 +290,120 @@ class NativeReconciliationTests(unittest.TestCase):
         self.assertFalse(native.positions);self.assertFalse(native.orders)
         self.assertEqual(len(f.markets(native)),1)
         self.assertTrue(final['children'][1]['closedOpenings'])
+
+
+class IsolatedNativeRecoveryTests(unittest.TestCase):
+    def fixture(self):
+        runner = isolated.IsolatedEngineTests()
+        self.addCleanup(runner.doCleanups)
+        return runner, runner.make()
+
+    def test_lost_exact_price_refusal_resumes_once_with_fresh_price(self):
+        runner, f = self.fixture()
+        native, bridge = f.natives[0], f.primary
+        account = '900000002'
+        guard, execute = bridge.guard_chunk_request, bridge.execute
+        checks, attempts, lost = [], [], []
+
+        def move_quote(payload, request):
+            if payload.get('type') == 'market' and not lost:
+                identifier = payload['id']
+                self.assertFalse(bridge.db.in_transaction)
+                self.assertEqual(bridge._request_receipt(identifier)['status'], 'unknown')
+                checks.append(identifier)
+                f.quote(native, 25007.)
+            return guard(payload, request)
+
+        def drop_refusal(operation, payload, *args, **kwargs):
+            if operation == 'place' and payload.get('type') == 'market':
+                attempts.append(payload['id'])
+            response = execute(operation, payload, *args, **kwargs)
+            if payload['id'] in checks and not lost:
+                refusal = response['result']
+                self.assertEqual(refusal['status'], 'rejected')
+                self.assertIs(refusal['finalPreMutationRejection'], True)
+                self.assertEqual(refusal['entryDiagnostics']['rejectionStage'], 'native-entry-price-guard')
+                self.assertEqual(bridge._request_receipt(payload['id']), refusal)
+                lost.append(payload['id'])
+                f.quote(native, 25003.)
+                raise RuntimeError('Simulated loss of a native price refusal')
+            return response
+
+        bridge.guard_chunk_request = move_quote
+        bridge.execute = drop_refusal
+        f.engine.arm(f.payload)
+        held = runner.until(f, lambda state: lost and state['lanePhases'].get(account) == 'paused')
+        self.assertEqual(checks, lost)
+        self.assertEqual(next(child['state'] for child in held['children'] if child['id'] == lost[0]), 'unknown')
+        self.assertFalse(f.markets(native))
+        with patch('time.time', return_value=f.now+.35):
+            final = runner.until(f, lambda state: state['phase'] == 'completed')
+        self.assertEqual(final['accounts'][account]['filledVolume'], 1.)
+        rejected = next(child for child in final['children'] if child['id'] == lost[0])
+        self.assertEqual((rejected['state'], rejected['result']['status']), ('rejected', 'rejected'))
+        self.assertEqual(attempts.count(lost[0]), 1)
+        self.assertEqual(f.markets(native)[0]['price'], 25003.)
+        self.assertAlmostEqual(sum(row['volume'] for row in f.markets(native)), 1.)
+        self.assertAlmostEqual(sum(row.volume for row in native.positions), 1.)
+        f.engine.close()
+
+    def test_ioc_partial_waits_for_terminal_proof_then_acquires_only_residual(self):
+        for closed in (False, True):
+            with self.subTest(closed=closed):
+                runner, f = self.fixture()
+                native = f.natives[0]
+                native.info.filling_mode = 2
+                account = '900000002'
+                ticket = []
+                proof_ready = threading.Event()
+                send, orders = native.order_send, native.history_orders_get
+
+                def partial(request):
+                    if request['action'] != native.TRADE_ACTION_DEAL or 'position' in request or ticket:
+                        return send(request)
+                    result = send(dict(request, volume=.10))
+                    native.sent[-1] = copy.deepcopy(request)
+                    ticket.append(result.order)
+                    order, deal = native.history_orders[-1], native.history_deals[-1]
+                    order.state = 2
+                    order.type = request['type']
+                    order.type_filling = native.ORDER_FILLING_IOC
+                    order.volume_initial = request['volume']
+                    order.volume_current = round(request['volume']-.1, 8)
+                    order.sl, order.tp = request['sl'], request['tp']
+                    deal.ticket, deal.order, deal.type, deal.price = 111, result.order, request['type'], request['price']
+                    if closed:
+                        position = native.positions.pop()
+                        native.history_deals.append(N(ticket=112, order=222, symbol=position.symbol, position_id=position.identifier,
+                            entry=1, type=1-position.type, volume=.1, price=position.sl, reason=4))
+                    result.retcode = 10010
+                    return result
+
+                def visible_history(order=None, **kwargs):
+                    order = kwargs.get('ticket', order)
+                    if ticket and order == ticket[0] and not proof_ready.is_set():
+                        return ()
+                    return orders(ticket=order)
+
+                native.order_send = partial
+                native.history_orders_get = visible_history
+                f.engine.arm(f.payload)
+                runner.until(f, lambda state: ticket and state['lanePhases'].get(account) == 'paused')
+                self.assertEqual(len(f.markets(native)), 1)
+                proof_ready.set()
+                final = runner.until(f, lambda state: state['phase'] == ('stopped' if closed else 'completed'))
+                self.assertEqual(final['accounts'][account]['filledVolume'], .1 if closed else 1.)
+                partial_child = next(child for child in final['children'] if child['result'].get('providerOrderId') == str(ticket[0])
+                                     or any(row.get('ticket') == str(ticket[0]) for row in child['positions'].values()))
+                self.assertEqual(partial_child['positions'][account]['volume'], .1)
+                self.assertEqual(bool(partial_child.get('closedOpenings')), closed)
+                self.assertFalse(native.orders)
+                if closed:
+                    self.assertFalse(native.positions)
+                    self.assertEqual(len(f.markets(native)), 1)
+                else:
+                    self.assertAlmostEqual(sum(row.volume for row in native.positions), 1.)
+                f.engine.close()
 
 
 class ClosedOpeningProofTests(unittest.TestCase):

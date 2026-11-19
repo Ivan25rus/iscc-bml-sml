@@ -10,7 +10,7 @@ function clean(value) {
   }
   return result;
 }
-function createDraftStore(directory) {
+function createDraftStore(directory, onSaved = () => {}) {
   const file=path.join(directory,'index-card-drafts.json');let values={},timer,dirty=false;
   try {if(fs.statSync(file).size<=4096) {
     const saved=JSON.parse(fs.readFileSync(file,'utf8'));
@@ -24,6 +24,7 @@ function createDraftStore(directory) {
       fs.writeFileSync(file+'.incoming',JSON.stringify(values),{mode:0o600});
       fs.renameSync(file+'.incoming',file);dirty=false;
     }catch { /* Draft failure cannot change execution. */ }
+    if (!dirty) onSaved();
   }
   return {get:ticker=>['USTEC','SPX500'].includes(ticker) ? clean(values[ticker]) : {},flush,
     set(ticker,value) {

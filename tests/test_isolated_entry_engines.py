@@ -157,6 +157,94 @@ class IsolatedEngineTests(unittest.TestCase):
                 self.assertEqual([(row.ticket, row.volume) for row in native.positions], [(order.ticket, .7)])
                 self.assertFalse(f.markets(native))
 
+    def test_edge_partial_is_confirmed_before_scheduled_poll_with_stale_or_outside_quote(self):
+        for side, direction, stale in (('buy', 1, True), ('sell', -1, False)):
+            with self.subTest(side=side, stale=stale):
+                f = self.make(side)
+                account, native = '900000001', f.natives[1]
+                f.payload['mirrorAccounts'] = [dict(account=account, multiplier=.7)]
+                edge = f.payload['trigger'] + direction*f.payload['zoneRadius']
+                f.quote(native, edge + direction*.2)
+                f.engine.arm(f.payload)
+                state = self.until(f, lambda s: s['accounts'][account].get('pendingVolume') == .7
+                    and any(row['state'] == 'pending' and account in row['volumes'] for row in s['children']))
+                child = next(row for row in state['children'] if row['state'] == 'pending' and account in row['volumes'])
+                shard = f.engine.shards[account]
+                lane = shard.lanes[(f.payload['id'], account)]
+                f.engine._drain_lanes(f.payload['id'])
+                lane.pending_poll_at[child['id']] = time.monotonic()+30
+                order = native.orders[0]
+                with f.bridges[1].lock:
+                    order.volume_current = .4
+                    native.tick.time = time.time()-(2 if stale else 0)
+                exact_read = threading.Event()
+                limit_state = f.bridges[1].entry_limit_state
+
+                def observe_limit(*args):
+                    view = limit_state(*args)
+                    exact_read.set()
+                    return view
+
+                with patch.object(f.bridges[1], 'entry_limit_state', side_effect=observe_limit):
+                    self.until(f, lambda _: exact_read.is_set())
+                    f.engine._drain_lanes(f.payload['id'])
+                state = f.state()
+                self.assertEqual(state['accounts'][account]['filledVolume'], 0.)
+                self.assertEqual(state['accounts'][account]['pendingVolume'], .7)
+                self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
+
+                with f.bridges[1].lock:
+                    fill = dict(symbol=order.symbol, type=native.ORDER_TYPE_BUY if side == 'buy' else native.ORDER_TYPE_SELL,
+                                volume=.3, price=edge, sl=order.sl, tp=order.tp, comment=order.comment)
+                    position = native.position_from(order.ticket, fill)
+                    position.ticket += 10000
+                    position.identifier = position.ticket
+                    order.position_id = position.identifier  # Only the live order links these two ticket IDs.
+                    native.positions.append(position)
+                    native.tick.time = time.time()-(2 if stale else 0)
+                state = self.until(f, lambda s: s['accounts'][account]['filledVolume'] == .3)
+                self.assertAlmostEqual(state['accounts'][account]['pendingVolume'], .4)
+                captured = next(row for row in state['children'] if row['id'] == child['id'])
+                self.assertEqual(captured['positions'][account]['openingTicket'], str(order.ticket))
+                self.assertEqual([row.ticket for row in native.orders], [order.ticket])
+                self.assertFalse(f.markets(native))
+                self.assertGreater(lane.pending_poll_at[child['id']], time.monotonic()+1)
+
+                if not stale:
+                    with f.bridges[1].lock:
+                        position.volume = .5
+                        exact_read.clear()
+                    context = f.bridges[1].entry_context
+
+                    def race_after_quote(*args):
+                        reply = context(*args)
+                        proof = reply['proof']
+                        if proof:
+                            for row in proof['orders']:
+                                if row['ticket'] == str(position.ticket):
+                                    row['lots'] = .2  # Force a fresh position proof after the quote.
+                        return reply
+
+                    lane.position_proof = {}
+                    with patch.object(f.bridges[1], 'entry_context', side_effect=race_after_quote), \
+                            patch.object(f.bridges[1], 'entry_limit_state', side_effect=observe_limit):
+                        self.until(f, lambda _: exact_read.is_set())
+                        f.engine._drain_lanes(f.payload['id'])
+                    state = f.state()
+                    self.assertEqual(state['accounts'][account]['filledVolume'], .3)
+                    self.assertAlmostEqual(state['accounts'][account]['pendingVolume'], .4)
+                    self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
+
+                with f.bridges[1].lock:
+                    native.orders.remove(order)
+                    position.volume = .7
+                    native.history_orders.append(SimpleNamespace(ticket=order.ticket, symbol=order.symbol,
+                                                                position_id=position.identifier, state=4))
+                state = self.until(f, lambda s: s['accounts'][account]['filledVolume'] == .7)
+                self.assertEqual(state['accounts'][account]['pendingVolume'], 0.)
+                self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
+                self.assertGreater(lane.pending_poll_at[child['id']], time.monotonic()+1)
+
     def test_return_fill_between_native_reads_is_confirmed_even_with_stale_quote(self):
         for side, direction in (('buy', 1), ('sell', -1)):
             with self.subTest(side=side):
@@ -199,11 +287,125 @@ class IsolatedEngineTests(unittest.TestCase):
                 state = self.until(f, lambda state: state['accounts'][account]['filledVolume'] == .7)
                 self.assertEqual(observations, ['orders', 'orders'])
                 self.assertEqual(state['accounts'][account].get('pendingVolume'), 0.)
+                self.assertEqual(state['accounts'][account].get('limitFillStopRange'),
+                                 dict(minimum=order.sl, maximum=order.sl))
+                self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
                 f.quote(native, edge)
                 native.tick.time = time.time()
                 state = self.until(f, lambda state: state['accounts'][account].get('entryStatus') == 'completed')
                 self.assertEqual(state['accounts'][account]['filledVolume'], .7)
+                self.assertNotIn('limitFillStopRange', state['accounts'][account])
                 self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
+
+    def return_limit_awaiting_history(self):
+        f = self.make('sell')
+        account, native, bridge = '900000001', f.natives[1], f.bridges[1]
+        f.payload.update(mirrorAccounts=[dict(account=account, multiplier=.7)])
+        edge = f.payload['trigger'] - f.payload['zoneRadius']
+        f.quote(native, edge - .2)
+        f.engine.arm(f.payload)
+        self.until(f, lambda state: state['accounts'][account].get('pendingVolume') == .7
+                   and state['accounts']['900000002']['filledVolume'] == 1.)
+        f.engine._drain_lanes(f.payload['id'])
+
+        with bridge.lock:
+            order = native.orders.pop()
+        # The limit filled and stopped out before the live read. The broker
+        # hasn't published its deals yet, so keep the reservation intact.
+        checking = self.until(f, lambda state: state['lanePhases'][account] == 'paused')
+        self.assertEqual(checking['accounts'][account]['pendingVolume'], .7)
+        self.assertEqual(checking['accounts'][account]['filledVolume'], 0.)
+        self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
+        return f, order
+
+    @staticmethod
+    def publish_closed_limit(f, order):
+        native, bridge = f.natives[1], f.bridges[1]
+        fill_price = order.price_open + .1
+        with bridge.lock:
+            native.history_orders.append(SimpleNamespace(ticket=order.ticket, symbol=order.symbol,
+                position_id=order.ticket, state=4, type=order.type, volume_initial=.7, sl=order.sl, tp=order.tp))
+            native.history_deals.extend([
+                SimpleNamespace(ticket=1, order=order.ticket, position_id=order.ticket, symbol=order.symbol,
+                    entry=0, type=native.ORDER_TYPE_SELL, volume=.7, price=fill_price, reason=0),
+                SimpleNamespace(ticket=2, order=order.ticket + 1, position_id=order.ticket, symbol=order.symbol,
+                    entry=1, type=native.ORDER_TYPE_BUY, volume=.7, price=order.sl, reason=4),
+            ])
+        return fill_price
+
+    def test_return_limit_closed_before_live_read_releases_direction_after_exact_history(self):
+        f, order = self.return_limit_awaiting_history()
+        account, native = '900000001', f.natives[1]
+        fill_price = self.publish_closed_limit(f, order)
+        settled = self.until(f, lambda state: state['lanePhases'][account] == 'stopped')
+        self.assertEqual(settled['accounts'][account]['filledVolume'], .7)
+        self.assertEqual(settled['accounts'][account]['pendingVolume'], 0.)
+        child = next(row for row in settled['children'] if account in row['volumes'])
+        self.assertEqual(child['state'], 'confirmed')
+        self.assertEqual(child['positions'][account]['fillPrice'], fill_price)
+        self.assertEqual(child['closedOpenings'][account], dict(openingTicket=str(order.ticket), positionId=str(order.ticket)))
+        self.assertFalse(child.get('cancellations'))
+        self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
+        self.assertFalse(f.engine.shards[account]._load(f.payload['id'])[2]['reconciliation']['resumeAllowed'])
+
+        f.payload.update(id='next-return-after-broker-exit', cid='next-return-after-broker-exit')
+        f.engine.arm(f.payload)
+        self.until(f, lambda state: any(child['state'] == 'pending' and account in child['volumes']
+                                      for child in state['children']))
+        self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING]*2)
+
+    def test_new_entry_waits_only_on_account_reconciling_older_limit(self):
+        f, order = self.return_limit_awaiting_history()
+        account, native = '900000001', f.natives[1]
+        f.payload.update(id='next-return-during-check', cid='next-return-during-check',
+                         intentDelivery='entry-intent-delivery-v1', intentTtlMs=15000, expiresAt=f.now*1000+15000)
+        # This case measures ordering and isolation. The next test explicitly
+        # drives the deadline; slow fixture disk writes must not race it here.
+        with patch('chunk_entry.LIMIT_HISTORY_ADMISSION_WAIT', 15.):
+            f.engine.arm(f.payload)
+            self.until(f, lambda state: state['accounts'][account].get('admissionWaiting')
+                       and state['accounts']['900000002']['filledVolume'] == 1.)
+            self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
+            self.publish_closed_limit(f, order)
+            self.until(f, lambda state: any(child['state'] == 'pending' and account in child['volumes']
+                                          for child in state['children']))
+        self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING]*2)
+
+    def test_new_entry_waiting_for_limit_history_expires_without_late_send(self):
+        f, order = self.return_limit_awaiting_history()
+        account, native = '900000001', f.natives[1]
+        f.payload.update(id='next-return-history-timeout', cid='next-return-history-timeout')
+        with patch('chunk_entry.LIMIT_HISTORY_ADMISSION_WAIT', .15):
+            f.engine.arm(f.payload)
+            self.until(f, lambda state: state['accounts'][account].get('admissionWaiting'))
+            self.until(f, lambda state: state['lanePhases'][account] == 'stopped')
+        self.publish_closed_limit(f, order)
+        self.until(f, lambda _: not f.engine.admission_retries and f.engine.shards[account]._load('protection-one')[2]['phase'] == 'stopped')
+        self.assertIsNone(f.engine.shards[account]._load(f.payload['id']))
+        self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
+
+    def test_new_entry_can_wait_when_it_starts_previous_limit_reconciliation(self):
+        f, order = self.return_limit_awaiting_history()
+        account, native = '900000001', f.natives[1]
+        old_id = f.payload['id']
+        f.engine._drain_lanes(old_id)
+        shard = f.engine.shards[account]
+        state = shard._load(old_id)[2]
+        state.pop('reconciliation')
+        state.update(phase='unknown', lanePhases={account:'unknown'})
+        shard._save(state)
+        f.payload.update(id='next-return-starts-history-check', cid='next-return-starts-history-check',
+                         intentDelivery='entry-intent-delivery-v1', intentTtlMs=15000, expiresAt=f.now*1000+15000)
+        worker = f.primary.linked[account]
+        with patch.object(worker, 'call_if_idle', side_effect=worker.call, create=True), \
+                patch('chunk_entry.LIMIT_HISTORY_ADMISSION_WAIT', 15.):
+            f.engine.arm(f.payload)
+            self.until(f, lambda row: row['accounts'][account].get('admissionWaiting'))
+            self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING])
+            self.publish_closed_limit(f, order)
+            self.until(f, lambda row: any(child['state'] == 'pending' and account in child['volumes']
+                                         for child in row['children']))
+        self.assertEqual([request['action'] for request in native.sent], [native.TRADE_ACTION_PENDING]*2)
 
     def test_edge_limit_capacity_refusal_and_partial_fill_retain_working_remainder(self):
         for retcode in (10033, 10034):
@@ -531,12 +733,15 @@ class IsolatedEngineTests(unittest.TestCase):
         f=self.make();entered=threading.Event();release=threading.Event();self.addCleanup(release.set)
         original=f.primary.linked['900000001'].call
         def call(method,*args):
-            if method=='entry_admission':entered.set();release.wait(3)
+            if method=='entry_admission':
+                entered.set()
+                # Keep the peer blocked until the primary's result is checked.
+                release.wait()
             return original(method,*args)
         f.primary.linked['900000001'].call=call
-        started=time.monotonic();f.engine.arm(f.payload)
-        self.assertLess(time.monotonic()-started,.5)
         try:
+            started=time.monotonic();f.engine.arm(f.payload)
+            self.assertLess(time.monotonic()-started,.5)
             state=self.until(f,lambda s:s['accounts']['900000002']['filledVolume']==1)
             self.assertTrue(entered.is_set());self.assertEqual(state['accounts']['900000001']['filledVolume'],0)
         finally:release.set()

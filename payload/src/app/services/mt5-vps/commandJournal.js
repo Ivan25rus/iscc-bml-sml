@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { createHash } = require('crypto');
 const { isDeepStrictEqual } = require('util');
+const {isEntryPlan, changeFile, loadEntryPlans, appendEntryPlansSync} = require('../entryPlanJournal');
 const independentEntryOperations = ['entry-protection', 'entry-close', 'entry-partial-close'];
 function isIndependentEntryControl(record) {
   return independentEntryOperations.includes(record.operation) && record.payload?.independentAccountControls === true;
@@ -18,7 +19,8 @@ class CommandJournal {
     this.file = file;
     this.asyncWrites = asyncWrites;
     if(asyncWrites)require('../journalWriter').warm();
-    this.records = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : [];
+    this.records = isEntryPlan(file) ? [...loadEntryPlans(file).records.values()]
+      : fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : [];
     if (!Array.isArray(this.records)) throw Error('Повреждён журнал команд MT5');
     if(asyncWrites)this.prepared=require('../journalWriter').prepareJournal(file).catch(()=>{});
   }
@@ -27,6 +29,7 @@ class CommandJournal {
   }
   save(changes) {
     if (this.asyncWrites) return require('../journalWriter').writeJournal(this.file,changes,changes ? undefined : this.records);
+    if (isEntryPlan(this.file) && fs.existsSync(changeFile(this.file))) return appendEntryPlansSync(this.file, changes);
     fs.mkdirSync(path.dirname(this.file), {recursive:true});
     const temporary = this.file + '.tmp';
     const fd = fs.openSync(temporary, 'w', 0o600);

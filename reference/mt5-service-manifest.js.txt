@@ -4,12 +4,18 @@ const loadConfig = require('../../config/load');
 const { MT5VPSAdapter } = require('./client');
 const { CommandJournal } = require('./commandJournal');
 const events = require('../events');
-const {followers,transferCopying}=require('./sizing');
+const {followers,accountChunkPercents,accountZoneMultipliers,transferCopying}=require('./sizing');
+const {normalizeAccountNames}=require('./accountNames');
+const {ACCOUNT_CHUNK_CAPABILITY,ACCOUNT_ZONE_CAPABILITY}=require('./entryAdmission');
 const {normalizePrimaryRisk,primaryRisk}=require('./primaryRisk');
 const {managementFreshness}=require('./managementFreshness');
 settings.register('mt5-vps', path.join(__dirname,'config/mt5-vps.json'), path.join(__dirname,'config/mt5-vps-settings-descriptor.json'));
 settings.onApply('mt5-vps', ({ changedPaths }) => ({restartRequiredPaths:changedPaths}));
 function readConfig() { return loadConfig('../services/mt5-vps/config/mt5-vps.json'); }
+function realEntryAccounts(state) {
+  return Object.entries(state.accountStates || {}).filter(([,view])=>view.connected && view.accountInfo?.tradeMode==='real')
+    .map(([id])=>id);
+}
 function initService(api) {
   let adapter;
   const accountAdapters = new Map();
@@ -116,7 +122,11 @@ function initService(api) {
       .catch(()=>{}).finally(()=>{receiptRefresh=null;});
   }
   const warmthTimer = require('timers').setInterval(async () => {
-    if (closing || watching || !adapter?.config.enabled) return;
+    if (closing || !adapter?.config.enabled) return;
+    // The coordinator receives the opening for every account. Keep its
+    // sockets ready even when flat and a management read is still pending.
+    const entryWarmth=adapter.maintainExecutionWarmth({keepReady:true}).catch(()=>{});
+    if (watching) return entryWarmth;
     watching = true;
     try {
       // Discover positions even with the dialog closed. This GET never arms or
@@ -126,9 +136,10 @@ function initService(api) {
         if (closing) return;
         if (state) acceptManagement(state);
       }
-      await Promise.all([adapter,...accountAdapters.values()].map(connection=>connection.maintainExecutionWarmth()));
+      await Promise.all([...accountAdapters.values()].map(connection=>connection.maintainExecutionWarmth()));
     } catch { /* Existing UI status and VPS checks handle a disconnected terminal. */ }
     finally { watching = false; }
+    await entryWarmth;
   },1000);
   warmthTimer.unref?.();
   // before-quit can be cancelled while the TV connector is stopping. Keep the
@@ -207,7 +218,10 @@ function initService(api) {
       // Settings need capabilities/account ids, not ticket histories,
       // reconciliation, command journals or a management execution lease.
       return {status:'ok',account:config.account,accounts:[config.account,...primary.remoteAccounts],
-        followers:followers(config),primaryRisk:primaryRisk(config),
+        followers:followers(config),primaryRisk:primaryRisk(config),accountChunkPercents:accountChunkPercents(config.accountChunkPercents),
+        accountZoneMultipliers:accountZoneMultipliers(config.accountZoneMultipliers),
+        accountNames:normalizeAccountNames(config.accountNames),
+        realAccounts:realEntryAccounts(state),
         timeExit:require('./timeExit').timeExitConfig(config),capabilities:state.capabilities || health.capabilities || []};
     } catch(error){return {status:'rejected',reason:error.message};}
   });
@@ -311,6 +325,7 @@ function initService(api) {
     if(!settings.writeConfig('mt5-vps',changed))throw Error('Не удалось сохранить настройки');
     primary.config.followers=next;
     primary.config.mirrorAccount=changed.mirrorAccount;
+    api.ltLevelSync?.invalidateMobileProfile();
     return {status:'ok',followers:next};
   }
   ipcMain.handle('mt5-vps:save-followers',async (_evt,rows)=>{
@@ -357,8 +372,65 @@ function initService(api) {
       if (!settings.writeConfig('mt5-vps',{...config,primaryRiskByAccount:policies}))
         throw Error('Не удалось сохранить риск основного счёта');
       primary.config.primaryRiskByAccount=policies;
+      api.ltLevelSync?.invalidateMobileProfile();
       return {status:'ok',primaryRisk:risk};
     } catch(error) {return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('mt5-vps:save-account-chunk-percents',(_evt,value)=>{
+    try {
+      const primary=api.mt5VPS.getAdapter(),config=readConfig();
+      const active=String(config.account);
+      if(String(value?.account)!==active || String(primary.config.account)!==active || enrollment.busy)
+        throw Error('Список счетов изменился. Обнови настройки MT5');
+      if(!primary.capabilities?.includes(ACCOUNT_CHUNK_CAPABILITY))throw Error('Обнови приёмник VPS');
+      const available=new Set([active,...(primary.remoteAccounts || []).map(String)]);
+      const next=accountChunkPercents(value?.percentages);
+      if(Object.keys(next).some(account=>!available.has(account)))throw Error('Список счетов изменился. Обнови настройки MT5');
+      if(!settings.writeConfig('mt5-vps',{...config,accountChunkPercents:next}))throw Error('Не удалось сохранить размер частей');
+      primary.config.accountChunkPercents=next;
+      return {status:'ok',accountChunkPercents:next};
+    } catch(error){return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('mt5-vps:save-account-zone-multipliers',async (_evt,value)=>{
+    try {
+      const primary=api.mt5VPS.getAdapter(),active=String(primary.config.account);
+      if(String(value?.account)!==active || enrollment.busy)throw Error('Список счетов изменился. Обнови настройки MT5');
+      if(!primary.capabilities?.includes(ACCOUNT_ZONE_CAPABILITY))throw Error('Обнови приёмник VPS');
+      const submitted=accountZoneMultipliers(value?.multipliers);
+      const edited=Object.keys(value?.multipliers || {});
+      const state=await primary.managementState({maxAgeMs:2000});
+      const config=readConfig();
+      if(String(config.account)!==active || api.mt5VPS.getAdapter()!==primary || enrollment.busy)
+        throw Error('Список счетов изменился. Обнови настройки MT5');
+      const available=new Set([active,...primary.remoteAccounts.map(String)]);
+      const realAccounts=new Set(realEntryAccounts(state));
+      if(!edited.length || edited.some(id=>!realAccounts.has(id) || !available.has(id)))
+        throw Error('Приёмник не подтвердил реальный счёт. Обнови настройки MT5');
+      const next=accountZoneMultipliers(config.accountZoneMultipliers);
+      for(const id of edited)delete next[id];
+      Object.assign(next,submitted);
+      if(!settings.writeConfig('mt5-vps',{...config,accountZoneMultipliers:next}))throw Error('Не удалось сохранить люфт БМЛ/СМЛ');
+      primary.config.accountZoneMultipliers=next;
+      return {status:'ok',accountZoneMultipliers:next};
+    } catch(error){return {status:'rejected',reason:error.message};}
+  });
+  ipcMain.handle('mt5-vps:save-account-names',(_evt,value)=>{
+    try {
+      const primary=api.mt5VPS.getAdapter(),config=readConfig(),active=String(config.account);
+      if(String(value?.account)!==active || String(primary.config.account)!==active || enrollment.busy)
+        throw Error('Список счетов изменился. Обнови настройки MT5');
+      const submitted=normalizeAccountNames(value?.names);
+      const edited=Object.keys(value?.names || {});
+      const available=new Set([active,...followers(config).map(row=>row.account),...(primary.remoteAccounts || []).map(String)]);
+      if(!edited.length || edited.some(id=>!available.has(id)))
+        throw Error('Список счетов изменился. Обнови настройки MT5');
+      const next=normalizeAccountNames(config.accountNames);
+      for(const id of edited)delete next[id];
+      Object.assign(next,submitted);
+      if(!settings.writeConfig('mt5-vps',{...config,accountNames:next}))throw Error('Не удалось сохранить имена счетов');
+      primary.config.accountNames=next;
+      return {status:'ok',accountNames:next};
+    } catch(error){return {status:'rejected',reason:error.message};}
   });
   ipcMain.handle('mt5-vps:save-time-exit',async (_evt,value)=>{
     try {
@@ -379,6 +451,7 @@ function initService(api) {
       }
       if (!settings.writeConfig('mt5-vps',{...current,timeExit})) throw Error('Не удалось сохранить время закрытия');
       primary.config.timeExit=timeExit;
+      api.ltLevelSync?.invalidateMobileProfile();
       return {status:'ok',timeExit};
     } catch(error) {return {status:'rejected',reason:error.message};}
   });

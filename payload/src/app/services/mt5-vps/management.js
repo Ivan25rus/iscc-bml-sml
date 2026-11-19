@@ -5,6 +5,7 @@ const {parentClosePreview}=require('./parentClosePreview');
 const {protectionReceiptView}=require('./protectionReceiptView');
 const {normalizeTarget,matchesTarget}=require('./managementTarget');
 const {managementBlock,decimal,protectionChanges,isEntryPlanRow,entryPlanMetadata,entryProtectionBlock,exactEntryProtectionBlock,exactEntryCloseBlock,protectionView}=require('./managementPolicy');
+const pendingTakeAccount=({state})=>['armed','firing','unknown'].includes(state);
 function peerProtectionTarget(data,wanted) {
   const selected=data.accountStates?.[wanted.account],server=data.server || selected?.server;
   if(!data.accountStates || String(data.account)!==wanted.account || selected?.account!=null && String(selected.account)!==wanted.account
@@ -78,6 +79,7 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
     const takePrice=input('Цена','mt5-partial-take-price');
     const takePercent=input('Закрыть, %','mt5-partial-take-percent');takePercent.value='50';
     const takeSave=make('button','Сохранить частичный тейк');takeSave.id='mt5-partial-take-save';
+    const takeClear=make('button','Убрать черновик');takeClear.id='mt5-partial-take-clear';
     const takeCancel=make('button','Отменить частичный тейк');takeCancel.id='mt5-partial-take-cancel';
     const takeNote=make('p');takeNote.id='mt5-partial-take-status';takeNote.className='mt5-note';
     const takePreview=make('p');takePreview.id='mt5-partial-take-preview';takePreview.className='mt5-note';
@@ -173,7 +175,7 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
     const takeSection=make('details');takeSection.id='mt5-partial-take-section';
     const takeTitle=document.createElement('summary');takeTitle.textContent='Частичный тейк · все счета';
     const takeFields=document.createElement('div');takeFields.className='mt5-fields mt5-protection-fields';takeFields.append(takePrice.closest('label'),takePercent.closest('label'));
-    const takeActions=document.createElement('div');takeActions.className='mt5-action';takeActions.append(takeSave,takeCancel);
+    const takeActions=document.createElement('div');takeActions.className='mt5-action';takeActions.append(takeSave,takeClear,takeCancel);
     takeSection.append(takeTitle,takeFields,takePreview,takeActions,takeNote);protection.append(takeSection);
     const closure=section('Закрыть часть');const closeRow=document.createElement('div');closeRow.className='mt5-row';closeRow.append(sizeMode,volume.closest('label'),percent.closest('label'),partial);
     const presets=document.createElement('div');presets.className='mt5-percent-presets';
@@ -291,12 +293,14 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
       presets.hidden=!row?.__isPosition;
       takeSection.hidden=!hybrid || !row?.__isPosition;
       const takeRule=parentTake(),takeStates=Object.values(takeRule?.accounts || {});
-      const takeActive=takeStates.some(item=>['armed','firing','unknown'].includes(item.state));
+      const takeActive=takeStates.some(pendingTakeAccount);
       const takeSupported=capabilities.includes('entry-parent-partial-take-v1');
       let takePlan=[],takeValue=0;
       try{takeValue=decimal(takePrice.value);takePlan=parentClosePreview(row,dataAccount(),accountStates,'percent',decimal(takePercent.value)).preview;}catch{}
       takeSave.disabled=busy || !hybrid || !takeSupported || !connected || Boolean(fullBlock) || !(takeValue>0)
         || !takePlan.length || takePlan.some(item=>item.error) || takeActive;
+      takeClear.hidden=takeActive || !takePrice.value.trim();
+      takeClear.disabled=busy || takeClear.hidden;
       takeCancel.disabled=busy || !takeSupported || !takeStates.some(item=>item.state==='armed') || takeStates.some(item=>['firing','unknown'].includes(item.state));
       takeCancel.hidden=!takeActive;
       takeSave.textContent=`Сохранить TP ${takePercent.value || '…'}%`;
@@ -325,7 +329,13 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
     function choose(preserve = false, keepEditedPrices = false) {
       const row = target(),hybrid=isEntryPlanRow(row);
       if(takeDraftParent!==(row?.entryPlan?.id || '')){takeDraftParent=row?.entryPlan?.id || '';takeDirty=false;}
-      if(!takeDirty){const rule=parentTake();takePrice.value=rule?String(rule.targetPrice):'';takePercent.value=String(rule?.closePercent || 50);}
+      const rule=parentTake();
+      const takeActive=Object.values(rule?.accounts || {}).some(pendingTakeAccount);
+      if(takeActive || !takeDirty){
+        takePrice.value=takeActive?String(rule.targetPrice):'';
+        takePercent.value=String(rule?.closePercent || 50);
+        takeDirty=false;
+      }
       title.textContent=navigationTarget ? `Стоп и тейк · ${navigationTarget.symbol}` : 'Позиции · MT5';
       select.hidden=!!navigationTarget;
       let protectionRow=row;try{protectionRow=protectionView(row);}catch{protectionRow={};}
@@ -604,6 +614,11 @@ function mountManagement(ipc, toolbar, {getInstrumentInfo=()=>null,partialClose=
     };
     const closeSize=()=>sizeMode.value==='percent' ? {percent:String(decimal(percent.value))} : {volume:String(decimal(volume.value))};
     for(const field of [takePrice,takePercent])field.oninput=()=>{takeDirty=true;buttons();};
+    takeClear.onclick=()=>{
+      takePrice.value='';
+      takePrice.dispatchEvent(new Event('input',{bubbles:true}));
+      takePrice.focus();
+    };
     takeSave.onclick=()=>{try{run('entry-take',{take:{operation:'arm',targetPrice:decimal(takePrice.value),closePercent:decimal(takePercent.value)}});}catch(error){showMessage(error.message,'Ошибка');}};
     takeCancel.onclick=()=>{const rule=parentTake();if(rule)run('entry-take',{take:{operation:'cancel',ruleId:rule.id}});};
     partial.onclick = () => {try{

@@ -119,9 +119,30 @@ class InstallerTests(unittest.TestCase):
     def test_optional_lt_skip_and_existing_dependencies_are_preserved(self):
         selection = plan()
         selection['publishToLT'] = False
+        package = self.source / 'package.json'
+        package.write_text('{"dependencies":{"ws":"^8.20.0","existing":"^1.0.0"}}')
         install.stage(self.source, selection, self.work)
         install.change(self.work)
         self.assertEqual((self.source / 'app/services/levelTrack/index.js').read_text(), LT)
+        self.assertEqual(json.loads(package.read_text())['dependencies'],
+                         {'ws': '^8.20.0', 'existing': '^1.0.0', 'node-fetch': '^2.7.0'})
+
+    def test_compatible_main_renderer_mounts_warning_panel(self):
+        renderer = self.source / 'app/renderer.js'
+        renderer.write_text("const {ipcRenderer} = require('electron');\n// custom UI\n")
+        install.install(self.source, plan(), self.work)
+        self.assertIn("require('./services/candleLevelRenderer/warnings-ui').mountWarnings(", renderer.read_text())
+        self.assertIn('// custom UI', renderer.read_text())
+        self.assertIn("ipcMain: require('electron').ipcMain",
+                      (self.source / 'app/services/tvListener/manifest.js').read_text())
+
+    def test_other_renderer_remains_untouched(self):
+        renderer = self.source / 'app/renderer.js'
+        renderer.write_text('// custom renderer without a supported integration point\n')
+        install.install(self.source, plan(), self.work)
+        self.assertEqual(renderer.read_text(), '// custom renderer without a supported integration point\n')
+        self.assertNotIn("ipcMain: require('electron').ipcMain",
+                         (self.source / 'app/services/tvListener/manifest.js').read_text())
 
     def test_existing_iscc_receiver_is_required_when_selected(self):
         selection = plan()

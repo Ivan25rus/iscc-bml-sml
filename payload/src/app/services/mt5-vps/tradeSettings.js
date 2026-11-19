@@ -1,3 +1,6 @@
+const {ACCOUNT_CHUNK_CAPABILITY,ACCOUNT_ZONE_CAPABILITY}=require('./entryAdmission');
+const {MAX_NAME_LENGTH}=require('./accountNames');
+
 function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrumentSettings}={}) {
   const launch=document.createElement('button');launch.id='mt5-trade-settings-button';launch.textContent=accounts?'Счета MT5':'Закрытие по времени · MT5';toolbar.append(launch);
   let dialog;
@@ -55,6 +58,17 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
     const transferActions=make('div','',transfer);transferActions.className='account-controls';
     const transferSave=make('button','Перенести',transferActions);transferSave.id='mt5-copy-transfer-save';
     const transferCancel=make('button','Отмена',transferActions);
+    const parts=make('details');parts.id='mt5-account-market-parts';make('summary','Рыночные части БМЛ/СМЛ',parts);
+    make('p','Процент от объёма счёта. Пустое поле использует настройку инструмента.',parts);
+    const partRows=make('div','',parts);
+    const partSave=make('button','Сохранить',parts);partSave.id='mt5-save-account-chunk-percents';
+    const zone=make('details');zone.id='mt5-account-entry-zone';make('summary','Люфт БМЛ/СМЛ на реальном счёте',zone);
+    make('p','Например, ×1,25 расширяет люфт на 25%. Пустое поле или ×1 оставляет люфт инструмента.',zone);
+    const zoneRows=make('div','',zone);
+    const zoneSave=make('button','Сохранить люфт',zone);zoneSave.id='mt5-save-account-zone';
+    const names=make('details');names.id='mt5-account-names';make('summary','Имена счетов на карточках',names);
+    const nameRows=make('div','',names);
+    const nameSave=make('button','Сохранить имена',names);nameSave.id='mt5-save-account-names';
     const recorderPanel=make('details');recorderPanel.id='mt5-tradehub-roles';
     const recorderLabel=make('summary','Роли Trade Hub',recorderPanel);
     recorderLabel.id='mt5-chart-recorder-label';
@@ -94,7 +108,7 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
     const refresh=make('button','Обновить');refresh.id='mt5-settings-refresh';
     const dismiss=make('button','Закрыть');dismiss.style.marginLeft='8px';dismiss.onclick=()=>dialog.close();
     let busy=false,loading=false,ready=false,readPromise=null,copiesDirty=false,exitDirty=false,primaryRiskDirty=false,account,capabilities=[],catalogBusy=false,catalogScanning=false;
-    let accountIds=[],savedCopies=[];
+    let accountIds=[],savedCopies=[],partsDirty=false,realAccounts=[],zoneDirty=false,namesDirty=false;
     let recorder,recorderDraft;
     function renderRecorder(next) {
       if(!next){recorder=undefined;recorderDraft=undefined;recorderStatus.textContent='Настройка уровней и снимков недоступна.';return;}
@@ -190,6 +204,11 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
         editor.save.disabled=editor.select.disabled || !editor.draft || editor.select.value===(editor.state.pendingAccount || editor.state.account);
       }
       saveCopies.disabled=busy || !ready || !capabilities.includes('scaled-accounts');
+      parts.hidden=!capabilities.includes(ACCOUNT_CHUNK_CAPABILITY);
+      partSave.disabled=busy || !ready || !partsDirty;
+      zone.hidden=!capabilities.includes(ACCOUNT_ZONE_CAPABILITY) || !realAccounts.length;
+      zoneSave.disabled=busy || !ready || !zoneDirty || zone.hidden;
+      nameSave.disabled=busy || !ready || !namesDirty;
       primarySave.disabled=busy || !ready;
       primaryPercent.hidden=primaryMode.value!=='balance';
       exitSave.disabled=busy || !ready || !capabilities.includes('time-exit');refresh.disabled=busy || loading;
@@ -220,8 +239,51 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
         }
         accountIds=(data.accounts || []).slice(1).map(String);
         renderCopies(data.followers || []);
+        if(capabilities.includes(ACCOUNT_CHUNK_CAPABILITY) && !partsDirty && !busy && !parts.contains(document.activeElement))
+          renderParts(data.accountChunkPercents || {});
+        realAccounts=(data.realAccounts || []).map(String);
+        if(!zoneDirty && !busy && !zone.contains(document.activeElement))renderZones(data.accountZoneMultipliers || {});
+        if(!namesDirty && !busy && !names.contains(document.activeElement))renderNames(data.accountNames || {});
         await readRecorder();
       } finally {loading=false;controls();}
+    }
+    function renderNames(values) {
+      nameRows.replaceChildren();
+      for(const id of [String(account),...accountIds]) {
+        const row=make('div','',nameRows);row.className='account-controls account-row';
+        const label=make('label',id,row);
+        const input=make('input','',label);
+        input.type='text';input.maxLength=MAX_NAME_LENGTH;input.style.width='135px';
+        input.dataset.nameAccount=id;input.placeholder='Имя на карточке';input.value=values[id] ?? '';
+        input.setAttribute('aria-label',`Имя счёта ${id}`);
+        input.oninput=()=>{namesDirty=true;controls();};
+      }
+    }
+    function renderZones(values) {
+      zoneRows.replaceChildren();
+      for(const id of realAccounts) {
+        const row=make('div','',zoneRows);row.className='account-controls account-row';
+        const label=make('label',id,row);
+        make('span','×',label);
+        const input=make('input','',label);
+        input.type='number';input.min='1';input.step='any';input.style.width='72px';
+        input.dataset.zoneAccount=id;input.placeholder='1';input.value=values[id] ?? '';
+        input.setAttribute('aria-label',`Множитель люфта ${id}`);
+        input.oninput=()=>{zoneDirty=true;controls();};
+      }
+    }
+    function renderParts(values) {
+      partRows.replaceChildren();
+      for(const id of [String(account),...accountIds]) {
+        const row=make('div','',partRows);row.className='account-controls account-row';
+        const label=make('label',id,row);
+        const input=make('input','',label);
+        input.type='number';input.min='0';input.max='100';input.step='any';input.style.width='72px';
+        input.dataset.partAccount=id;input.placeholder='Авто';input.value=values[id] ?? '';
+        input.setAttribute('aria-label',`Рыночная часть ${id}, %`);
+        make('span','%',label);
+        input.oninput=()=>{partsDirty=true;controls();};
+      }
     }
     function renderCopies(rows,force=false) {
       savedCopies=rows;
@@ -262,12 +324,23 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
         else if(kind==='risk'){
           primaryRiskDirty=false;
           toolbar.dispatchEvent(new CustomEvent('mt5-primary-risk-changed',{detail:result.primaryRisk,bubbles:true}));
+        } else if(kind==='parts'){
+          partsDirty=false;
+          renderParts(result.accountChunkPercents);
+        } else if(kind==='zone'){
+          zoneDirty=false;
+          renderZones(result.accountZoneMultipliers);
+        } else if(kind==='names'){
+          namesDirty=false;
+          renderNames(result.accountNames);
+          toolbar.dispatchEvent(new CustomEvent('mt5-account-names-changed',{detail:result.accountNames,bubbles:true}));
         } else {
           copiesDirty=false;
           if(kind==='transfer')transfer.hidden=true;
           if(result.followers)renderCopies(result.followers,true);
         }
-        message.textContent=kind==='transfer' ? `Копирование перенесено на ${value.to}.` : 'Сохранено для следующих сделок.';
+        message.textContent=kind==='transfer' ? `Копирование перенесено на ${value.to}.`
+          : kind==='names' ? 'Имена обновлены на карточках.' : 'Сохранено для следующих сделок.';
         try{await reload();}catch(error){status.textContent=error.message;}
       }catch(error){message.textContent=error.message;}finally{busy=false;controls();}
     }
@@ -309,6 +382,14 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
     primaryMode.onchange=()=>{primaryRiskDirty=true;controls();};
     primaryPercent.oninput=()=>{primaryRiskDirty=true;};
     primarySave.onclick=()=>save('mt5-vps:save-primary-risk',{account,mode:primaryMode.value,percent:primaryPercent.value},'risk');
+    partSave.onclick=()=>save('mt5-vps:save-account-chunk-percents',{account,
+      percentages:Object.fromEntries([...partRows.querySelectorAll('input')].filter(input=>input.value!=='' || input.validity.badInput)
+        .map(input=>[input.dataset.partAccount,input.valueAsNumber]))},'parts');
+    zoneSave.onclick=()=>save('mt5-vps:save-account-zone-multipliers',{account,
+      multipliers:Object.fromEntries([...zoneRows.querySelectorAll('input')]
+        .map(input=>[input.dataset.zoneAccount,input.value==='' && !input.validity.badInput ? 1 : input.valueAsNumber]))},'zone');
+    nameSave.onclick=()=>save('mt5-vps:save-account-names',{account,
+      names:Object.fromEntries([...nameRows.querySelectorAll('input')].map(input=>[input.dataset.nameAccount,input.value]))},'names');
     exitSave.onclick=()=>save('mt5-vps:save-time-exit',{enabled:exitEnabled.checked,time:exitTime.value},'time');
     saveCopies.onclick=()=>save('mt5-vps:save-followers',[...copiesRows.querySelectorAll('[data-copy-account]')].map(line=>{
       const balance=line.querySelector('select').value==='balance',value=Number(line.querySelector('input[type=number]').value);

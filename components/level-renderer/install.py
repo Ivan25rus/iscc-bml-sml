@@ -50,13 +50,14 @@ def once(text, before, after):
     return text.replace(before, after, 1)
 
 
-def listener_patch(text):
+def listener_patch(text, warnings_ui=False):
     if HOOK in text or "require('./candleLevels')" in text or 'startCandleLevels(' in text:
         raise ValueError('This panel already has a candle renderer; compare versions instead of adding a second writer')
     anchor = '  const tvProxy = servicesApi.tvProxy;'
+    warning_arg = "ipcMain: require('electron').ipcMain, " if warnings_ui else ''
     text = once(text, anchor, anchor + '\n' + '''  // ISCC_CANDLE_RENDERER_ADDON_V1
   const candleRenderer = require('../candleLevelRenderer').attach({
-    servicesApi, settings, root: require('../../config/load').USER_ROOT,
+    servicesApi, settings, ''' + warning_arg + '''root: require('../../config/load').USER_ROOT,
     getEnabled: () => cfg.enabled !== false && (typeof tvProxy?.getStatus !== 'function' || tvProxy.getStatus().enabled !== false)
   });
   require('electron').app?.on('before-quit', () => candleRenderer.stop());''')
@@ -65,6 +66,14 @@ def listener_patch(text):
     anchor = "          const sourceKey = sourceId != null && sourceId !== '' ? String(sourceId) : null;"
     text = once(text, anchor, anchor + "\n          if (src === null && candleRenderer.acceptRemovalEvent(sourceKey, rec)) return;\n          if (candleRenderer.acceptSource(sourceKey, src, { local: rec.event === 'http_request' && rec.dir === 'out' })) return;")
     return text
+
+
+def warnings_patch(text):
+    anchor = "const {ipcRenderer} = require('electron');"
+    if text.count(anchor) != 1:
+        return None
+    return once(text, anchor, anchor + """
+require('./services/candleLevelRenderer/warnings-ui').mountWarnings({ document, ipcRenderer });""")
 
 
 def lt_patch(text):
@@ -109,7 +118,13 @@ def stage(source, plan, work):
         raise ValueError('Select extracted ISCC source with app/ or src/app/. Packaged apps require separate extraction and rebuild')
     has_receiver = (source / app / 'services/mt5-vps').is_dir()
     adapter_mode = ('iscc' if has_receiver else 'stdio') if plan['adapterMode'] == 'auto' else plan['adapterMode']
-    changes = {listener_name: listener_patch(listener.read_text(encoding='utf-8')).encode()}
+    changes = {}
+    renderer_name = app + '/renderer.js'
+    renderer = inside(source, renderer_name)
+    patched_renderer = warnings_patch(renderer.read_text(encoding='utf-8')) if renderer.is_file() else None
+    if patched_renderer is not None:
+        changes[renderer_name] = patched_renderer.encode()
+    changes[listener_name] = listener_patch(listener.read_text(encoding='utf-8'), patched_renderer is not None).encode()
     if plan['publishToLT']:
         lt_name = app + '/services/levelTrack/index.js'
         changes[lt_name] = lt_patch(inside(source, lt_name).read_text(encoding='utf-8')).encode()
@@ -131,8 +146,11 @@ def stage(source, plan, work):
     if not package.is_file():
         raise ValueError('Select the complete source project with package.json')
     metadata = json.loads(package.read_text(encoding='utf-8'))
-    if 'ws' not in metadata.get('dependencies', {}):
-        metadata.setdefault('dependencies', {})['ws'] = '^8.22.0'
+    dependencies = metadata.setdefault('dependencies', {})
+    required_dependencies = {'ws': '^8.22.0', 'node-fetch': '^2.7.0'}
+    missing_dependencies = {name: version for name, version in required_dependencies.items() if name not in dependencies}
+    if missing_dependencies:
+        dependencies.update(missing_dependencies)
         changes['package.json'] = encoded(metadata)
     if adapter_mode == 'iscc' and not has_receiver:
         raise ValueError('This panel has no compatible MT5 receiver. Choose the candle-only stdio reader')

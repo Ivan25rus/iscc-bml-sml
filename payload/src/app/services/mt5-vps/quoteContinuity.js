@@ -31,4 +31,20 @@ function createQuoteContinuity() {
     summary:()=>({...counters})
   };
 }
-module.exports={createQuoteContinuity};
+function createQuoteBacklogDetector() {
+  let previousGap;
+  return timing => {
+    if (timing.accepted || timing.writeToArrivalMs < 2500) previousGap = undefined;
+    if (timing.accepted || !timing.sameStream || timing.arrivalGapMs < 750 ||
+        !(timing.captureGapMs > 0 && timing.captureGapMs <= 300) ||
+        !(timing.processingDelayMs <= 100) || !(timing.writeToArrivalMs >= 3000)) return false;
+
+    const elapsed = timing.receivedAt - previousGap?.receivedAt;
+    const reconnect = elapsed > 0 && elapsed <= 5000 &&
+      timing.writeToArrivalMs - previousGap.writeToArrivalMs >= 500;
+    previousGap = timing;
+    return reconnect;
+  };
+}
+
+module.exports={createQuoteContinuity,createQuoteBacklogDetector};

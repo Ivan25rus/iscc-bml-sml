@@ -84,6 +84,43 @@ class EntryCheckBatchTests(unittest.TestCase):
             for text, in bridge.db.execute('SELECT result FROM requests'):
                 self.assertNotIn('positionProof',json.loads(text))
 
+    def test_first_market_reuses_fresh_admission_tick_and_checks_the_terminal_again(self):
+        for scenario in ('fresh','expired','moved'):
+            with self.subTest(scenario=scenario):
+                case,f,root=self.model();root.config['entryMarketFirst']=True
+                f.payload.update(chunkPercent=100,chunkVolume=1.)
+                native=f.natives[0]
+                quote=f.primary._snapshot
+                calls=[]
+                def snapshot(symbol, account):
+                    result=quote(symbol,account)
+                    if scenario=='expired':
+                        result['quote']['nativeCapturedAt']-=51
+                    return result
+                def record(method,args):
+                    calls.append(method)
+                    if scenario=='moved' and method=='execute' and args[1]['type']=='market':
+                        f.quote(native,25007.)
+                native.symbol_info_tick=lambda *_: SimpleNamespace(bid=native.tick.bid,ask=native.tick.ask,
+                    time=time.time()+f.primary.broker_utc_offset_seconds)
+                root.primary_worker.before=record
+                with patch.object(f.primary,'_snapshot',side_effect=snapshot):
+                    f.engine.arm(f.payload)
+                    for job in tuple(f.engine.admitting.values()):job.result(timeout=3)
+                def enough():
+                    f.engine.tick()
+                    return bool(native.sent)
+                case.wait(enough)
+                before_execute=calls[:calls.index('execute')]
+                self.assertEqual('entry_context' in before_execute,scenario=='expired')
+                if scenario=='moved':
+                    self.assertEqual(native.sent[0]['action'],native.TRADE_ACTION_PENDING)
+                    self.assertEqual(native.sent[0]['price'],25006.)
+                    self.assertFalse(f.markets(native))
+                else:
+                    self.assertEqual(native.sent[0]['action'],native.TRADE_ACTION_DEAL)
+                    self.assertGreater(native.sent[0]['sl'],0)
+
     def test_missing_or_stale_opening_proof_falls_back_to_fresh_positions(self):
         case,f,root=self.completed();actor=f.engine.shards['900000002']
         _,payload,state=actor._load(f.payload['id']);lane=actor.lanes[(state['id'],'900000002')]

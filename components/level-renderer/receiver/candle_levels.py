@@ -298,6 +298,13 @@ class CandleLevels:
 
     def files(self):
         if self.directory is None:
+            shared = self.config.get('candleLevelsFileDirectory')
+            if shared:
+                path = pathlib.Path(shared)
+                if not path.is_absolute() or not path.is_dir():
+                    raise ValueError('Shared MT5 level directory is unavailable')
+                self.directory = path
+                return path
             info = self.mt5.terminal_info()
             if not info or not getattr(info, 'data_path', None):
                 raise ValueError('MT5 terminal data directory is unavailable')
@@ -388,7 +395,8 @@ class CandleLevels:
 
     def acknowledgements(self, generation, drawing):
         try:
-            file = self.files() / 'iscc-addon-levels-ack.csv'
+            directory = self.files()
+            file = directory / 'iscc-addon-levels-ack.csv'
             stat = file.stat()
             if not 0 <= self.clock() - stat.st_mtime <= 5 or stat.st_size > 1024 * 1024:
                 return None

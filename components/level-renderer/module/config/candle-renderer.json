@@ -1,5 +1,6 @@
 {
   "enabled": false,
+  "warnOnLevelDifference": false,
   "publishToLT": true,
   "adapterMode": "iscc",
   "readerCommand": [],

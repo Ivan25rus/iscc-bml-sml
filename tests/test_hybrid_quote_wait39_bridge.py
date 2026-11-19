@@ -90,6 +90,29 @@ class QuoteWait39BridgeTests(unittest.TestCase):
         self.assertEqual(f.bridge.quote_freshness['USTEC']['lastStale'], stale)
         self.assertEqual(len(f.bridge.quote_freshness), 1)
 
+    def test_entry_quote_episode_preserves_native_timestamp_and_connection_without_extra_reads(self):
+        f = self.fixture()
+        f.bridge.entry_diagnostics.active = True
+        capture = time.time()
+        f.mt5.tick.time_msc = int((capture-5)*1000)
+        with patch.object(f.mt5, 'symbol_info_tick', wraps=f.mt5.symbol_info_tick) as read, \
+                patch.object(f.mt5, 'terminal_info', wraps=f.mt5.terminal_info) as terminal:
+            f.bridge.entry_snapshot('USTEC')
+            f.bridge.entry_snapshot('USTEC')
+            f.mt5.tick.time_msc = int(time.time()*1000)
+            f.bridge.entry_snapshot('USTEC')
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual(terminal.call_count, 3)
+        start, end = f.bridge.entry_diagnostics.queue.take(10)
+        self.assertEqual([row['stage'] for row in (start, end)], ['stale-start', 'stale-end'])
+        self.assertEqual(start['rawTickMs'], int((capture-5)*1000))
+        self.assertEqual(start['rawTickMs'], start['nativeTickUtcMs'])
+        self.assertGreater(start['nativeAgeMs'], 4500)
+        self.assertGreaterEqual(end['maxNativeAgeMs'], start['nativeAgeMs'])
+        self.assertIn('nativeReadMs', start)
+        self.assertIs(start['terminalConnected'], True)
+        self.assertEqual(f.mt5.sent, [])
+
     def test_linked_snapshot_diagnostics_are_read_only_and_preserve_account_identity(self):
         f = protection_fixtures.HybridProtectionTests()
         f.setUp()

@@ -2,6 +2,7 @@
   "properties": { "group": "data-source", "name": "Отрисовщик уровней" },
   "options": {
     "enabled": { "description": "Включить после настройки и проверки пары ТВ → MT5", "type": "boolean" },
+    "warnOnLevelDifference": { "description": "Предупреждать о расхождении уровней", "type": "boolean" },
     "publishToLT": { "description": "Передавать подтверждённые цены в ЛТ", "type": "boolean" },
     "adapterMode": { "description": "Приёмник: iscc или stdio", "type": "string" },
     "readerCommand": { "description": "Локальная команда приёмника: программа и аргументы", "item": { "type": "string" } },
@@ -11,7 +12,8 @@
         "enabled": { "type": "boolean", "description": "Включена" },
         "sourceSymbol": { "type": "string", "description": "Полный символ TradingView" },
         "mt5Symbol": { "type": "string", "description": "Точное имя MT5" },
-        "sourceLayout": { "type": "string", "description": "ID рабочего графика TV для подтверждения удаления; определяется агентом локально" }
+        "sourceLayout": { "type": "string", "description": "ID рабочего графика TV для подтверждения удаления; определяется агентом локально" },
+        "standardSpread": { "type": "number", "default": 0, "step": "any", "description": "Обычный спред, в пунктах (0 — выключено)" }
       }
     }
   }

@@ -8,18 +8,46 @@ const coordinator=[...native,'independent-account-engines-v5','entry-initial-siz
 const account=id=>({account:String(id),server:config.server,connected:true,evidenceReady:true,checkedAt:Date.now(),orders:[],capabilities:[...native]});
 const management=()=>({...config,capabilities:[...coordinator],accountStates:{900000002:account(900000002),900000001:account(900000001)}});
 test('Account settings retain coordinator enrollment and balance risk capabilities',async()=>{
-  const state=management();state.capabilities.push('account-enrollment','entry-balance-risk-v1');
+  const state=management();state.capabilities.push('account-enrollment','entry-balance-risk-v1','entry-account-zone-v1');
+  state.accountStates['900000002'].accountInfo={tradeMode:'demo'};
+  state.accountStates['900000001'].accountInfo={tradeMode:'real'};
   const primary={remoteAccounts:['900000001','900000003'],managementState:async()=>state};
   const source=fs.readFileSync(require.resolve('../reference/mt5-service-manifest.js.txt'),'utf8');
   const start=source.indexOf("  ipcMain.handle('mt5-vps:trade-settings'"),end=source.indexOf("  ipcMain.handle('mt5-vps:orders'",start);
   let handler;
   const scope={ipcMain:{handle:(name,fn)=>{if(name==='mt5-vps:trade-settings')handler=fn;}},api:{mt5VPS:{getAdapter:()=>primary}},readConfig:()=>config,
     primaryRisk:require('../payload/src/app/services/mt5-vps/primaryRisk').primaryRisk,
+    ...require('../payload/src/app/services/mt5-vps/sizing'),
+    ...require('../payload/src/app/services/mt5-vps/accountNames'),
     acceptManagement(){},followers:()=>[],require:name=>{assert.equal(name,'./timeExit');return {timeExitConfig:()=>({})};}};
-  vm.createContext(scope);vm.runInContext(source.slice(start,end),scope);
+  const helpers=source.slice(source.indexOf('function realEntryAccounts'),source.indexOf('function initService'));
+  vm.createContext(scope);vm.runInContext(helpers+source.slice(start,end),scope);
   const result=await handler();assert.equal(result.status,'ok');
   assert.ok(result.capabilities.includes('account-enrollment'));assert.ok(result.capabilities.includes('entry-balance-risk-v1'));
   assert.equal(result.accounts.at(-1),'900000003');
+  assert.deepEqual(Array.from(result.realAccounts),['900000001']);
+});
+test('Display names save locally for known accounts and can be cleared independently',async()=>{
+  const source=fs.readFileSync(require.resolve('../reference/mt5-service-manifest.js.txt'),'utf8');
+  const start=source.indexOf("  ipcMain.handle('mt5-vps:save-account-names'");
+  const end=source.indexOf("  ipcMain.handle('mt5-vps:save-time-exit'",start);
+  let saved={...config,accountNames:{900000002:'Основной',900000001:'Демо'}},handler,writes=0;
+  const primary={config:{...saved},remoteAccounts:['900000001']};
+  vm.runInNewContext(source.slice(start,end),{
+    ipcMain:{handle:(_name,fn)=>{handler=fn;}},api:{mt5VPS:{getAdapter:()=>primary}},
+    readConfig:()=>saved,enrollment:{busy:false},...require('../payload/src/app/services/mt5-vps/sizing'),
+    ...require('../payload/src/app/services/mt5-vps/accountNames'),
+    settings:{writeConfig:(_section,value)=>{writes++;saved=value;return true;}}
+  });
+  const save=names=>handler(null,{account:'900000002',names});
+  assert.equal((await save({999999:'Другой'})).status,'rejected');
+  assert.equal((await save({900000001:'две\nстроки'})).status,'rejected');
+  assert.equal(writes,0);
+  assert.equal((await save({900000001:'  Резерв  '})).status,'ok');
+  assert.deepEqual(saved.accountNames,{900000002:'Основной',900000001:'Резерв'});
+  assert.equal((await save({900000001:''})).status,'ok');
+  assert.deepEqual(primary.config.accountNames,{900000002:'Основной'});
+  assert.equal(saved.account,config.account);
 });
 function adapter(t,options={}){const a=new MT5VPSAdapter({...config,...options});t.after(()=>a.close());return a;}
 

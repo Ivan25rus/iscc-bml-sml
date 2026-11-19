@@ -59,8 +59,8 @@ class ParentTakeTests(unittest.TestCase):
         follower='900000001';primary='900000002'
         legacy=dict(phase='running',accounts={follower:{}})
         direction_rows=AccountPlanEntries._direction_rows
-        def block_follower(storage,payload,legacy_only=False):
-            return iter([(payload,legacy)]) if legacy_only else direction_rows(storage,payload)
+        def block_follower(storage,payload,legacy_only=False,*,admission_stages=None):
+            return iter([(payload,legacy)]) if legacy_only else direction_rows(storage,payload,admission_stages=admission_stages)
         with patch.object(AccountPlanEntries,'_direction_rows',side_effect=block_follower):
             f.engine.arm(f.payload)
         state=isolated.IsolatedEngineTests.until(self,f,lambda s:s['lanePhases'][primary]=='completed')

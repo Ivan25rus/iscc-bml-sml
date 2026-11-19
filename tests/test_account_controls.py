@@ -3,11 +3,14 @@ import copy
 import hashlib
 import json
 import pathlib
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,6 +18,76 @@ sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
 import test_entry_independence as fixture
 from chunk_entry import AccountPlanEntries, IsolatedEntries, digest
 from mt5_bridge import CoordinatorBridge
+
+
+class DirectionIndexTests(unittest.TestCase):
+    def test_existing_entries_and_later_updates_preserve_direction_holds(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = pathlib.Path(directory.name) / 'entries.sqlite3'
+        with closing(sqlite3.connect(path)) as db:
+            storage = SimpleNamespace(db=db, lock=threading.Lock())
+            db.execute('CREATE TABLE chunk_entries (id TEXT PRIMARY KEY,digest TEXT,payload TEXT,state TEXT)')
+            direction = dict(symbol='USTEC', side='sell')
+
+            def save(identifier, state, legacy=False):
+                payload = dict(id=identifier, accountExecution='independent-v4' if legacy else 'independent-v5')
+                db.execute('INSERT OR REPLACE INTO chunk_entries VALUES (?,?,?,?)',
+                           (identifier, '', json.dumps(payload), json.dumps(state)))
+
+            def candidates(legacy_only=False):
+                return [payload['id'] for payload, _ in AccountPlanEntries._direction_rows(storage, direction, legacy_only)]
+
+            settled = dict(direction, phase='completed')
+            holds = [dict(phase='armed'), dict(phase='paused'), dict(phase='unknown'),
+                     dict(protectionPending='receipt'), dict(closurePending='close'), dict(missingNativeChild=True),
+                     dict(children=[{'state': 'pending'}]), dict(children=[{'state': 'unknown'}]),
+                     dict(accounts={'101': {'commonStopUncertain': True}}),
+                     dict(accounts={'102': {'riskRepairRequired': True}})]
+            ids = [f'hold-{i}' for i in range(len(holds))]
+            legacy_ids = [identifier for i, identifier in enumerate(ids) if i % 2 == 0]
+            with db:
+                save('closed', settled)
+                save('other-side', dict(settled, side='buy', phase='armed'))
+                save('other-symbol', dict(settled, symbol='SPX500', phase='armed'))
+                for i, hold in enumerate(holds):
+                    save(ids[i], {**settled, **hold}, legacy=ids[i] in legacy_ids)
+
+            AccountPlanEntries._index_directions(storage)
+            self.assertEqual(candidates(), ids)
+            self.assertEqual(candidates(legacy_only=True), legacy_ids)
+
+            # Progress updates for an already tracked direction must not
+            # dirty the index pages again or add a second database write.
+            changed_before = db.total_changes
+            with db:
+                db.execute('UPDATE chunk_entries SET state=? WHERE id=?',
+                           (json.dumps(dict(settled, phase='running', updatedAt=123)), ids[0]))
+            self.assertEqual(db.total_changes - changed_before, 1)
+            self.assertEqual(candidates(), ids)
+
+            # Triggers work for writes from older receivers and within the
+            # original transaction. A rollback also restores the lookup.
+            writer = sqlite3.connect(path)
+            try:
+                writer.execute('UPDATE chunk_entries SET state=? WHERE id=?', (json.dumps(settled), ids[0]))
+                writer.rollback()
+                self.assertEqual(candidates(), ids)
+                with writer:
+                    writer.execute('UPDATE chunk_entries SET state=? WHERE id=?', (json.dumps(settled), ids[0]))
+                    writer.execute('UPDATE chunk_entries SET state=? WHERE id=?',
+                                   (json.dumps(dict(settled, phase='running')), 'closed'))
+                    writer.execute('DELETE FROM chunk_entries WHERE id=?', (ids[-1],))
+                self.assertEqual(candidates(), ['closed', *ids[1:-1]])
+            finally:
+                writer.close()
+
+            with db:
+                save('closed', settled)
+                save('new-active', dict(settled, phase='running'), legacy=True)
+            AccountPlanEntries._index_directions(storage)
+            self.assertEqual(candidates(), [*ids[1:-1], 'new-active'])
+            self.assertEqual(candidates(legacy_only=True), [*legacy_ids[1:], 'new-active'])
 
 
 class AccountControlTests(unittest.TestCase):
@@ -142,10 +215,10 @@ class AccountControlTests(unittest.TestCase):
         f,root=case.model()
         account='900000001'
         original=AccountPlanEntries._direction_rows
-        def direction_rows(storage,payload,legacy_only=False):
+        def direction_rows(storage,payload,legacy_only=False,*,admission_stages=None):
             if legacy_only:
                 return [({},dict(phase='running',accounts={account:{}}))]
-            return original(storage,payload,legacy_only)
+            return original(storage,payload,legacy_only,admission_stages=admission_stages)
         with patch.object(AccountPlanEntries,'_direction_rows',side_effect=direction_rows):
             f.engine.arm(f.payload)
         entry=fixture.support.IsolatedEngineTests.until(self,f,lambda state:state['lanePhases']['900000002']=='completed')
@@ -275,7 +348,16 @@ class AccountControlTests(unittest.TestCase):
         f.quote(native,25008.)
         f.engine.arm(f.payload)
         fixture.support.IsolatedEngineTests.until(self,f,lambda state:state['lanePhases']['900000002']=='completed'
-            and state['accounts'][account]['filledVolume']==0 and bool(native.orders))
+            and state['accounts'][account]['filledVolume']==0 and bool(native.orders)
+            and any(child['state']=='pending' and account in child['volumes'] for child in state['children']))
+        # Exercise direct protection reads against both broker snapshots.
+        # The background lane would otherwise persist an unknown state while
+        # the fixture intentionally reports a partial fill without its position.
+        shard = f.engine.shards[account]
+        suspend_acquisition = patch.object(shard, '_schedule_lanes', return_value=None)
+        suspend_acquisition.start()
+        self.addCleanup(suspend_acquisition.stop)
+        f.engine._drain_lanes(f.payload['id'])
         order = native.orders[0]
         order.volume_current -= .25
         order.position_id = order.ticket+40

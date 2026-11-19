@@ -1,8 +1,37 @@
 const { createHash } = require('crypto');
 
-const { DEFAULT_SOURCES, sourceMap, sourceLayouts, brokerName } = require('./candle-mappings');
+const { DEFAULT_SOURCES, sourceMap, sourceLayouts, brokerName, mappings } = require('./candle-mappings');
 const GROUP_KEYS = { USTEC: 'TV → MT5 · USTEC', SPX500: 'TV → MT5 · SPX500' };
 const OWNER = 'tv-mt5-candles';
+const SYNC_INTERVAL_MS = 1000;
+const SYNC_BATCH_SIZE = 4;
+const LEVEL_WARNING_MS = 30_000;
+const WARNING_HISTORY_LIMIT = 50;
+
+function validWarningHistoryEntry(row) {
+  return typeof row?.id === 'string' && /^[a-f0-9]{24}$/.test(row.id)
+    && typeof row.symbol === 'string' && row.symbol.length > 0 && row.symbol.length <= 60 && Number.isSafeInteger(row.at)
+    && row.at > 0 && row.at <= 8.64e15
+    && [row.referencePrice, row.mappedPrice, row.threshold].every(value => Number.isFinite(value) && value > 0)
+    && Math.abs(row.referencePrice - row.mappedPrice) > row.threshold;
+}
+
+function levelWarning(row, config) {
+  if (config.warnOnLevelDifference !== true) return null;
+  if (row.phase !== 'ready' || row.removed || row.retire || row.sourceAnchorChanged
+    || row.rangeSide || row.backgroundRange) return null;
+  const referencePrice = row.sourcePrice, mappedPrice = row.price;
+  if (![referencePrice, mappedPrice].every(price => Number.isFinite(price) && price > 0)) return null;
+  const spread = mappings(config).find(mapping => mapping.enabled && mapping.sourceSymbol === row.sourceSymbol
+    && mapping.mt5Symbol === row.symbol && (!mapping.sourceLayout || mapping.sourceLayout === row.sourceLayout))?.standardSpread;
+  if (!(spread > 0)) return null;
+  const threshold = 2 * spread;
+  const rounding = 4 * Number.EPSILON * Math.max(referencePrice, mappedPrice);
+  if (Math.abs(mappedPrice - referencePrice) <= threshold + rounding) return null;
+  const anchor = [row.id, row.sourceSymbol, row.symbol, row.timeframe, row.time, row.endTime, row.side, referencePrice, mappedPrice, threshold];
+  const id = createHash('sha256').update(JSON.stringify(anchor)).digest('hex').slice(0, 24);
+  return { id, symbol: row.symbol, referencePrice, mappedPrice, threshold };
+}
 
 function timeframe(value) {
   const raw = String(value || '').toUpperCase();
@@ -42,9 +71,16 @@ function drawing(sourceId, source, config = {}) {
   const rgb = colorRgb(state.state?.linecolor);
   if (!tf || !Number.isSafeInteger(time) || time <= 0 || !Number.isFinite(price) || price <= 0
     || Number(point?.offset || 0) !== 0) throw Error('У линии нет точной привязки к свече и таймфрейму');
+  const tag = /^ISCC NY OR \| (\d+) \| (high|low)$/.exec(state.state?.text || '');
+  const expiresAt = tag ? Number(tag[1]) : null;
+  if (tag && (tf !== 'M1' || state.type !== 'LineToolHorzRay' || !Number.isSafeInteger(expiresAt)
+    || expiresAt % 60 || expiresAt - time < 22500 || expiresAt - time > 23400)) {
+    throw Error('Некорректное время луча Opening Range');
+  }
   return { id: createHash('sha256').update('tv-candle:' + sourceId).digest('hex').slice(0, 24),
     sourceId, sourceSymbol: source.symbol.toUpperCase(), symbol, timeframe: tf, time, sourcePrice: price,
-    tool: state.type === 'LineToolHorzLine' ? 'line' : 'ray', ...(rgb == null ? {} : { colorRgb: rgb }) };
+    tool: state.type === 'LineToolHorzLine' ? 'line' : 'ray', ...(rgb == null ? {} : { colorRgb: rgb }),
+    ...(tag ? { expiresAt, rangeSide: tag[2] } : {}) };
 }
 
 function selectExtreme(marker, bar) {
@@ -52,6 +88,9 @@ function selectExtreme(marker, bar) {
   const epsilon = Math.max(1e-8, Math.abs(marker.sourcePrice) * 1e-11);
   const high = Math.abs(marker.sourcePrice - bar[1]) <= epsilon;
   const low = Math.abs(marker.sourcePrice - bar[2]) <= epsilon;
+  if (marker.rangeSide === 'high' && high) return 'high';
+  if (marker.rangeSide === 'low' && low) return 'low';
+  if (marker.rangeSide) throw Error('Луч Opening Range должен стоять на исходном экстремуме');
   if (high && low) throw Error('High и Low этой свечи совпадают: сторона уровня неоднозначна');
   if (!high && !low) throw Error('Линия должна стоять точно на High или Low исходной свечи ТВ');
   return high ? 'high' : 'low';
@@ -61,15 +100,23 @@ function candleKey(symbol, tf, time) { return `${symbol}|${tf}|${time}`; }
 
 class CandleLevelSync {
   constructor({ getConfig = () => ({}), getAdapter, publish = async () => {}, persist = async () => {},
-    initial = {}, onStatus = () => {}, onNeedBars = () => {}, diagnose = () => {}, clock = Date.now } = {}) {
+    initial = {}, onStatus = () => {}, onNeedBars = () => {}, diagnose = () => {}, clock = Date.now,
+    setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
     this.getConfig = getConfig; this.getAdapter = getAdapter; this.publish = publish;
     this.persist = persist; this.onStatus = onStatus; this.onNeedBars = onNeedBars; this.clock = clock;
+    this.setTimer = setTimer; this.clearTimer = clearTimer;
+    this.started = false; this.timer = null; this.timerAt = Infinity; this.wakePending = false;
+    this.indicatorReadAt = 0;
     this.records = new Map(); this.bars = new Map(); this.busy = false; this.closed = false;
     this.dirty = false; this.publishNeeded = false; this.lastError = null;
     this.networkFailures = 0; this.networkRetryAt = 0; this.mappingSignature = null;
     this.inventories = new Map(); this.missingSources = new Map(); this.openCharts = null;
     this.awaitingSources = new Set();
+    this.checkRestoredRemovals = false;
     this.diagnose=diagnose;this.delayStates=new Map();this.publishedDiagnostics=new Map();
+    this.levelDifferences = new Map();
+    this.warningHistory = Array.isArray(initial.levelWarningHistory)
+      ? initial.levelWarningHistory.slice(-WARNING_HISTORY_LIMIT).filter(validWarningHistoryEntry) : [];
     for (const row of initial.records || []) {
       if (row && /^[a-f0-9]{24}$/.test(row.id || '') && /^[A-Za-z0-9_.:-]{1,160}$/.test(row.sourceId || '')
         && Number.isSafeInteger(row.revision) && row.revision > 0) {
@@ -79,7 +126,9 @@ class CandleLevelSync {
           && row.windowed && row.side && row.endTime
           && /Invalid or incomplete MT5 minute window coverage|MT5 M1 history for the exact TV window is unavailable/.test(row.reason || '');
         const migrate = !row.removed && !row.windowed;
-        const phase = row.removed || (row.side && row.endTime) ? 'queued' :
+        const confirmedRemoval = row.removed && row.phase === 'removed' && !row.retire && !row.requestError;
+        if (confirmedRemoval) this.checkRestoredRemovals = true;
+        const phase = confirmedRemoval ? 'removed' : row.removed || (row.side && row.endTime) ? 'queued' :
           !row.timeframe || (row.phase === 'error' && !row.selectionError) ? 'error' : 'awaiting-tv';
         const restoredPrice = !migrate && !row.removed && !row.retire && !row.selectionError
           && ['ready','queued','drawing','waiting-close','waiting-history'].includes(row.phase)
@@ -90,7 +139,7 @@ class CandleLevelSync {
           ...(recoverHistory ? {phase:'queued',revision:row.revision+1,historyReaderRecovery:1,
             restoredPrice:false,price:null,reason:null,nextAttemptAt:0,requestRetryAt:0,requestFailures:0,requestError:null} : {}) });
         if(recoverHistory)this.dirty=true;
-        if (!row.removed) this.awaitingSources.add(row.sourceId);
+        if (!row.removed && (!row.backgroundRange || row.nativeSourceId)) this.awaitingSources.add(row.sourceId);
       }
     }
     this.publishNeeded = this.records.size > 0;
@@ -132,7 +181,7 @@ class CandleLevelSync {
         reason: null, nextAttemptAt: 0, requestRetryAt: 0, requestFailures: 0, requestError: null };
       if (!target) this.awaitingSources.delete(sourceId);
       if (target) {
-        const marker = Object.fromEntries(['id','sourceId','sourceSymbol','symbol','timeframe','time','sourcePrice','tool','colorRgb']
+        const marker = Object.fromEntries(['id','sourceId','sourceSymbol','symbol','timeframe','time','sourcePrice','tool','colorRgb','expiresAt','rangeSide']
           .filter(key => row[key] != null).map(key => [key, row[key]]));
         row.signature = JSON.stringify(marker);
         if (row.phase === 'awaiting-tv') this.identify(row);
@@ -149,6 +198,10 @@ class CandleLevelSync {
       && Number.isSafeInteger(row.time) && row.time > 0 && (!row.side || !row.endTime))
       .map(row => ({ symbol: row.sourceSymbol, interval: row.timeframe, time: row.time }));
   }
+  sourceRecord(sourceId) {
+    if (!sourceId) return null;
+    return this.records.get(sourceId) || [...this.records.values()].find(row => row.nativeSourceId === sourceId);
+  }
   acceptSnapshot(snapshot) {
     if (!this.enabled() || !snapshot || !Array.isArray(snapshot.sources) || !Array.isArray(snapshot.series)) return;
     this.reconfigure();
@@ -158,7 +211,7 @@ class CandleLevelSync {
         || !Number.isFinite(entry[1].serverUpdateTime) || entry[1].serverUpdateTime <= 0) continue;
       this.acceptSource(entry[0], entry[1], { scope: snapshot.inventory?.scope });
     }
-    this.reconcileInventory(snapshot.inventory, snapshot.readStartedAt);
+    if (snapshot.sourceOnly !== true) this.reconcileInventory(snapshot.inventory, snapshot.readStartedAt);
   }
   acceptOpenCharts(scopes, readStartedAt) {
     const now = this.clock(), observedAt = Number(readStartedAt);
@@ -186,7 +239,7 @@ class CandleLevelSync {
         const foreignDeletionsOnly = entry?.complete === false && Array.isArray(entry.pendingSaveIds)
           && entry.pendingSaveIds.length > 0 && entry.pendingSaveIds.length <= 2000
           && entry.pendingSaveIds.every(id => {
-            const row = typeof id === 'string' && this.records.get(id);
+            const row = typeof id === 'string' && this.sourceRecord(id);
             return row && row.sourceSymbol && row.sourceSymbol !== entry.symbol
               && (layouts[row.sourceSymbol] ? layouts[row.sourceSymbol] === inventory.scope
                 : row.chartScopes?.includes(inventory.scope))
@@ -202,10 +255,12 @@ class CandleLevelSync {
     while (this.inventories.size > 64) this.inventories.delete(this.inventories.keys().next().value);
     for (const row of this.records.values()) {
       if (row.removed) { this.missingSources.delete(row.sourceId); continue; }
+      if (row.backgroundRange && !row.nativeSourceId) continue;
+      const nativeId = row.nativeSourceId || row.sourceId;
       const authority = layouts[row.sourceSymbol];
       if (authority && inventory.scope !== authority) continue;
       const current = symbols.get(row.sourceSymbol);
-      if (current?.ids.has(row.sourceId)) {
+      if (current?.ids.has(nativeId)) {
         const origins = Array.isArray(row.chartScopes) ? row.chartScopes : [];
         if (!origins.includes(inventory.scope) && origins.length < 16) {
           row.chartScopes = [...origins, inventory.scope]; this.dirty = true;
@@ -225,7 +280,7 @@ class CandleLevelSync {
         : tabs ? row.chartScopes.filter(scope => tabs.scopes.has(scope)) : row.chartScopes;
       if (!origins.length) { this.missingSources.delete(row.sourceId); continue; }
       const proofs = origins.map(scope => this.inventories.get(scope)?.get(row.sourceSymbol));
-      if (proofs.some(proof => !proof || now - proof.observedAt > 30000 || proof.ids.has(row.sourceId)
+      if (proofs.some(proof => !proof || now - proof.observedAt > 30000 || proof.ids.has(nativeId)
         || proof.observedAt <= (row.localEditAt || 0) || now - (row.localEditAt || 0) < 30000)) {
         this.missingSources.delete(row.sourceId); continue;
       }
@@ -241,7 +296,47 @@ class CandleLevelSync {
     }
     if (symbols.size) this.publishNeeded = true;
   }
-  serialize() { return { schema: 1, records: [...this.records.values()].map(row => ({ ...row })) }; }
+  serialize() {
+    return { schema: 1, records: [...this.records.values()].map(row => ({ ...row })),
+      levelWarningHistory: this.warningHistory.slice() };
+  }
+  levelWarningHistory() { return this.warningHistory.slice().reverse(); }
+  latestLevelWarningId() { return this.warningHistory.at(-1)?.id || null; }
+
+  refreshLevelWarnings() {
+    for (const row of this.records.values()) this.observeLevelDifference(row);
+  }
+
+  observeLevelDifference(row) {
+    if (this.awaitingSources.has(row.sourceId)) return;
+    const warning = levelWarning(row, this.getConfig());
+    const previous = this.levelDifferences.get(row.sourceId);
+    if (warning && warning.id === previous?.warning.id) {
+      previous.row = row;
+      return;
+    }
+    this.levelDifferences.delete(row.sourceId);
+    if (!warning) return;
+    const at = this.clock();
+    this.levelDifferences.set(row.sourceId, { row, warning, at });
+    if (this.warningHistory.some(saved => saved.id === warning.id)) return;
+    this.warningHistory.push({ ...warning, at });
+    if (this.warningHistory.length > WARNING_HISTORY_LIMIT) this.warningHistory.shift();
+    this.dirty = true;
+  }
+
+  levelWarnings({ includeExpiry = false } = {}) {
+    if (!this.enabled() || this.getConfig().warnOnLevelDifference !== true) return [];
+    const now = this.clock(), warnings = [];
+    for (const { row, warning, at } of this.levelDifferences.values()) {
+      if (now - at >= LEVEL_WARNING_MS || now < at) continue;
+      const current = this.records.get(row.sourceId);
+      if (row !== current || row.phase !== 'ready' || row.sourceAnchorChanged || row.removed || row.retire) continue;
+      warnings.push(includeExpiry ? { ...warning, expiresAt: at + LEVEL_WARNING_MS } : warning);
+    }
+    return warnings.slice(-16);
+  }
+
   status() {
     const all = [...this.records.values()], rows = all.filter(row => !row.removed);
     const removals = all.filter(row => row.removed && row.phase !== 'removed');
@@ -256,17 +351,18 @@ class CandleLevelSync {
   }
 
   acceptRemovalEvent(sourceId, record) {
-    const row = this.records.get(sourceId);
+    const row = this.sourceRecord(sourceId);
     const scope = require('./candle-source-event').removalScope(record);
     if (!scope || !row || row.removed || row.mappingDisabled || row.sourceLayout !== scope
       || sourceLayouts(this.getConfig())[row.sourceSymbol] !== scope) return false;
-    return this.acceptSource(sourceId, null, { local: true, scope });
+    return this.acceptSource(row.sourceId, null, { local: true, scope });
   }
 
   acceptSource(sourceId, source, { local = false, scope } = {}) {
     if (!this.enabled() || !sourceId) return false;
     this.reconfigure();
     const old = this.records.get(sourceId);
+    if (source && old?.expiresAt && old.expiresAt * 1000 <= this.clock()) return true;
     const symbol = String(source?.symbol || old?.sourceSymbol || '').toUpperCase();
     const authority = sourceLayouts(this.getConfig())[symbol];
     if (authority && scope !== authority) {
@@ -298,11 +394,12 @@ class CandleLevelSync {
     let marker, reason;
     const config = !mapped && old?.sourceSymbol ? { mappings: [{ enabled: true, sourceSymbol: old.sourceSymbol, mt5Symbol: old.symbol }] } : this.getConfig();
     try { marker = source && drawing(sourceId, source, config); } catch (error) { reason = error.message; }
+    if (marker?.expiresAt && marker.expiresAt * 1000 <= this.clock()) return true;
     const mappingDisabled = !!marker && !mapped && !!old?.sourceSymbol;
     const sameCandle = marker && old && !old.removed && ['high', 'low'].includes(old.side)
-      && ['sourceSymbol', 'symbol', 'timeframe', 'time', 'sourcePrice', 'tool'].every(key => marker[key] === old[key]);
+      && ['sourceSymbol', 'symbol', 'timeframe', 'time', 'sourcePrice', 'tool', 'expiresAt', 'rangeSide'].every(key => marker[key] === old[key]);
     const signature = JSON.stringify(marker || { removed: !source, reason });
-    this.awaitingSources.delete(sourceId);
+    const wasAwaitingSource = this.awaitingSources.delete(sourceId);
     if (old?.signature === signature) {
       if (authority && old.sourceLayout !== authority) {
         old.sourceLayout = authority; this.dirty = true; this.publishNeeded = true;
@@ -313,6 +410,10 @@ class CandleLevelSync {
       }
       if (version > (old.sourceVersion || 0)) {
         old.sourceVersion = version; old.localEdit = local; this.dirty = true;
+      }
+      if (wasAwaitingSource) {
+        this.observeLevelDifference(old);
+        this.wakeFor(old);
       }
       return true;
     }
@@ -335,6 +436,7 @@ class CandleLevelSync {
     this.trace(row,'source-observed',{sourceSavedAt:row.sourceVersion,sourceAgeMs:Math.max(0,this.clock()-row.sourceVersion)});
     this.observeDelays(row);
     if (marker && row.phase === 'awaiting-tv') this.onNeedBars();
+    this.wakeFor(row);
     this.onStatus(this.status());
     return true;
   }
@@ -372,14 +474,15 @@ class CandleLevelSync {
     }
     while (this.bars.size > 20000) this.bars.delete(this.bars.keys().next().value);
     for (const row of this.records.values()) {
+      if (row.removed || row.sourceSymbol !== record.symbol || row.timeframe !== tf) continue;
       const end = this.bars.get(candleKey(row.sourceSymbol, row.timeframe, row.time))?.[3];
-      if ((row.phase !== 'awaiting-tv' && !row.selectionError && (!end || end === row.endTime))
-        || row.removed || row.sourceSymbol !== record.symbol || row.timeframe !== tf) continue;
+      if (row.phase !== 'awaiting-tv' && !row.selectionError && (!end || end === row.endTime)) continue;
       const previous = [row.phase, row.side, row.reason, row.endTime].join('|');
       this.identify(row);
       if (previous !== [row.phase, row.side, row.reason, row.endTime].join('|')) {
         row.revision++; row.nextAttemptAt = 0; row.requestRetryAt = 0; this.dirty = true;
         row.price = null; this.publishNeeded = true;
+        this.wakeFor(row);
       }
     }
   }
@@ -435,6 +538,17 @@ class CandleLevelSync {
 
   acceptReply(state) {
     if (!state || !Array.isArray(state.levels)) throw Error('Некорректный ответ свечных уровней MT5');
+    if (this.checkRestoredRemovals) {
+      // The receiver lists all surviving upserts even before the chart applies
+      // its snapshot. Replay a confirmed removal only if an old upsert returned.
+      const remoteLevels = new Map(state.levels.map(row => [row.id, row.revision]));
+      for (const row of this.records.values()) {
+        const revision = remoteLevels.get(row.id);
+        if (!row.removed || row.phase !== 'removed' || !Number.isSafeInteger(revision) || revision > row.revision) continue;
+        row.phase = 'queued'; this.dirty = true;
+      }
+      this.checkRestoredRemovals = false;
+    }
     for (const row of this.records.values()) {
       if (row.removed && row.phase === 'deleting') {
         if (state.snapshotApplied === true && !state.levels.some(remote => remote.id === row.id)) {
@@ -451,41 +565,104 @@ class CandleLevelSync {
         && Number.isFinite(remote.price) && remote.price > 0) {
         row.price = remote.price; row.phase = 'ready'; row.reason = null;
         this.dirty = true; this.publishNeeded = true;
+        this.observeLevelDifference(row);
       } else if (['waiting-close', 'waiting-history'].includes(remote.status)) {
-        row.phase = remote.status; row.nextAttemptAt = Math.max(this.clock() + 1000, Number(remote.retryAt) || 0);
-        row.reason = remote.status === 'waiting-close' ? 'Ожидание закрытия выбранной свечи MT5' : 'MT5 загружает историю выбранной свечи'; this.dirty = true;
+        // A read for another level can repeat this status before its own retry.
+        const earliest = row.phase === remote.status ? row.nextAttemptAt || 0 : this.clock() + SYNC_INTERVAL_MS;
+        const retryAt = Math.max(earliest, Number(remote.retryAt) || 0);
+        if (row.phase !== remote.status || row.nextAttemptAt !== retryAt) this.dirty = true;
+        row.nextAttemptAt = retryAt;
+        row.phase = remote.status;
+        row.reason = remote.status === 'waiting-close' ? 'Ожидание закрытия выбранной свечи MT5' : 'MT5 загружает историю выбранной свечи';
       } else if (remote.status === 'error') {
         row.phase = 'error'; row.restoredPrice = false; row.reason = remote.reason || 'Свеча MT5 недоступна'; this.dirty = true; this.publishNeeded = true;
       } else { row.phase = 'drawing'; row.reason = remote.reason || 'Ожидание отрисовки уровня в MT5'; }
     }
   }
 
+  requestAt(row, layouts) {
+    if (!row.removed && this.awaitingSources.has(row.sourceId)
+      && !(row.retire && (!row.side || !row.endTime || row.phase === 'error'))) return Infinity;
+    if (!row.removed && layouts[row.sourceSymbol] && row.sourceLayout !== layouts[row.sourceSymbol]) return Infinity;
+    const retryAt = row.requestRetryAt || 0;
+    if (row.retire || row.phase === 'queued') return retryAt;
+    if (row.phase === 'waiting-close' || row.phase === 'waiting-history') return Math.max(retryAt, row.nextAttemptAt || 0);
+    return Infinity;
+  }
+
+  needsIndicatorRead() {
+    return this.checkRestoredRemovals || [...this.records.values()].some(row => ['drawing', 'deleting'].includes(row.phase));
+  }
+
+  schedule(at) {
+    if (!this.started || this.closed || at >= this.timerAt) return;
+    if (this.timer !== null) this.clearTimer(this.timer);
+    this.timerAt = at;
+    this.timer = this.setTimer(() => {
+      this.timer = null; this.timerAt = Infinity;
+      return this.tick();
+    }, Math.max(0, at - this.clock()));
+    this.timer?.unref?.();
+  }
+
+  wakeFor(row) {
+    if (!this.started || this.closed) return;
+    const at = this.requestAt(row, sourceLayouts(this.getConfig()));
+    if (!Number.isFinite(at)) return;
+    if (this.busy) this.wakePending = true;
+    else this.schedule(Math.max(at, this.clock(), this.networkRetryAt));
+  }
+
+  scheduleNext(startedAt, batchSize) {
+    if (!this.started || this.closed) return;
+    const now = this.clock();
+    let next = Math.max(startedAt + SYNC_INTERVAL_MS, now);
+    // Drain at most one full batch per tick. A newly runnable revision can wake
+    // an idle or partially used batch without increasing indicator read frequency.
+    if (batchSize < SYNC_BATCH_SIZE && this.enabled()) {
+      const layouts = sourceLayouts(this.getConfig());
+      for (const row of this.records.values()) {
+        const at = this.requestAt(row, layouts);
+        if (at > 0 || this.wakePending) next = Math.min(next, Math.max(at, this.networkRetryAt, now));
+      }
+      if (this.needsIndicatorRead()) next = Math.min(next, Math.max(this.indicatorReadAt, this.networkRetryAt, now));
+    }
+    this.schedule(next);
+  }
+
   async tick() {
-    if (!this.enabled() || this.busy) return;
+    if (this.busy) return;
+    const startedAt = this.clock();
+    if (!this.enabled()) { this.schedule(startedAt + SYNC_INTERVAL_MS); return; }
+    let batchSize = 0;
     this.busy = true;
     try {
       this.reconfigure();
+      for (const row of this.records.values()) {
+        if (!row.removed && row.expiresAt && row.expiresAt * 1000 <= this.clock()) {
+          this.acceptSource(row.sourceId, null, { local: true, scope: sourceLayouts(this.getConfig())[row.sourceSymbol] });
+        }
+      }
       await this.save(); await this.publishCurrent();
+      if (!this.enabled()) return;
+      this.wakePending = false;
       if (this.networkRetryAt > this.clock()) return;
       const layouts = sourceLayouts(this.getConfig());
-      const work = [...this.records.values()].filter(row => (row.requestRetryAt || 0) <= this.clock()
-        && (row.removed || !this.awaitingSources.has(row.sourceId)
-          || (row.retire && (!row.side || !row.endTime || row.phase === 'error')))
-        && (row.removed || !layouts[row.sourceSymbol] || row.sourceLayout === layouts[row.sourceSymbol])
-        && (row.retire || row.phase === 'queued'
-        || (['waiting-close', 'waiting-history'].includes(row.phase) && row.nextAttemptAt <= this.clock())))
-        .sort((left, right) => Number(right.removed) - Number(left.removed)).slice(0, 4);
-      const pendingDrawing = [...this.records.values()].some(row => ['drawing', 'deleting'].includes(row.phase));
-      if (!work.length && !pendingDrawing) return;
+      const now = this.clock();
+      const work = [...this.records.values()].filter(row => this.requestAt(row, layouts) <= now)
+        .sort((left, right) => Number(right.removed) - Number(left.removed)).slice(0, SYNC_BATCH_SIZE)
+        .map(row => ({ row, revision: row.revision }));
+      batchSize = work.length;
+      if (!work.length && !(this.needsIndicatorRead() && (!this.started || now >= this.indicatorReadAt))) return;
       const adapter = this.getAdapter();
       if (!adapter.capabilities?.includes('candle-levels')) {
         await adapter.health();
         if (!adapter.capabilities?.includes('candle-levels')) throw Error('Нужно обновить приёмник свечных уровней на VPS');
       }
       let checkedColor = false;
-      for (const row of work) {
+      for (const { row, revision } of work) {
         if (this.closed || !this.enabled()) break;
-        const revision = row.revision;
+        if (row !== this.records.get(row.sourceId) || row.revision !== revision || this.requestAt(row, layouts) > this.clock()) continue;
         try {
           const remove = row.removed || !row.side || !row.endTime || row.phase === 'error';
           const payload = { id: row.id, revision, action: remove ? 'delete' : 'upsert' };
@@ -529,8 +706,10 @@ class CandleLevelSync {
           row.requestFailures = (row.requestFailures || 0) + 1; this.dirty = true;
         }
       }
-      if ([...this.records.values()].some(row => ['drawing', 'deleting'].includes(row.phase))) {
+      if (!this.enabled()) return;
+      if (this.needsIndicatorRead() && (!this.started || this.clock() >= this.indicatorReadAt)) {
         const startedAt=this.clock();
+        this.indicatorReadAt = startedAt + SYNC_INTERVAL_MS;
         const reply = await adapter.request('/candle-levels');
         this.trace(null,'indicator-read',{elapsedMs:Math.max(0,this.clock()-startedAt),snapshotApplied:reply?.candleLevels?.snapshotApplied===true});
         if (this.enabled()) this.acceptReply(reply.candleLevels);
@@ -543,11 +722,15 @@ class CandleLevelSync {
       this.trace(null,'sync-error',{reason:this.lastError.slice(0,500)});
       this.networkRetryAt = this.clock() + Math.min(30000, 1000 * 2 ** Math.min(++this.networkFailures, 5));
     }
-    finally { this.busy = false; this.onStatus(this.status()); }
+    finally {
+      this.busy = false;
+      this.scheduleNext(startedAt, batchSize);
+      this.onStatus(this.status());
+    }
   }
 
-  start() { this.timer = setInterval(() => this.tick(), 1000); this.timer.unref?.(); return this; }
-  stop() { this.closed = true; clearInterval(this.timer); }
+  start() { this.started = true; this.schedule(this.clock() + SYNC_INTERVAL_MS); return this; }
+  stop() { this.closed = true; if (this.timer !== null) this.clearTimer(this.timer); this.timer = null; }
 }
 
 function updateManagedLevels(config, levels, { preserveUnspecified = false } = {}) {

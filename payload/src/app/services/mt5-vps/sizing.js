@@ -11,6 +11,24 @@ function followers(config) {
     return {account,multiplier,enabled:row.enabled!==false,...(riskPercent===null ? {} : {riskPercent})};
   });
 }
+function accountChunkPercents(value = {}) {
+  if (!value || typeof value!=='object' || Array.isArray(value) || Object.keys(value).length>17)
+    throw Error('Неверные настройки рыночных частей');
+  return Object.fromEntries(Object.entries(value).map(([account,percent])=>{
+    if (!/^[1-9][0-9]{0,15}$/.test(account) || typeof percent!=='number' || !(percent>0 && percent<=100))
+      throw Error('Размер рыночной части должен быть больше 0 и не больше 100%');
+    return [account,percent];
+  }));
+}
+function accountZoneMultipliers(value = {}) {
+  if (!value || typeof value!=='object' || Array.isArray(value) || Object.keys(value).length>17)
+    throw Error('Неверные настройки люфта БМЛ/СМЛ');
+  return Object.fromEntries(Object.entries(value).filter(([account,multiplier])=>{
+    if (!/^[1-9][0-9]{0,15}$/.test(account) || !Number.isFinite(multiplier) || multiplier<1)
+      throw Error('Множитель люфта должен быть числом от 1');
+    return multiplier>1;
+  }));
+}
 function transferCopying(config, request, linkedAccounts) {
   const account=String(config.account),from=String(request?.from),to=String(request?.to);
   if(String(request?.account)!==account || from===to || [from,to].includes(account)
@@ -60,4 +78,4 @@ function closeVolumes(row, account, linked, mode, value) {
     } catch(error) {return {account:String(target.account),error:error.message};}
   });
 }
-module.exports={followers,transferCopying,percentVolume,closeVolumes};
+module.exports={followers,accountChunkPercents,accountZoneMultipliers,transferCopying,percentVolume,closeVolumes};

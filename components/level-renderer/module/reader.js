@@ -16,7 +16,7 @@ function chart(value) {
       && url.pathname.startsWith('/chart/') && !url.username && !url.password;
   } catch { return false; }
 }
-function evaluate(url, expression, { signal } = {}) {
+function evaluate(url, expression, { signal, timeoutMs = 20000 } = {}) {
   if (!localDebugger(url)) return Promise.reject(Error('Разрешён только локальный отладчик TradingView'));
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(Error('Чтение остановлено')); return; }
@@ -24,7 +24,7 @@ function evaluate(url, expression, { signal } = {}) {
     const socket = new WebSocket(url, { maxPayload: 2 * 1024 * 1024 });
     let done = false;
     const abort = () => finish(Error('Чтение остановлено'));
-    const timer = setTimeout(() => finish(Error('TradingView не ответил')), 20000);
+    const timer = setTimeout(() => finish(Error('TradingView не ответил')), timeoutMs);
     function finish(error, result) {
       if (done) return;
       done = true; clearTimeout(timer); signal?.removeEventListener('abort', abort);
@@ -55,75 +55,155 @@ async function targets(signal) {
   if(charts.length>16)throw Error('Слишком много открытых графиков для полной сверки');
   return charts;
 }
-function startReader({ enabled, acceptSnapshot, acceptInventory = () => {}, acceptOpenCharts=()=>{}, sourceLayouts=()=>({}), sources, anchors, onError = () => {},
-  getTargets = targets, run = evaluate, intervalMs = 10000, setTimer = setTimeout, clearTimer = clearTimeout }) {
-  let closed = false, running = false, timer, controller, refreshPending=false, historyCursor=0;
+function startReader({ enabled, acceptSnapshot, acceptInventory = () => {}, acceptOpenCharts = () => {},
+  sourceLayouts = () => ({}), sources, anchors, onError = () => {}, getTargets = targets, run = evaluate,
+  intervalMs = 10000, clock = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
+  let closed = false, running = false, timer, controller, refreshPending = false, historyCursor = 0;
+  let fullReadAt = 0, pinnedCharts = [];
+  const pinnedReadMs = 2000;
   const active = () => !closed && enabled();
-  const seen = new Map(), installed = new Set(), inventories = new Map();
+  const layoutOf = target => target.url?.match(/\/chart\/([A-Za-z0-9_-]+)(?:\/|[?#]|$)/)?.[1];
+  const seen = new Map(), fastSeen = new Map(), installed = new Set(), inventories = new Map();
   const collector = snapshotCandlePage.toString(), calendar = candleWindowReader.toString();
   const version = JSON.stringify(createHash('sha256').update(collector).update(calendar).digest('hex'));
-  function schedule(delay) { clearTimer(timer); if (!closed) { timer = setTimer(tick, delay); timer.unref?.(); } }
-  async function tick() {
+  function schedule(delay, full = true) {
+    clearTimer(timer);
+    if (!closed) {
+      timer = setTimer(() => tick(full), delay);
+      timer.unref?.();
+    }
+  }
+  function forget(id, full) {
+    fastSeen.delete(id);
+    pinnedCharts = pinnedCharts.filter(target => target.id !== id);
+    if (full) {
+      seen.delete(id);
+      installed.delete(id);
+      inventories.delete(id);
+    }
+  }
+  function reset() {
+    pinnedCharts = [];
+    seen.clear();
+    fastSeen.clear();
+    installed.clear();
+    inventories.clear();
+  }
+  async function collect(target, options, full) {
+    const scopeCheck = options.scope ? `const here = window.location;
+      if (here.protocol !== 'https:' || !['tradingview.com','www.tradingview.com','ru.tradingview.com'].includes(here.hostname)
+        || !here.pathname.startsWith('/chart/') || here.pathname.split('/')[2] !== ${JSON.stringify(options.scope)})
+        return { moved: true };` : '';
+    const read = `return runtime.collect(runtime.calendar, ${JSON.stringify(options)});`;
+    const args = { signal: controller.signal, ...(!full ? { timeoutMs: 1000 } : {}) };
+    if (installed.has(target.id)) {
+      const result = await run(target.webSocketDebuggerUrl, `(() => {
+        ${scopeCheck}
+        const runtime = window.__isccAddonCandleRuntime;
+        if (runtime?.version !== ${version}) return { missingRuntime: true };
+        ${read} })()`, args);
+      if (!result?.missingRuntime || !active()) return result;
+    }
+    if (!active()) return null;
+    const result = await run(target.webSocketDebuggerUrl, `(() => {
+      ${scopeCheck}
+      const runtime = window.__isccAddonCandleRuntime = {
+        version: ${version}, collect: (${collector}), calendar: (${calendar})
+      };
+      ${read} })()`, args);
+    if (!result?.moved) installed.add(target.id);
+    return result;
+  }
+  async function tick(full) {
     if (closed || running) return;
-    running = true; refreshPending=false; controller = new AbortController();
+    running = true; refreshPending = false; controller = new AbortController();
     try {
-      if (!active()) { seen.clear(); installed.clear(); inventories.clear(); return; }
-      const discoveredAt=Date.now(),allCharts = await getTargets(controller.signal);
-      if(!active())return;
-      await acceptOpenCharts([...new Set(allCharts.map(target=>target.url?.match(/\/chart\/([A-Za-z0-9_-]+)(?:\/|[?#]|$)/)?.[1]).filter(Boolean))],discoveredAt);
-      const charts=allCharts.filter(target=>target.webSocketDebuggerUrl);
+      if (!active()) { reset(); return; }
+      const layouts = sourceLayouts(), pinned = new Set(Object.values(layouts));
+      let charts = pinnedCharts.filter(target => pinned.has(layoutOf(target)));
+      if (full) {
+        const discoveredAt = clock(), allCharts = await getTargets(controller.signal);
+        if (!active()) return;
+        await acceptOpenCharts([...new Set(allCharts.map(layoutOf).filter(Boolean))], discoveredAt);
+        charts = allCharts.filter(target => target.webSocketDebuggerUrl)
+          .sort((a, b) => Number(pinned.has(layoutOf(b))) - Number(pinned.has(layoutOf(a))));
+        // One fast reader per selected layout. Full discovery still checks duplicate tabs.
+        pinnedCharts = [...new Map(charts.filter(target => pinned.has(layoutOf(target)))
+          .map(target => [layoutOf(target), target])).values()];
+      }
       for (const target of charts) {
         if (!active()) break;
         try {
-        const scope = target.url?.match(/\/chart\/([A-Za-z0-9_-]+)(?:\/|[?#]|$)/)?.[1], readStartedAt = Date.now();
-        const options = JSON.stringify({ selective: true, scope, sources: sources(), sourceLayouts:sourceLayouts(), anchors: anchors(), ack: seen.get(target.id) });
-        let result;
-        if (installed.has(target.id)) result = await run(target.webSocketDebuggerUrl, `(() => {
-          const runtime = window.__isccAddonCandleRuntime;
-          if (runtime?.version !== ${version}) return { missingRuntime: true };
-          return runtime.collect(runtime.calendar, ${options}); })()`, { signal: controller.signal });
-        if (!installed.has(target.id) || result?.missingRuntime) {
+          const scope = layoutOf(target), readStartedAt = clock();
+          const selected = sources().filter(symbol => full || layouts[symbol] === scope);
+          const required = anchors().filter(anchor => full || layouts[anchor.symbol] === scope);
+          const result = await collect(target, { selective: true, scope, sources: selected, sourceLayouts: layouts,
+            anchors: required, ack: (full ? seen : fastSeen).get(target.id),
+            ...(!full ? { sourceOnly: true } : {}) }, full);
           if (!active()) break;
-          result = await run(target.webSocketDebuggerUrl, `(() => {
-            const runtime = window.__isccAddonCandleRuntime = {
-              version: ${version}, collect: (${collector}), calendar: (${calendar})
-            };
-            return runtime.collect(runtime.calendar, ${options}); })()`, { signal: controller.signal });
-          installed.add(target.id);
-        }
-        if (!active()) break;
-        if (result?.unchanged && result.token === seen.get(target.id)) {
-          const inventory = inventories.get(target.id);
-          if (inventory) await acceptInventory(inventory, readStartedAt);
-          continue;
-        }
-        if (!result?.token && Array.isArray(result?.sources) && !result.sources.length
-          && Array.isArray(result.series) && !result.series.length) {
-          await acceptInventory({ scope, complete: false, symbols: [] }, readStartedAt);
-          seen.delete(target.id); inventories.delete(target.id); continue;
-        }
-        if (result && Array.isArray(result.sources) && Array.isArray(result.series)) {
-          await acceptSnapshot({ ...result, readStartedAt });
-          if (result.inventory) inventories.set(target.id, result.inventory); else inventories.delete(target.id);
-          seen.set(target.id, result.token);
-        }
+          if (!result) continue;
+          if (result.moved) { forget(target.id, true); continue; }
+          const hasSnapshot = Array.isArray(result.sources) && Array.isArray(result.series);
+          if (!full) {
+            const currentLayouts = sourceLayouts();
+            if (hasSnapshot && result.inventory?.scope === scope && result.token
+              && selected.length && selected.every(symbol => currentLayouts[symbol] === scope)) {
+              // Deletion needs a full inventory and a fresh topology proof.
+              await acceptSnapshot({ sources: result.sources, series: result.series, inventory: { scope }, sourceOnly: true });
+              fastSeen.set(target.id, result.token);
+            } else if (!result.unchanged) fastSeen.delete(target.id);
+            continue;
+          }
+          if (result.unchanged && result.token === seen.get(target.id)) {
+            const inventory = inventories.get(target.id);
+            if (inventory) await acceptInventory(inventory, readStartedAt);
+            continue;
+          }
+          if (!result.token && hasSnapshot && !result.sources.length && !result.series.length) {
+            await acceptInventory({ scope, complete: false, symbols: [] }, readStartedAt);
+            seen.delete(target.id); inventories.delete(target.id); continue;
+          }
+          if (hasSnapshot) {
+            await acceptSnapshot({ ...result, readStartedAt });
+            if (result.inventory) inventories.set(target.id, result.inventory); else inventories.delete(target.id);
+            seen.set(target.id, result.token);
+          }
         } catch (error) {
-          seen.delete(target.id); installed.delete(target.id); inventories.delete(target.id);
+          forget(target.id, full);
           if (active()) onError(error);
         }
       }
-      const required=anchors();
-      if(active() && charts.length && required.length){
-        const anchor=required[(historyCursor++)%required.length];
-        const series=await run(charts[0].webSocketDebuggerUrl,
-          `(${readCandleHistory.toString()})(${JSON.stringify(anchor)},(${calendar}))`,{signal:controller.signal});
-        if(active() && series)await acceptSnapshot({sources:[],series:[series]});
+      const required = anchors();
+      if (full && active() && charts.length && required.length) {
+        const anchor = required[(historyCursor++) % required.length];
+        const series = await run(charts[0].webSocketDebuggerUrl,
+          `(${readCandleHistory.toString()})(${JSON.stringify(anchor)},(${calendar}))`, { signal: controller.signal });
+        if (active() && series) await acceptSnapshot({ sources: [], series: [series] });
       }
-      for (const id of installed) if (!charts.some(target => target.id === id)) { seen.delete(id); installed.delete(id); inventories.delete(id); }
-    } catch (error) { if (active()) {await acceptOpenCharts(null,Date.now());onError(error);} }
-    finally { running = false; controller = undefined; schedule(refreshPending?250:intervalMs); }
+      if (full) {
+        const available = new Set(charts.map(target => target.id));
+        for (const id of installed) if (!available.has(id)) forget(id, true);
+      }
+    } catch (error) {
+      reset();
+      if (active()) { await acceptOpenCharts(null, clock()); onError(error); }
+    } finally {
+      running = false; controller = undefined;
+      if (full) fullReadAt = clock() + intervalMs;
+      const remaining = full ? intervalMs : Math.max(0, fullReadAt - clock());
+      if (refreshPending) schedule(250);
+      else if (pinnedCharts.length && remaining > pinnedReadMs) schedule(pinnedReadMs, false);
+      else schedule(remaining);
+    }
   }
   schedule(1000);
-  return { refresh() {if(closed)return;const pending=refreshPending;refreshPending=true;if(!running&&!pending)schedule(250);}, stop() { closed = true; clearTimer(timer); controller?.abort(); seen.clear(); installed.clear(); inventories.clear(); } };
+  return {
+    refresh() {
+      if (closed) return;
+      const pending = refreshPending; refreshPending = true;
+      if (!running && !pending) schedule(250);
+    },
+    stop() { closed = true; clearTimer(timer); controller?.abort(); reset(); }
+  };
 }
 module.exports = { startReader, chart, localDebugger, evaluate };

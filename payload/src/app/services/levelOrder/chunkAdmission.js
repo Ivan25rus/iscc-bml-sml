@@ -78,6 +78,7 @@ function createChunkAdmission({getAdapter,getGroups,getConfig,getSnapshot,orderC
           instrumentType},snapshot.quote,{deferMarketPrice:zone});
         if (!rule.ok) throw Error(rule.reason);
         const entryPlan={...plan,chunkPercent,chunkVolume,maxGap:zone ? plan.maxGap : maxGap,
+          ...(zone && Number(args.maxLot)>0 ? {maxLot:Number(args.maxLot)} : {}),
           ...(nativeRisk ? {primaryRiskRequest:{account:primaryAccount,percent:policy.percent,
             quantityStep:Number(args.minLot),minQty:Number(snapshot.metadata.minQty ?? args.minLot),
             maxQty:Number(snapshot.metadata.maxQty),pointValue:Number(args.lot),maxLot:Number(args.maxLot),

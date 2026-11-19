@@ -1,15 +1,37 @@
 const {Worker,isMainThread,parentPort}=require('node:worker_threads');
+const {isEntryPlan}=require('./entryPlanJournal');
 const now=()=>Number(process.hrtime.bigint())/1e6;
 
 if(!isMainThread) {
   const fs=require('node:fs');
   const {writeDurable}=require('./durableFile');
+  const {loadEntryPlans,changeBatch,appendEntryPlanBatch}=require('./entryPlanJournal');
   const files=new Map();
   const tails=new Map();
   parentPort.on('message',message=>{
     const tail=(tails.get(message.file) || Promise.resolve()).catch(()=>{}).then(async()=>{
       try {
         const started=now(),timings={journalWorkerQueueMs:started-message.postedAt};
+        if (isEntryPlan(message.file)) {
+          let state=files.get(message.file);
+          if (!state) {
+            const {validBytes,size}=loadEntryPlans(message.file);
+            state={validBytes,size};
+            files.set(message.file,state);
+          }
+          timings.journalWorkerLoadMs=now()-started;
+          if (!message.prepare) {
+            const serializing=now(),text=changeBatch(message.changes);
+            timings.journalSerializeMs=now()-serializing;
+            const writing=now();
+            // Entry-plan writes have a dedicated worker. Keep its ordered
+            // disk operations off the process-wide asynchronous file queue.
+            appendEntryPlanBatch(message.file,state,text);
+            timings.journalDurableMs=now()-writing;
+          }
+          parentPort.postMessage({id:message.id,timings,finishedAt:now()});
+          return;
+        }
         let rows=files.get(message.file);
         if(!rows || message.replace) {
           const values=message.replace || (fs.existsSync(message.file) ? JSON.parse(fs.readFileSync(message.file,'utf8')) : []);
@@ -33,14 +55,18 @@ if(!isMainThread) {
     tail.finally(()=>{if(tails.get(message.file)===tail)tails.delete(message.file);});
   });
 } else {
-  let worker,serial=0;
-  const pending=new Map();
-  function warm() {
-    if(worker)return worker;
-    const current=new Worker(__filename);worker=current;current.unref();
+  let serial=0;
+  const workers=new Map();
+  function journalWorker(entryPlan=false) {
+    const existing=workers.get(entryPlan);
+    if(existing)return existing;
+    const current=new Worker(__filename),pending=new Map();
+    const slot={current,pending};
+    workers.set(entryPlan,slot);
     const failed=error=>{
-      if(worker===current)worker=null;
-      for(const [id,row] of pending)if(row.worker===current){pending.delete(id);row.reject(error);}
+      if(workers.get(entryPlan)===slot)workers.delete(entryPlan);
+      for(const row of pending.values())row.reject(error);
+      pending.clear();
     };
     current.on('message',message=>{
       const row=pending.get(message.id);if(!row)return;
@@ -50,17 +76,18 @@ if(!isMainThread) {
         journalAckMs:now()-message.finishedAt,journalTotalMs:now()-row.postedAt});
     });
     current.on('error',failed);
-    current.on('exit',code=>{if(worker===current)failed(Error('Durable journal worker stopped: '+code));});
+    current.on('exit',code=>failed(Error('Durable journal worker stopped: '+code)));
     current.unref();
-    return current;
+    return slot;
   }
+  const warm=()=>journalWorker().current;
   function request(file,changes,replace,prepare=false) {
-    // Only the changed records cross threads. Serialize the complete retained
-    // history in the worker, preserving the existing atomic JSON file format.
-    const current=warm(),id=++serial;
+    // Full history rewrites must not hold up durable entry plans.
+    const {current,pending}=journalWorker(isEntryPlan(file)),id=++serial;
+    // Only the changed records cross threads for command and receipt updates.
     return new Promise((resolve,reject)=>{
       const postedAt=now();
-      pending.set(id,{resolve,reject,worker:current,postedAt});current.ref();
+      pending.set(id,{resolve,reject,postedAt});current.ref();
       try{current.postMessage({id,file,changes,replace,prepare,postedAt});}
       catch(error){pending.delete(id);if(!pending.size)current.unref();reject(error);}
     });

@@ -21,7 +21,9 @@ function chunkReason(entry) {
   if(!entry?._readError && ['Independent account execution; exact account outcomes retained',
     'Independent account engines; exact account outcomes retained'].includes(reason)) {
     const details=Object.entries(entry.accounts || {}).filter(([,row])=>row.entryReason && row.entryReason!==reason);
-    return details.length ? details.map(([account,row])=>account+': '+chunkReason({reason:row.entryReason})).join('\n')
+    return details.length ? accountStageText(details.map(([account,row])=>[account,
+      row.limitFillStopRange && row.entryStatus==='waiting-quote'
+        ? 'Объём набран. Ждёт свежий тик для пересчёта SL и TP.' : chunkReason({reason:row.entryReason})]))
       : 'Счета исполняются независимо; проверяем точный исход каждого счёта.';
   }
   if(reason.includes("Can't pickle") && reason.includes('AccountInfo'))
@@ -80,26 +82,38 @@ function chunkReason(entry) {
     'Actual execution exceeded the planned volume or risk; further entry stopped':'Исполнение превысило плановый объём или риск; набор остановлен'
   };
   const accountGap=reason.match(/^Account (\d+): price gap is too large; waiting for price to return$/);
-  if(accountGap)return `${accountGap[1]}: цена вне допуска; ждём возврата`;
+  if(accountGap)return `${displayMT5Account(accountGap[1])}: цена вне допуска; ждём возврата`;
   const accountRisk=reason.match(/^Account (\d+): next tranche exceeds remaining risk; waiting for price to return$/);
-  if(accountRisk)return `${accountRisk[1]}: следующая часть превысит остаток риска; ждём возврата цены`;
+  if(accountRisk)return `${displayMT5Account(accountRisk[1])}: следующая часть превысит остаток риска; ждём возврата цены`;
   return messages[reason] || reason;
 }
 
 function chunkAccountText(entry) {
   return Object.entries(entry?.accounts || {}).map(([account,value])=>{
     const filled=value?.filledVolume,target=value?.targetVolume;
+    const name=displayMT5Account(account);
     if(filled===0 && !value.positionsClosed && entry.positionLifecycle!=='closed') {
       const open=entry.positionsConfirmed===true && entry.hasOpenPositions===true && !entry._readError && entry.livePositions?.some(row=>
         String(row.account)===account && Number.isFinite(row.volume) && row.volume>0);
-      if(open)return `${account} · позиция открыта`;
+      if(open)return `${name} · позиция открыта`;
       const unresolvedFill=entry.children?.some(child=>Number(child.volumes?.[account])>0
         && (child.state==='unknown' || child.type==='market' && !['confirmed','cancelled','rejected'].includes(child.state)));
-      if(unresolvedFill || entry._readError || entry._armUnconfirmed)return `${account} · сверка объёма`;
+      if(unresolvedFill)return `${name} · сверка объёма`;
+      if(entry._armUnconfirmed)return `${name} · запуск не подтверждён`;
+      if(value?.entryStatus==='waiting-quote')return `${name} · ждёт свежую цену`;
+      if(entry._readError)return `${name} · статус уточняется`;
     }
-    if(!Number.isFinite(filled) || filled<0 || !Number.isFinite(target) || target<=0)return `${account} · —`;
+    if(!Number.isFinite(filled) || filled<0 || !Number.isFinite(target) || target<=0)return `${name} · —`;
+    const stops=value.limitFillStopRange;
+    if(!entry._readError && !value.positionsClosed && entry.positionLifecycle!=='closed' &&
+      Number.isFinite(stops?.minimum) && Number.isFinite(stops?.maximum) && stops.minimum>0 && stops.maximum>=stops.minimum) {
+      const format={useGrouping:false,maximumFractionDigits:8};
+      const first=stops.minimum.toLocaleString('ru-RU',format);
+      const last=stops.maximum===stops.minimum ? '' : '–'+stops.maximum.toLocaleString('ru-RU',format);
+      return `${name} · ${filled.toLocaleString('ru-RU',format)} лот · SL ${first}${last} · ${value.entryStatus==='waiting-quote' ? 'ждёт тик' : 'сверка защиты'}`;
+    }
     const percent=filled>=target ? 100 : Math.min(99,Math.floor(filled/target*100+1e-8));
-    return `${account} · ${filled>0 && percent===0 ? '<1' : percent}%`;
+    return `${name} · ${filled>0 && percent===0 ? '<1' : percent}%`;
   }).join('\n');
 }
 
@@ -113,7 +127,7 @@ function logChunkDiagnostic(panel,entry,detail) {
   // Timing snapshots change on each refresh; log actual state changes only.
   record.accounts=Object.fromEntries(Object.entries(record.accounts).map(([account,row])=>[account,
     Object.fromEntries(['filledVolume','targetVolume','pendingVolume','freeVolume','entryStatus','entryReason',
-      'laneStopReason','commonStopUncertain','stopCheckRejected','riskRepairRequired','sl','tp']
+      'laneStopReason','commonStopUncertain','stopCheckRejected','riskRepairRequired','sl','tp','limitFillStopRange']
       .filter(field=>row?.[field]!==undefined).map(field=>[field,row[field]]))]));
   const signature=JSON.stringify(record);
   if(panel._diagnosticSignature===signature)return;
@@ -222,6 +236,7 @@ function createLevelOrderBody(row, key, $pointSize) {
       if (cardStates.has(key) || chunkCardLocked(key)) return;
       const value = validateMarket(action);
       if (value.valid) await armChunkEntry(action,row,value,row.instrumentType || detectInstrumentType(row.ticker),clickAt);
+      else body.validate();
     });
     button.dataset.kind = action;marketButtons.push(button);
   }
@@ -256,7 +271,6 @@ function createLevelOrderBody(row, key, $pointSize) {
   chunkPanel.append(chunkProgress,chunkSummary,chunkDetail,chunkActions);
   let marketPreview = {valid:false,reason:''};
 
-  function entryPrice() { return _normNum($level.value); }
   function prepareMarketEntry() {
     if (!allowsMarketEntry || cardStates.has(key) || chunkCardLocked(key) || marketWarming || Date.now()-marketReadyAt<10000) return;
     marketWarming=true;
@@ -267,40 +281,42 @@ function createLevelOrderBody(row, key, $pointSize) {
       .finally(()=>{marketWarming=false;if(cardByKey(key)?.contains($level))body.validate();});
   }
   function validateMarket(action) {
-    const level=_normNum($level.value),center=entryPrice(),info=instrumentInfoFor(row.ticker,row);
+    const level=_normNum($level.value),info=instrumentInfoFor(row.ticker,row);
     const risk=_normNum($risk.value),stopOffsetPts=_normNum($stopOffset.value),takeProfitPts=_normNum($tp.value);
     const specifications=info?.provider==='mt5-vps' && [info.tickSize,info.quantityStep,info.contractSize,info.maxQty].every(isPos);
-    if (allowsMarketEntry && specifications && isPos(level)) prepareMarketEntry();
-    const check=validateTrackedEntry({groups:marketGroups,symbol:row.ticker,level,entryPrice:center});
+    if (!action && allowsMarketEntry && specifications && isPos(level)) prepareMarketEntry();
+    const check=validateTrackedEntry({groups:marketGroups,symbol:row.ticker,level,entryPrice:level});
     const locked=cardStates.has(key) || chunkCardLocked(key);
     const reason=!allowsMarketEntry ? 'BML/SML доступны для уровня LT' : locked ? 'Вход уже создан'
       : !specifications ? 'Ожидание спецификации MT5'
       : !check.ok ? check.reason : (!percentRisk && !isPos(risk)) || !isSL(stopOffsetPts) || !Number.isFinite(maxLot) || maxLot<0
         || ($tp.value!=='' && !isPos(takeProfitPts)) ? (percentRisk ? 'Проверь стоп, лот и тейк' : 'Проверь риск, стоп, лот и тейк') : '';
-    const plans={};
-    for (const kind of ['MB','MS']) {
-      plans[kind]=reason ? {ok:false,reason} : calculateMarketZoneTradePlan({
-        action:kind,ticker:row.ticker,instrumentType:row.instrumentType || detectInstrumentType(row.ticker),
-        level,entryPrice:center,maxOffset:check.maxOffset,zoneMultiplier:1,
-        entryMode:'side-zone',chunkPercent:resolveMarketChunkPercent(levelOrderCfg,row.ticker),
-        riskUsd:risk,stopOffsetPts,stopMode,maxLot,takeProfitPts:$tp.value==='' ? null : takeProfitPts,
-        minLot:info?.quantityStep,minQty:info?.minQty ?? info?.quantityStep,maxQty:info?.maxQty,
-        tickSize:info?.tickSize,lot:info?.contractSize,orderCalculator:orderCalc,previewWithoutSize:percentRisk
+    const chunkPercent=resolveMarketChunkPercent(levelOrderCfg,row.ticker);
+    const planFor=kind=>reason ? {ok:false,reason} : calculateMarketZoneTradePlan({
+      action:kind,ticker:row.ticker,instrumentType:row.instrumentType || detectInstrumentType(row.ticker),
+      level,entryPrice:level,maxOffset:check.maxOffset,zoneMultiplier:1,
+      entryMode:'side-zone',chunkPercent,
+      riskUsd:risk,stopOffsetPts,stopMode,maxLot,takeProfitPts:$tp.value==='' ? null : takeProfitPts,
+      minLot:info?.quantityStep,minQty:info?.minQty ?? info?.quantityStep,maxQty:info?.maxQty,
+      tickSize:info?.tickSize,lot:info?.contractSize,orderCalculator:orderCalc,previewWithoutSize:percentRisk
+    });
+    let selected;
+    if (action) selected=planFor(action);
+    else {
+      const plans=marketButtons.map(button=>{
+        const plan=planFor(button.dataset.kind);
+        setChanged(button,'disabled',!plan.ok);
+        setChanged(button,'title',plan.ok ? 'Набор по '+plan.chunkPercent+'% с лимиткой на остаток; ожидание с другой стороны уровня · '
+          +(stopMode==='entry' ? 'Общий SL от средней '+stopOffsetPts : 'SL '+plan.stopPrice)
+          +(percentRisk ? '' : ' · '+plan.totalQty+' лота') : plan.reason);
+        return plan;
       });
+      selected=plans.find(plan=>plan.ok);
+      marketPreview={valid:!!selected,reason:reason || plans.map(plan=>plan.reason).filter(Boolean).join(' · ')};
     }
-    for (const button of marketButtons) {
-      const plan=plans[button.dataset.kind];
-      setChanged(button,'disabled',!plan.ok);
-      setChanged(button,'title',plan.ok ? 'Набор по '+plan.chunkPercent+'% с лимиткой на остаток; ожидание с другой стороны уровня · '
-        +(stopMode==='entry' ? 'Общий SL от средней '+stopOffsetPts : 'SL '+plan.stopPrice)
-        +(percentRisk ? '' : ' · '+plan.totalQty+' лота') : plan.reason);
-    }
-    const selected=action ? plans[action] : Object.values(plans).find(plan=>plan.ok);
-    marketPreview={valid:!!selected?.ok,reason:reason || selected?.reason || Object.values(plans).map(plan=>plan.reason).filter(Boolean).join(' · '),
-      plan:selected,check};
-    return {valid:!!selected?.ok,type:'levelOrder',level,entryPrice:selected?.referencePrice ?? center,risk,stopOffsetPts,stopMode,maxLot,
+    return {valid:!!selected?.ok,type:'levelOrder',level,entryPrice:selected?.referencePrice ?? level,risk,stopOffsetPts,stopMode,maxLot,
       minLot:info?.quantityStep,takeProfitPts:$tp.value==='' ? null : takeProfitPts,pointSize:null,tickSize:info?.tickSize,
-      chunkPercent:selected?.chunkPercent ?? resolveMarketChunkPercent(levelOrderCfg,row.ticker),entryMode:'side-zone',zoneMultiplier:1};
+      chunkPercent:selected?.chunkPercent ?? chunkPercent,entryMode:'side-zone',zoneMultiplier:1};
   }
   function persist() {
     uiState.set(key,{
@@ -345,7 +361,8 @@ function createLevelOrderBody(row, key, $pointSize) {
       else setChanged($level,'title',tracksLevel ? trackedLevelReason() || 'Ближайший уровень LT: переключается автоматически.' : 'Ручной уровень');
       const progress=chunkDisplayEntry(key,entry);
       const closeConfirmation=chunkCloseConfirmations.get(entry?.id);
-      const accounts=closeConfirmation?.accounts ?? chunkAccountText(progress);
+      const accounts=closeConfirmation ? closeConfirmation.accounts.split('\n').map(line=>
+        line.replace(/^\d+(?= ·)/,displayMT5Account)).join('\n') : chunkAccountText(progress);
       const pendingLimit=entry?.livePendingOrders?.length>0 || progress && !chunkTerminalPhases.has(progress.phase)
         && progress.phase!=='unknown' && progress.children?.some(child=>child.type==='limit' && child.state==='pending');
       const stopUnconfirmed=entry?._stopUnconfirmed===true;
@@ -353,7 +370,8 @@ function createLevelOrderBody(row, key, $pointSize) {
         || value==='stopped' && !progress.accounts?.[account]?.userStopped && !!progress.accounts?.[account]?.laneStopReason);
       const stoppedByUser=progress?.phase==='stopped' && Object.values(progress.accounts || {}).some(account=>account.userStopped===true);
       const detail=stopUnconfirmed ? 'VPS ещё не подтвердил команду остановки.' : closeConfirmation ? closeConfirmation.detail
-        : progress ? (laneFailed || progress._readError || ['stopped','paused','unknown'].includes(progress.phase)) ? chunkReason(progress) : ''
+        : progress ? (laneFailed || progress._readError || ['stopped','paused','unknown'].includes(progress.phase)
+          || Object.values(progress.accounts || {}).some(account=>account.entryStatus==='waiting-quote')) ? chunkReason(progress) : ''
         : chunkEntryErrorsByKey.get(key) || '';
       const lifecycleChecking=progress?._readErrorKind==='checking';
       const failed=!closeConfirmation && (laneFailed || !!progress?._readError && !lifecycleChecking || progress?.phase==='unknown' || !!detail && !progress
@@ -571,9 +589,8 @@ async function armChunkEntry(action,row,value,instrumentType,clickAt=Date.now())
   const local={id:requestId,symbol:row.ticker,side:['BS','MB'].includes(action) ? 'buy' : 'sell',entryMode:value.entryMode,
     trigger:value.entryPrice,level:value.level,zoneMultiplier:value.zoneMultiplier,phase:'arming',accounts:{}};
   chunkEntriesByKey.set(key,local);row.chunkEntryId=requestId;
-  paintChunkEntry(key);
   try {
-    const result=await ipcRenderer.invoke('level-order:arm-chunks',{
+    const pending=ipcRenderer.invoke('level-order:arm-chunks',{
       ticker:row.ticker,provider:row.provider,instrumentType,action,level:value.level,entryPrice:value.entryPrice,
       riskUsd:value.risk,stopOffsetPts:value.stopOffsetPts,stopMode:value.stopMode,maxLot:value.maxLot,
       minLot:value.minLot,takeProfitPts:value.takeProfitPts,buyPriceSource:value.buyPriceSource,
@@ -582,6 +599,9 @@ async function armChunkEntry(action,row,value,instrumentType,clickAt=Date.now())
       entryMode:value.entryMode,zoneMultiplier:value.zoneMultiplier,
       requestId,strategyId:requestId,clickAt
     });
+    try {paintChunkEntry(key);}
+    catch(error) {console.error('Could not paint the pending entry',error);}
+    const result=await pending;
     // A stop may have been confirmed before this arm reply arrived, or a poll
     // may already have recovered a newer parent. Never restore the old launch
     // or overwrite a stop that is still awaiting its own confirmation.

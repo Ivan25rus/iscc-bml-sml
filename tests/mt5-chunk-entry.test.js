@@ -70,6 +70,45 @@ test('Independent account execution is captured only after the receiver advertis
   assert.ok(require('../payload/src/app/services/mt5-vps/entryAdmission').requiredCapabilities(lanes).includes('independent-account-lanes-v4'));
 });
 
+test('Account market parts are captured once and sent in the existing atomic opening request',()=>{
+  const {captureEntrySettings}=require('../payload/src/app/services/mt5-vps/chunkEntryClient');
+  const {ACCOUNT_CHUNK_CAPABILITY}=require('../payload/src/app/services/mt5-vps/entryAdmission');
+  const adapter=new MT5VPSAdapter({...config,accountChunkPercents:{900000002:35,900000001:100,900000004:5}});
+  const hybrid={...plan,referencePrice:plan.level,entryMode:'side-zone',zoneRadius:6,zoneMultiplier:1,
+    executionPolicy:'hybrid-market-limit-v1',stopMode:'entry',stopOffsetPts:4,chunkPercent:50,maxLot:.4};
+  adapter.capabilities=['atomic-entry-admission-v1','independent-account-engines-v5','entry-initial-sizing-only-v1'];
+  const entrySettings=captureEntrySettings(adapter,hybrid.ticker);
+  adapter.config.accountChunkPercents[900000001]=75;
+  assert.throws(()=>buildEntryRequest(adapter,hybrid,{entrySettings}),/VPS/);
+  adapter.capabilities.push(ACCOUNT_CHUNK_CAPABILITY);
+  const request=buildEntryRequest(adapter,hybrid,{entrySettings});
+  assert.deepEqual(request.accountChunkPercents,{900000002:35,900000001:100});
+  assert.equal(request.accountChunkMaxLot,.4);
+  assert.ok(request.requiredCapabilities.includes(ACCOUNT_CHUNK_CAPABILITY));
+  assert.equal(buildEntryRequest(adapter,plan).accountChunkPercents,undefined);
+});
+
+test('Account-specific price play is captured and sent only for enabled BML/SML accounts',()=>{
+  const {captureEntrySettings}=require('../payload/src/app/services/mt5-vps/chunkEntryClient');
+  const {ACCOUNT_ZONE_CAPABILITY}=require('../payload/src/app/services/mt5-vps/entryAdmission');
+  const adapter=new MT5VPSAdapter({...config,accountZoneMultipliers:{900000001:1.255,900000004:3}});
+  const hybrid={...plan,referencePrice:plan.level,entryMode:'side-zone',zoneRadius:6,zoneMultiplier:2,
+    executionPolicy:'hybrid-market-limit-v1',stopMode:'entry',stopOffsetPts:4,chunkPercent:50};
+  adapter.capabilities=['atomic-entry-admission-v1','independent-account-engines-v5','entry-initial-sizing-only-v1'];
+  const entrySettings=captureEntrySettings(adapter,hybrid.ticker);
+  adapter.config.accountZoneMultipliers[900000001]=1;
+  assert.throws(()=>buildEntryRequest(adapter,hybrid,{entrySettings}),/VPS/);
+  adapter.capabilities.push(ACCOUNT_ZONE_CAPABILITY);
+  const request=buildEntryRequest(adapter,hybrid,{entrySettings});
+  const tick=hybrid.tickSize;
+  assert.deepEqual(request.accountZoneRadii,{900000001:Number((Math.floor(7.53/tick+1e-7)*tick).toFixed(10))});
+  assert.equal(request.zoneRadius,6);
+  assert.ok(request.requiredCapabilities.includes(ACCOUNT_ZONE_CAPABILITY));
+  assert.equal(buildEntryRequest(adapter,hybrid).accountZoneRadii,undefined);
+  assert.equal(buildEntryRequest(adapter,plan,{entrySettings}).accountZoneRadii,undefined);
+  assert.throws(()=>buildEntryRequest(adapter,{...hybrid,takeProfitPts:7/tick},{entrySettings}),/тейка/);
+});
+
 test('Fast entry progress reads do not depend on failed broad management',async()=>{
   const adapter=new MT5VPSAdapter(config),calls=[];
   adapter.capabilities=['atomic-entry-admission-v1','entry-progress-fast-read-v1'];

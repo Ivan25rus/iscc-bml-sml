@@ -111,6 +111,11 @@ class ChunkGuardTests(unittest.TestCase):
             result = self.bridge.execute('place', dict(self.payload, id='too-close'), None, True)['result']
         self.assertEqual(result['status'], 'rejected')
         self.assertEqual(result['entryDiagnostics']['rejectionStage'], 'final-native-price-guard')
+        self.assertIs(result['entryDiagnostics']['fixedEdgeQuoteRefusal'], True)
+        self.assertIs(result['finalPreMutationRejection'], True)
+        invalid_edge = dict(self.payload, id='invalid-edge', price=25005.99)
+        result = self.bridge.execute('place', invalid_edge, None, True)['result']
+        self.assertIs(result['entryDiagnostics']['fixedEdgeQuoteRefusal'], False)
         self.assertEqual(len(self.mt5.sent), 1)
 
     def test_isolated_expiry_and_final_identity_still_block_submission(self):

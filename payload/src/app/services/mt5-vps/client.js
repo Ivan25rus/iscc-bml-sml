@@ -14,6 +14,11 @@ const {isIndependentEntryControl}=require('./commandJournal');
 
 const INDEX_SYMBOLS = new Set(['SPX', 'SPX500', 'USTEC']);
 const MAX_QUOTE_CAPTURE_AGE_MS = 1500;
+const EXECUTION_WARM_INTERVAL_MS = 10000;
+const EXECUTION_WARM_RETRY_MS = 2000;
+function countExecutionSockets(sockets) {
+  return Object.values(sockets || {}).flat().filter(socket => !socket.destroyed && socket.readable && socket.writable).length;
+}
 function isIndex(symbol) { return INDEX_SYMBOLS.has(String(symbol || '').toUpperCase().split(':').pop()); }
 function validBidAsk(quote) {
   return Number.isFinite(quote?.bid) && quote.bid > 0 && Number.isFinite(quote.ask) && quote.ask >= quote.bid;
@@ -183,6 +188,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     const started = Date.now(), startedPerf = performance.now();
     const timing = {startedAt:started};
     const entryArm=execution && body && ['/entry-plan','/entry-plan-admit'].includes(pathname);
+    const transportProbe=execution && !body && pathname==='/entry-readiness';
     return new Promise((resolve, reject) => {
       let deadline,readTimer,request,readFinished=false,writeStarted=false;
       const traceRead=!body && ['/health','/management','/snapshot','/orders','/diagnostics','/minute-bars'].includes(pathname);
@@ -201,7 +207,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
       const fail=(error,failure)=>{
         if(readFinished)return;
         finishRead(false,failure || (/^[A-Z_0-9]{1,40}$/.test(error.code || '') ? error.code : 'response'));
-        if(pathname!=='/minute-bars' || body)this.lastStatus={connected:false,message:error.message,at:Date.now()};
+        if(!transportProbe && (pathname!=='/minute-bars' || body))this.lastStatus={connected:false,message:error.message,at:Date.now()};
         // A broken reply settles once. The caller retains any uncertain trade
         // result; neither transport cleanup nor status polling resends it.
         if(request && !request.destroyed)request.destroy(error);
@@ -246,7 +252,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
                 && result.linkedAccounts.every(account=>/^[1-9][0-9]{0,19}$/.test(String(account)))) {
               this.remoteAccounts=result.linkedAccounts.map(String);
             }
-            this.lastStatus = { connected: true, message: `MT5 VPS · ${result.account} · ${Date.now()-started} мс${result.tradingEnabled === false ? ' · только чтение' : ''}`, at:Date.now() };
+            if(!transportProbe)this.lastStatus = { connected: true, message: `MT5 VPS · ${result.account} · ${Date.now()-started} мс${result.tradingEnabled === false ? ' · только чтение' : ''}`, at:Date.now() };
             timing.totalMs = Number((performance.now()-startedPerf).toFixed(2));
             Object.defineProperty(result,'transportTiming',{value:timing,enumerable:false});
             finishRead(true);
@@ -335,6 +341,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     const cfg = this.config;
     if (this.closed || this.streamRequest || this.streamTimer || !cfg.enabled || !cfg.endpoint || !cfg.token || !cfg.caFile) return;
     let request, freshnessTimer, freshnessDue, backlogTimer, loopTimer, frameReader, reason='connection-closed', accepted=false, discarding=false;
+    const backlogGrowing = require('./quoteContinuity').createQuoteBacklogDetector();
     const fail=(code,error)=>{frameReader?.close();if (!request?.destroyed) {reason=code;request?.destroy(error);}};
     const checkFreshness=()=>{
       freshnessTimer=null;
@@ -374,16 +381,22 @@ class MT5VPSAdapter extends ExecutionAdapter {
                   {...arrival,publishedAt:frame.publishedAt,writeStartedAt:frame.writeStartedAt,quoteTiming:frame.quoteTiming,frameWorkMs:performance.now()-workStarted});
                 this.eventBus.emit('quote:timing',timing);
                 if (timing.arrivalGapMs>=750 || timing.captureGapMs>=750) this.recordQuoteStream('frame-gap','capture-vs-arrival',timing);
-                // Authenticated expired frames prove this stream is still alive.
-                // Let its queue drain instead of adding another TLS handshake.
-                // They never refresh a quote or renew any trading deadline.
+                const reconnect = backlogGrowing(timing);
+                // Allow small bursts to drain. Growing delivery latency on
+                // consecutive gaps can leave newer quotes stuck in this socket.
                 watchFreshness();
                 if (!usable) {
+                  this.streamDiagnostics.discardedFrames++;
+                  if (reconnect && performance.now() >= (this.streamBacklogRetryAfter || 0)) {
+                    this.streamBacklogRetryAfter = performance.now() + 30_000;
+                    this.recordQuoteStream('delayed','stale-backlog-growing',timing);
+                    fail('stale-backlog-growing',Error('Quote stream delivery delays are growing'));
+                    return;
+                  }
                   if (!backlogTimer) {
                     backlogTimer=setTimeout(()=>fail('stale-backlog-timeout',Error('Quote backlog did not recover')),15000);
                     backlogTimer.unref?.();
                   }
-                  this.streamDiagnostics.discardedFrames++;
                   if (!discarding) this.recordQuoteStream('delayed','expired-frame',timing);
                   discarding=true;
                   return;
@@ -504,12 +517,18 @@ class MT5VPSAdapter extends ExecutionAdapter {
     if (!row) throw Error('Позиция или заявка уже отсутствует. Обнови список.');
     return {...row}; // Only the server snapshot supplies routing and current volume.
   }
-  async maintainExecutionWarmth() {
-    if (this.closed || (!this.managementHasPositions && Date.now()>=this.managementLeaseUntil)) return;
-    if (this.executionWarmAt && Date.now()-this.executionWarmAt<10000) return;
-    if (this.executionWarmAttemptAt && Date.now()-this.executionWarmAttemptAt<2000) return;
-    this.executionWarmAttemptAt = Date.now();
-    await this.warmExecutionConnection();
+  async maintainExecutionWarmth({keepReady=false}={}) {
+    const now = Date.now();
+    if (this.closed || this.connectionRestarting || (!keepReady && !this.managementHasPositions && now>=this.managementLeaseUntil)) return;
+    const agent = this.agents?.execution;
+    // During dispatch leave every idle socket available for trading controls.
+    if (keepReady && countExecutionSockets(agent?.sockets)) return;
+    const lostSocket = keepReady && countExecutionSockets(agent?.freeSockets)<2;
+    if (!lostSocket && this.executionWarmAt && now-this.executionWarmAt<EXECUTION_WARM_INTERVAL_MS) return;
+    if (this.executionWarmAttemptAt && now-this.executionWarmAttemptAt<EXECUTION_WARM_RETRY_MS) return;
+    this.executionWarmAttemptAt = now;
+    if (keepReady) await this.warmExecutionSockets({lightweight:true});
+    else await this.warmExecutionConnection();
   }
   async managementState({maxAgeMs=5000,watch,allowPartial=false,readTimeoutMs}={}) {
     // Ticket histories are requested only for the captured opening group.
@@ -555,15 +574,29 @@ class MT5VPSAdapter extends ExecutionAdapter {
     if (!this.managementSnapshot || age<0 || age>5000) await this.managementState({maxAgeMs:0});
     return JSON.parse(JSON.stringify(this.managementSnapshot.rows));
   }
-  async warmExecutionConnection() {
-    if (this.closed) return;
-    if (this.warming) return this.warming;
-    // Prime two sockets before allowing the first click. Later heartbeats use
-    // FIFO rotation: one socket is checked while the other remains available.
-    const hasPair = this.executionPairPrimed && Date.now()-this.executionWarmAt < 20000;
-    this.warming = (async () => {
+  async warmExecutionSockets({lightweight=false}={}) {
+    if (this.closed || this.connectionRestarting) return;
+    if (this.executionSocketsWarming) return this.executionSocketsWarming;
+    const hasPair = countExecutionSockets(this.agents?.execution?.freeSockets)>=2;
+    // Independent account engines answer readiness from coordinator memory.
+    // Legacy receivers and explicit preparation retain their health check.
+    const route = lightweight && !this.config.routePrefix && this.capabilities.includes('independent-account-engines-v5')
+      ? '/entry-readiness' : '/health';
+    this.executionSocketsWarming = (async () => {
+      // FIFO rotates the two idle sockets. Keep one free during each heartbeat.
       const results = await Promise.all(Array.from({length:hasPair ? 1 : 2},
-        () => this.request('/health',undefined,{execution:true})));
+        () => this.request(route,undefined,{execution:true})));
+      if (this.closed) return;
+      this.executionWarmAt = Date.now();
+      return results[0];
+    })().finally(() => { this.executionSocketsWarming=null; });
+    return this.executionSocketsWarming;
+  }
+  async warmExecutionConnection() {
+    if (this.closed || this.connectionRestarting) return;
+    if (this.warming) return this.warming;
+    this.warming = (async () => {
+      const result = await this.warmExecutionSockets();
       if (this.closed) return;
       if (this.config.mirrorAccount) {
         const cfg = this.config;
@@ -572,9 +605,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
         await this.linkedWarmConnection.request('/health');
       }
       if (this.quoteFast) await this.syncQuoteMode();
-      this.executionPairPrimed = true;
-      this.executionWarmAt = Date.now();
-      return results[0];
+      return result;
     })().finally(() => { this.warming=null; });
     return this.warming;
   }

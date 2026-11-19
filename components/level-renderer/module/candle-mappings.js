@@ -22,12 +22,15 @@ function mappings(config = {}) {
     if (!/^[A-Z0-9_.-]+:[A-Z0-9_.!#&+\/()-]+$/.test(sourceSymbol) || sourceSymbol.length > 160)
       throw Error(`Пара ${index + 1}: нужен полный символ ТВ, например CAPITALCOM:NAS100`);
     brokerName(mt5Symbol);
+    const standardSpread = row.standardSpread ?? 0;
+    if (!Number.isFinite(standardSpread) || standardSpread < 0 || standardSpread > Number.MAX_SAFE_INTEGER)
+      throw Error(`Пара ${index + 1}: укажите стандартный спред в пунктах или 0`);
     const sourceLayout = row.sourceLayout ?? '';
     if (typeof sourceLayout !== 'string' || (sourceLayout && !/^[A-Za-z0-9_-]{1,128}$/.test(sourceLayout)))
       throw Error(`Пара ${index + 1}: некорректный ID исходного графика ТВ`);
     if (row.enabled && seen.has(sourceSymbol)) throw Error(`Для ${sourceSymbol} включено несколько назначений MT5`);
     if (row.enabled) seen.add(sourceSymbol);
-    return { enabled: row.enabled, sourceSymbol, mt5Symbol, ...(sourceLayout ? { sourceLayout } : {}) };
+    return { enabled: row.enabled, sourceSymbol, mt5Symbol, ...(sourceLayout ? { sourceLayout } : {}), ...(standardSpread > 0 ? { standardSpread } : {}) };
   });
 }
 

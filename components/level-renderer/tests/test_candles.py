@@ -79,6 +79,7 @@ class CandleTests(unittest.TestCase):
         self.ack(state)
         self.assertEqual(self.book.state()['levels'][0]['status'], 'ready')
 
+
     def test_status_uses_one_snapshot_for_both_file_and_ack_without_caching_readiness(self):
         pending=self.book.apply(self.payload)
         self.ack(pending)

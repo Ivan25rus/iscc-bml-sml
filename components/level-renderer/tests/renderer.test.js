@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('events');
 const { PassThrough } = require('stream');
+const { pathToFileURL } = require('url');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -9,6 +10,8 @@ const { readOnlyAdapter, StdioAdapter } = require('../module/transport');
 const { chart, localDebugger } = require('../module/reader');
 const { startReader } = require('../module/reader');
 const { attach } = require('../module');
+const { relayWarnings, READ_WARNINGS, WARNINGS_CHANGED } = require('../module/warnings-ipc');
+const { mountWarnings } = require('../module/warnings-ui');
 
 test('existing adapter facade exposes candle requests without trading methods', async () => {
   const calls = [];
@@ -75,6 +78,7 @@ test('stdio never constructs a shell command from downloaded plan data', () => {
 test('shipped settings start disabled with no recipient mappings or commands', () => {
   const config = require('../module/config/candle-renderer.json');
   assert.equal(config.enabled, false);
+  assert.equal(config.warnOnLevelDifference, false);
   assert.deepEqual(config.mappings, []);
   assert.deepEqual(config.readerCommand, []);
   assert.deepEqual(require('../module/candle-mappings').sourceMap(), {});
@@ -108,7 +112,7 @@ test('source state corruption is preserved instead of silently clearing saved le
 
 function readerHarness(overrides={}) {
   const timers = new Map(), expressions = [], snapshots = [], errors = [];
-  let sequence = 0;
+  let sequence = 0, now = 1700000000000;
   const reader = startReader({ enabled: () => true, sources: () => [], anchors: () => [],
     acceptSnapshot: value => snapshots.push(value), onError: error => errors.push(error.message),
     getTargets: async () => [{id:'one',webSocketDebuggerUrl:'ws://127.0.0.1:9222/devtools/page/one'}],
@@ -116,10 +120,11 @@ function readerHarness(overrides={}) {
       expressions.push(expression);
       return expressions.length===1 ? {sources:[],series:[],token:'one:1'} : {unchanged:true,token:'one:1'};
     },
+    clock: () => now,
     setTimer(fn,delay) { const id=++sequence;timers.set(id,{fn,delay});return id; },
     clearTimer(id) { timers.delete(id); },...overrides });
   return {reader,expressions,snapshots,errors,timers,async next(){
-    const [id,timer]=timers.entries().next().value;timers.delete(id);await timer.fn();
+    const [id,timer]=timers.entries().next().value;timers.delete(id);now+=timer.delay;await timer.fn();
   }};
 }
 
@@ -221,4 +226,141 @@ test('missing old candle history uses a bounded separate query and a refresh req
   try{await fixture.next();assert.equal(snapshots.length,2);assert.equal(snapshots[1].series[0].interval,'D1');
     assert.equal([...fixture.timers.values()][0].delay,250);
   }finally{fixture.reader.stop();}
+});
+
+const target = (id, scope = id) => ({ id, url: `https://tradingview.com/chart/${scope}/`,
+  webSocketDebuggerUrl: `ws://127.0.0.1:9222/devtools/page/${id}` });
+
+test('fast rereads one configured tab per layout and preserve full inventory cadence', async () => {
+  const symbol = 'SYNTH:INDEX', inventory = { scope: 'work', complete: true, symbols: [] };
+  const reads = [], inventories = [];
+  let discoveries = 0;
+  const fixture = readerHarness({
+    sourceLayouts: () => ({ [symbol]: 'work' }), sources: () => [symbol],
+    getTargets: async () => { discoveries++; return [target('other'), target('first', 'work'), target('second', 'work')]; },
+    acceptInventory: value => inventories.push(value),
+    run: async (url, expression, options) => {
+      reads.push({ url, expression, timeout: options.timeoutMs });
+      const token = options.timeoutMs ? 'fast:1' : 'full:1';
+      if (expression.includes(`"ack":"${token}"`)) return { unchanged: true, token };
+      return { sources: [], series: [], inventory, token };
+    }
+  });
+  try {
+    await fixture.next();
+    assert.equal(discoveries, 1);
+    assert.equal(reads.length, 3);
+    assert.equal([...fixture.timers.values()][0].delay, 2000);
+    for (let i = 0; i < 4; i++) await fixture.next();
+    assert.equal(discoveries, 1);
+    const fastReads = reads.filter(read => read.timeout);
+    assert.equal(fastReads.length, 4);
+    assert.ok(fastReads.every(read => read.url.endsWith('/second') && read.timeout === 1000
+      && read.expression.includes('"sourceOnly":true')));
+    assert.deepEqual(fixture.snapshots.at(-1), { sources: [], series: [], inventory: { scope: 'work' }, sourceOnly: true });
+    assert.equal(inventories.length, 0);
+    await fixture.next();
+    assert.equal(discoveries, 2);
+    assert.equal(inventories.length, 3);
+  } finally { fixture.reader.stop(); }
+});
+
+test('a moved or newly unassigned fast tab contributes no drawings', async () => {
+  const symbol = 'SYNTH:INDEX';
+  let layout = 'work', discoveries = 0, fastReads = 0;
+  const fixture = readerHarness({
+    sourceLayouts: () => ({ [symbol]: layout }), sources: () => [symbol],
+    getTargets: async () => { discoveries++; return [target('page', 'work')]; },
+    run: async (_url, expression, options) => {
+      if (options.timeoutMs && ++fastReads === 1) layout = 'new';
+      if (options.timeoutMs && fastReads === 2) {
+        assert.ok(expression.includes("here.pathname.split('/')[2]"));
+        return { moved: true };
+      }
+      return { sources: [], series: [], token: 'read:1', inventory: { scope: 'work', complete: true, symbols: [] } };
+    }
+  });
+  try {
+    await fixture.next();
+    await fixture.next();
+    assert.equal(fixture.snapshots.length, 1);
+    layout = 'work';
+    await fixture.next();
+    assert.equal(fixture.snapshots.length, 1);
+    assert.equal(fastReads, 2);
+    assert.equal([...fixture.timers.values()][0].delay, 6000);
+    await fixture.next();
+    assert.equal(discoveries, 2);
+  } finally { fixture.reader.stop(); }
+});
+
+test('warning IPC serves only the main local panel and sends changes once', () => {
+  let handler, removed;
+  const changes = [];
+  const ipcMain = { handle(channel, cb) { assert.equal(channel, READ_WARNINGS); handler = cb; },
+    removeHandler(channel) { removed = channel; } };
+  const url = pathToFileURL(path.resolve(__dirname, '../../index.html')).href;
+  const mainFrame = { url };
+  const sender = { mainFrame, isDestroyed: () => false, getURL: () => mainFrame.url,
+    send: (...args) => changes.push(args) };
+  let state = { enabled: false, active: [], history: [] };
+  const relay = relayWarnings(ipcMain, () => state);
+  assert.equal(handler({ sender, senderFrame: { url } }), null);
+  assert.deepEqual(handler({ sender, senderFrame: mainFrame }), state);
+  relay.publish();
+  assert.equal(changes.length, 0);
+  state = { ...state, enabled: true };
+  relay.publish();
+  relay.publish();
+  assert.deepEqual(changes, [[WARNINGS_CHANGED, state]]);
+  mainFrame.url = 'https://www.tradingview.com/chart/example/';
+  assert.equal(handler({ sender, senderFrame: mainFrame }), null);
+  state = { ...state, enabled: false };
+  relay.publish();
+  assert.equal(changes.length, 1);
+  relay.stop();
+  assert.equal(removed, READ_WARNINGS);
+});
+
+test('warning UI offers redrawing, permits dismissing and keeps local history available', async () => {
+  class Element {
+    constructor() { this.children = []; this.events = {}; this.attributes = {}; }
+    append(...nodes) { this.children.push(...nodes); }
+    appendChild(node) { this.append(node); }
+    setAttribute(key, value) { this.attributes[key] = value; }
+    replaceChildren(...nodes) { this.children = nodes; }
+    addEventListener(event, cb) { this.events[event] = cb; }
+  }
+  const toolbar = new Element(), head = new Element(), body = new Element();
+  const document = { head, body, getElementById: () => ({ parentElement: toolbar }), createElement: () => new Element() };
+  const ipcRenderer = new EventEmitter();
+  ipcRenderer.invoke = async () => ({ enabled: false, active: [], history: [] });
+  let now = 1700000000000, timer;
+  mountWarnings({ document, ipcRenderer, clock: () => now,
+    setTimer(fn, delay) { timer = { fn, delay }; return timer; },
+    clearTimer(handle) { if (handle === timer) timer = undefined; } });
+  await Promise.resolve();
+  const [toggle] = toolbar.children, [history, toast] = body.children;
+  assert.equal(toggle.hidden, true);
+  const row = { id: 'warning', symbol: 'SYNTH_INDEX', referencePrice: 100, mappedPrice: 105, threshold: 2 };
+  const state = { enabled: true, active: [{ ...row, expiresAt: now + 30000 }], history: [{ ...row, at: now }] };
+  ipcRenderer.emit(WARNINGS_CHANGED, {}, state);
+  assert.equal(toggle.hidden, false);
+  assert.equal(toast.hidden, false);
+  assert.match(toast.children[0].children[0].textContent, /перерисуйте уровень/);
+  assert.match(toast.children[1].textContent, /ТВ 100 → MT5 105/);
+  assert.equal(timer.delay, 30000);
+  toast.children[0].children[1].events.click();
+  assert.equal(toast.hidden, true);
+  assert.equal(timer, undefined);
+  toggle.events.click();
+  assert.equal(history.hidden, false);
+  assert.match(history.children[1].children[0].textContent, /ТВ 100 → MT5 105/);
+  const later = { ...row, id: 'later', expiresAt: now + 2000 };
+  ipcRenderer.emit(WARNINGS_CHANGED, {}, { ...state, active: [later] });
+  assert.equal(toast.hidden, false);
+  now += 2000;
+  timer.fn();
+  assert.equal(toast.hidden, true);
+  assert.equal(history.hidden, false);
 });

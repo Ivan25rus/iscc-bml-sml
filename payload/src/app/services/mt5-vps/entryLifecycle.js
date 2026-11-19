@@ -1,6 +1,7 @@
 // Read-only position lifecycle for captured entry tickets. A missing plan or
 // order is never proof of a close; only the broker's balanced exit history is.
 const TERMINAL=new Set(['completed','stopped']);
+const ACTIVE=new Set(['armed','running','paused','sending']);
 const LIFECYCLE_VERSIONS=new Set([34,35,36,37,38,39]);
 const HYBRID_LIFECYCLE_VERSIONS=new Set([35,36,37,38,39]);
 const HYBRID_POLICY='hybrid-market-limit-v1';
@@ -434,6 +435,9 @@ async function reconcileEntries(adapter,entries,visible=rows=>rows,preferredId,d
       candidate=known.get(restored.id) || restored;
       if(candidate.positionLifecycle==='closed')retainClosedDisplay(adapter,candidate);
       if(restored!==response?.entry || candidate.positionLifecycle==='closed')return [...known.values()];
+      // The compact list can lag the exact plan during admission or quote
+      // wait. Its omission is not evidence that the active plan ended.
+      if(ACTIVE.has(candidate.phase))return [...known.values()];
       if(!TERMINAL.has(candidate.phase) && !settledLifecycle(candidate))throw Error('Точный журнал ещё не подтвердил окончание набора');
       if(unfilledEntryCanReset(candidate))return [...known.values()];
     }

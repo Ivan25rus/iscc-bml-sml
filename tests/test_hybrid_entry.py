@@ -327,6 +327,45 @@ class PercentageHybridTests(unittest.TestCase):
             self.assert_common_stop(bridge)
             self.assertTrue(all(abs(row['sl']-88.8) < 1e-8 for row in bridge.rows))
 
+    def test_inconsistent_limit_volume_has_one_exact_reread(self):
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                self.single_account()
+                self.buy_partial_then_outer_limit()
+                broker = self.primary
+                account = str(broker.login.login)
+                sent = copy.deepcopy(broker.sent)
+                cancelled = copy.deepcopy(broker.cancelled)
+                stale_pending = copy.deepcopy(next(row for row in broker.rows if not row['__isPosition']))
+                _, payload, state = self.engine._load(self.payload['id'])
+                child = next(row for row in state['children'] if row['state'] == 'pending')
+                broker.fill_limit(.7)
+                read = broker.entry_limit_state
+                reads = []
+
+                def read_during_fill(ticket, symbol):
+                    reads.append((ticket, symbol))
+                    view = read(ticket, symbol)
+                    if persistent or len(reads) == 1:
+                        view['pending'] = [stale_pending]
+                    return view
+
+                broker.entry_limit_state = read_during_fill
+                if persistent:
+                    with self.assertRaisesRegex(ValueError, 'exceeds its reservation'):
+                        self.engine._hybrid_limit(payload, state, child)
+                    self.assertEqual(state['accounts'][account]['filledVolume'], .3)
+                else:
+                    self.assertFalse(self.engine._hybrid_limit(payload, state, child))
+                    self.assertEqual(state['accounts'][account]['filledVolume'], 1.)
+                self.assertEqual(reads, [(stale_pending['ticket'], 'USTEC')] * 2)
+                self.assertEqual(broker.sent, sent)
+                self.assertEqual(broker.cancelled, cancelled)
+                if not persistent:
+                    self.tick()
+                    self.assertEqual(self.state()['phase'], 'completed')
+                    self.assert_common_stop(broker)
+
     def test_buy_return_from_above_play_cancels_outer_before_remaining_market(self):
         self.buy_partial_then_outer_limit()
         for bridge in self.bridges():

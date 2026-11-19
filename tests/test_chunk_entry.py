@@ -566,6 +566,10 @@ class ChunkEntryTests(unittest.TestCase):
         self.assertLessEqual(len(records), 30)
         self.assertLessEqual(len(json.dumps(records, separators=(',', ':')).encode()), 512 * 1024)
         self.assertLess(len(records), 30)  # The byte budget also bounds large histories.
+        active = self.engine.list(active_only=True)
+        self.assertEqual(active, records[:4])
+        active[0]['children'].clear()
+        self.assertTrue(self.engine.list(active_only=True)[0]['children'])
 
     def test_all_four_active_seventeen_account_plans_fit_maximum_public_allowance(self):
         for index in range(4):

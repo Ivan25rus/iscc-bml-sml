@@ -46,7 +46,7 @@ class EntryPriceFastRetryTests(unittest.TestCase):
         with patch('chunk_entry.time.time',return_value=1.300):
             self.assertFalse(ChunkEntries._parallel_retry_ready(state,'900000001','market',[25000,25000.2],.2))
 
-    def batch(self,result):
+    def batch(self,result,kind='market',**settings):
         engine=object.__new__(ChunkEntries);engine.entry_clocks={}
         engine._priority_volume=lambda payload,state,account,kind,price,volume,reserved:volume
         engine._hybrid_guards=lambda *args,**kwargs:{}
@@ -56,8 +56,9 @@ class EntryPriceFastRetryTests(unittest.TestCase):
         engine._limit_results=lambda state,child:{'900000001':result}
         state=dict(id='entry',phase='running',accounts={'900000001':{}},children=[])
         payload=dict(symbol='USTEC',side='buy',initialSizingOnly=True)
-        engine._parallel_batch(payload,state,'market',{'900000001':(25000.2,.2,25000,25000.2,0)})
-        return state['accounts']['900000001'].get('priceRejections',{}).get('market',{})
+        payload.update(settings)
+        engine._parallel_batch(payload,state,kind,{'900000001':(25000.2,.2,25000,25000.2,0)})
+        return state['accounts']['900000001'].get('priceRejections',{}).get(kind,{})
 
     def proof(self):
         return dict(status='rejected',entryDiagnostics=dict(account='900000001',symbol='USTEC',side='buy',kind='market',
@@ -78,6 +79,72 @@ class EntryPriceFastRetryTests(unittest.TestCase):
     def test_unknown_outcome_cannot_create_a_fast_retry_marker(self):
         row=self.proof();row['status']='unknown'
         with self.assertRaisesRegex(ValueError,'unknown'):self.batch(row)
+
+    def test_stale_refusal_retries_both_order_types_on_a_new_fresh_tick(self):
+        for kind in ('market', 'limit'):
+            with self.subTest(kind=kind):
+                row = self.proof()
+                row.update(finalPreMutationRejection=True, mutationStarted=False)
+                row['entryDiagnostics'].update(kind=kind, tickUtcMs=8900, checkedAtMs=10000,
+                    rejectionStage='native-entry-stale-quote-guard')
+                with patch('chunk_entry.time.time', return_value=10):
+                    rejection = self.batch(row, kind)
+                self.assertTrue(rejection['fastQuoteProof']['requireNewTick'])
+                details = dict(priceRejections={kind: rejection})
+                state = dict(accounts={'900000001': details})
+                for captured, tick, expected in ((10000, 10000, False), (10010, 8900, False),
+                        (10010, 9000, False), (10010, 10001, True)):
+                    details['latestQuoteProof'] = dict(capturedAtMs=captured, tickUtcMs=tick)
+                    with patch('chunk_entry.time.time', return_value=10.02):
+                        ready = ChunkEntries._parallel_retry_ready(state, '900000001', kind, [25001, 25001.2], .2)
+                    self.assertIs(ready, expected)
+                with patch('chunk_entry.time.time', return_value=11.01):
+                    self.assertFalse(ChunkEntries._parallel_retry_ready(state, '900000001', kind, [25001, 25001.2], .2))
+                row['finalPreMutationRejection'] = False
+                self.assertNotIn('fastQuoteProof', self.batch(row, kind))
+
+    def test_fixed_edge_retries_on_the_first_usable_new_tick_in_both_directions(self):
+        for side, inside, near, ready in (
+                ('buy', [25005.7,25005.9], [25005.85,25006.05], [25005.91,25006.11]),
+                ('sell', [25006.1,25006.3], [25005.95,25006.15], [25005.89,25006.09])):
+            with self.subTest(side=side), patch('chunk_entry.time.time', return_value=10):
+                row=dict(status='rejected', finalPreMutationRejection=True, mutationStarted=False,
+                    entryDiagnostics=dict(account='900000001',symbol='USTEC',side=side,kind='limit',
+                        bid=inside[0],ask=inside[1],tickUtcMs=9990,checkedAtMs=10000,
+                        submittedPrice=25006., minimumDistance=.1, fixedEdgeQuoteRefusal=True,
+                        rejectionStage='final-native-price-guard',mutationStarted=False))
+                rejection=self.batch(row,'limit',side=side,entryMarketFirst=True)
+                self.assertIn('fastQuoteProof',rejection)
+                self.assertNotIn('fastQuoteProof',self.batch(row,'limit',side=side))
+                state=dict(initialSizingOnly=True,accounts={'900000001':dict(priceRejections={'limit':rejection})})
+                cases=((10060,10059,inside,False), (10060,10059,near,False),
+                       (10000,10059,ready,False), (10060,9990,ready,False), (10060,10059,ready,True))
+                with patch('chunk_entry.time.time', return_value=10.060):
+                    for capture,tick,quote,expected in cases:
+                        state['accounts']['900000001']['latestQuoteProof']=dict(capturedAtMs=capture,tickUtcMs=tick)
+                        self.assertIs(ChunkEntries._parallel_retry_ready(state,'900000001','limit',quote,.2),expected)
+                for change in (dict(fixedEdgeQuoteRefusal=False), dict(minimumDistance=float('nan')),
+                               dict(account='900000002'),dict(kind='market')):
+                    invalid=dict(row,entryDiagnostics=dict(row['entryDiagnostics'],**change))
+                    self.assertNotIn('fastQuoteProof',self.batch(invalid,'limit',side=side,entryMarketFirst=True))
+                throttled=dict(row,retcode=10024)
+                self.assertNotIn('fastQuoteProof',self.batch(throttled,'limit',side=side,entryMarketFirst=True))
+                for now, quote, expected in ((10.3,near,False), (10.7,near,False),
+                                             (10.7,ready,True), (11.01,near,True)):
+                    details=state['accounts']['900000001']
+                    details['latestQuoteProof']=dict(capturedAtMs=now*1000,tickUtcMs=now*1000-3)
+                    with patch('chunk_entry.time.time',return_value=now):
+                        self.assertIs(ChunkEntries._parallel_retry_ready(state,'900000001','limit',quote,.2),expected)
+
+    def test_native_stale_quote_records_exact_proof_without_sending(self):
+        fixture=native_fixture.ChunkGuardTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
+        fixture.mt5.tick.time = fixture.payload['expiresAt']/1000-5
+        result=fixture.bridge.execute('place',fixture.payload,None,True)['result']
+        self.assertIs(result['finalPreMutationRejection'], True)
+        self.assertEqual(result['entryDiagnostics']['rejectionStage'], 'native-entry-stale-quote-guard')
+        self.assertEqual(result['entryDiagnostics']['tickUtcMs'], fixture.mt5.tick.time*1000)
+        self.assertEqual(fixture.mt5.sent, [])
+        self.assertEqual(fixture.bridge.receipt(fixture.payload['id'])['result'], result)
 
     def test_native_final_price_race_records_proof_and_sends_nothing(self):
         fixture=native_fixture.ChunkGuardTests();fixture.setUp();self.addCleanup(fixture.doCleanups)

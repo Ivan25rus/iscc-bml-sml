@@ -1,6 +1,7 @@
 // UI drafts only: no level, order identity, execution state or trading command.
 const fs=require('fs');
 const path=require('path');
+const {TRADING_SYMBOLS}=require('./tradingSymbols');
 const FIELDS=['risk','stopOffsetPts','maxLot','takeProfitPts','pointSize','zoneMultiplier'];
 function clean(value) {
   const result={};
@@ -14,7 +15,7 @@ function createDraftStore(directory, onSaved = () => {}) {
   const file=path.join(directory,'index-card-drafts.json');let values={},timer,dirty=false;
   try {if(fs.statSync(file).size<=4096) {
     const saved=JSON.parse(fs.readFileSync(file,'utf8'));
-    values=Object.fromEntries(['USTEC','SPX500'].map(ticker=>[ticker,clean(saved?.[ticker])]));
+    values=Object.fromEntries(TRADING_SYMBOLS.map(ticker=>[ticker,clean(saved?.[ticker])]));
   }}catch { /* New or invalid drafts use normal defaults. */ }
   function flush() {
     clearTimeout(timer);timer=null;
@@ -26,9 +27,9 @@ function createDraftStore(directory, onSaved = () => {}) {
     }catch { /* Draft failure cannot change execution. */ }
     if (!dirty) onSaved();
   }
-  return {get:ticker=>['USTEC','SPX500'].includes(ticker) ? clean(values[ticker]) : {},flush,
+  return {get:ticker=>TRADING_SYMBOLS.includes(ticker) ? clean(values[ticker]) : {},flush,
     set(ticker,value) {
-      if(!['USTEC','SPX500'].includes(ticker))return;
+      if(!TRADING_SYMBOLS.includes(ticker))return;
       const next=clean(value);if(JSON.stringify(clean(values[ticker]))===JSON.stringify(next))return;
       values[ticker]=next;dirty=true;clearTimeout(timer);timer=setTimeout(flush,150);
     }};

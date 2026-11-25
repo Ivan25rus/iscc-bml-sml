@@ -187,6 +187,7 @@ class BridgeTests(unittest.TestCase):
         self.bridge.group_execute('place',payload)
         self.assertEqual([len(terminal.sent) for terminal in (self.mt5,secondary,third_mt5)],[1,1,1])
 
+
     def test_percent_price_close_uses_each_actual_volume_survives_restart_and_fires_once(self):
         second,secondary=self.linked_bridge(); third,third_mt5=self.linked_bridge(152657)
         self.mt5.result.order=71

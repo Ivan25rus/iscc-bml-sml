@@ -51,12 +51,14 @@ class ChunkGuardTests(unittest.TestCase):
         calls = []
 
         def after_claim(name, read):
-            def checked(*args):
+            def checked(*args, **kwargs):
                 calls.append(name)
+                if name == 'positions_get':
+                    self.assertEqual(kwargs, {'symbol': self.payload['symbol']})
                 with closing(sqlite3.connect(pathlib.Path(self.temp.name)/'db.sqlite')) as ledger:
                     row = ledger.execute('SELECT result FROM requests WHERE id=?', (self.payload['id'],)).fetchone()
                 self.assertEqual(json.loads(row[0])['status'], 'unknown')
-                return read(*args)
+                return read(*args, **kwargs)
             return checked
 
         for name in methods:

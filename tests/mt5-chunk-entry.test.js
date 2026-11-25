@@ -13,6 +13,43 @@ const config={enabled:true,account:'900000002',server:'Example-MT5',spxSymbol:'S
 const plan={ticker:'USTEC',orderSide:'buy',referencePrice:30002,stopPrice:29990,takeProfitPts:2400,tickSize:.01,
   totalQty:1,chunkVolume:.2,maxGap:2,riskUsd:12.5,level:30000,stopMode:'level',stopOffsetPts:1000};
 
+test('Removing the primary captures only the selected trading accounts and requires the new VPS capability',()=>{
+  const adapter=new MT5VPSAdapter({...config,primaryTradingEnabled:false,accountChunkPercents:{900000002:35,900000001:100}});
+  const hybrid={...plan,referencePrice:plan.level,entryMode:'side-zone',zoneRadius:6,zoneMultiplier:1,
+    executionPolicy:'hybrid-market-limit-v1',chunkPercent:20};
+  adapter.capabilities=['atomic-entry-admission-v1','independent-account-engines-v5','entry-initial-sizing-only-v1','entry-account-chunk-percent-v1'];
+  assert.throws(()=>buildEntryRequest(adapter,hybrid),/обнови VPS/);
+  adapter.capabilities.push('entry-followers-only-v1');
+  const request=buildEntryRequest(adapter,hybrid);
+  assert.equal(request.excludePrimary,true);
+  assert.ok(request.requiredCapabilities.includes('entry-followers-only-v1'));
+  assert.deepEqual(request.mirrorAccounts,[{account:'900000001',multiplier:.7}]);
+  assert.deepEqual(request.accountChunkPercents,{900000001:100});
+  adapter.config.followers=[];
+  assert.throws(()=>buildEntryRequest(adapter,hybrid),/выключены все торговые счета/);
+  adapter.close();
+});
+
+test('Direct orders use a distinct followers-only route with no fallback to the primary',async()=>{
+  const adapter=new MT5VPSAdapter({...config,primaryTradingEnabled:false});
+  const calls=[];
+  adapter.request=async(route,payload)=>{
+    calls.push({route,payload});
+    return {result:{status:'ok',accountResults:{900000001:{status:'ok'}}}};
+  };
+  const order={symbol:'USTEC',side:'buy',type:'limit',qty:1,price:30000,sl:1000,tp:2400,tickSize:.01};
+  assert.equal((await adapter.placeOrder(order)).status,'rejected');
+  assert.deepEqual(calls,[]);
+  adapter.capabilities=['entry-followers-only-v1','scaled-accounts','time-exit'];
+  assert.equal((await adapter.placeOrder(order)).status,'ok');
+  assert.equal(calls[0].route,'/place-followers');
+  assert.deepEqual(calls[0].payload.mirrorAccounts,[{account:'900000001',multiplier:.7}]);
+  adapter.config.primaryTradingEnabled=true;
+  assert.equal((await adapter.placeOrder(order)).status,'ok');
+  assert.equal(calls[1].route,'/place');
+  adapter.close();
+});
+
 test('Fill priority resolves per instrument and is captured with a required receiver capability',()=>{
   const {resolveLevelOrderDefaults}=require('../payload/src/app/services/levelOrder/strategy');
   const settings={defaults:{fillPriority:'risk'},symbols:[{ticker:'SPX500',fillPriority:'volume'}]};

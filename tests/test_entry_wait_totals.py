@@ -6,10 +6,31 @@ import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]/'payload/vps'))
-from entry_wait_totals import EntryWaitTotals, record_common_stop_timing
+from entry_wait_totals import (EntryWaitTotals, entry_timing_summary, record_broker_position_open,
+                               record_common_stop_timing, record_entry_fill, record_entry_send)
 
 
 class EntryWaitTotalsTests(unittest.TestCase):
+    def test_submissions_fills_and_stop_keep_distinct_timestamps(self):
+        account = dict(filledVolume=.3, targetVolume=.8)
+        record_entry_send(account, 'market', dict(status='rejected', timings={'server': {'totalMs': 10}}))
+        self.assertNotIn('entryTiming', account)
+        record_entry_send(account, 'limit', dict(timings={'server': {'mt5StartedAt': 1000, 'mt5ReturnedAt': 1100, 'mt5Ms': 100}}))
+        record_broker_position_open(account, dict(brokerOpenedAtMs=4500))
+        record_entry_fill(account, 0, 4600)
+        account['filledVolume'] = .8
+        record_entry_fill(account, .3, 6100)
+        timing = account['entryTiming']
+        timing.update(stopConfirmedAtMs=6350, recentStages=[{'privateTrace': 1}])
+        summary = entry_timing_summary(timing)
+        self.assertEqual(summary['orderSends']['limit']['count'], 1)
+        self.assertEqual(summary['orderSends']['limit']['first']['returnedAtMs'], 1100)
+        self.assertEqual(summary['fills']['firstBrokerPositionOpenedAtMs'], 4500)
+        self.assertEqual(summary['fills']['firstConfirmedAtMs'], 4600)
+        self.assertEqual(summary['fills']['targetConfirmedAtMs'], 6100)
+        self.assertEqual(summary['stopConfirmedAtMs'], 6350)
+        self.assertNotIn('recentStages', summary)
+
     def test_common_stop_timings_keep_native_stages_without_protection_payload(self):
         timing={}
         result=dict(status='ok',elapsedMs=480,positions=[dict(ticket='private')],sl=12,
@@ -52,14 +73,18 @@ class EntryWaitTotalsTests(unittest.TestCase):
 
     def test_repeated_same_wait_is_one_segment_and_collects_quote_age_range(self):
         totals = EntryWaitTotals()
-        totals.observe('waiting-quote', 'Broker quote is stale', 0, 1100)
-        totals.observe('waiting-quote', 'Broker quote is stale', 500, 1600)
+        totals.observe('waiting-quote', 'Broker quote is stale', 0, 1100,
+            dict(tickUtcMs=5000, nativeCapturedAt=6090, checkedAtMs=6100, private='omitted'))
+        totals.observe('waiting-quote', 'Broker quote is stale', 500, 1600,
+            dict(tickUtcMs=5000, nativeCapturedAt=6590, checkedAtMs=6600))
         totals.observe('ready', 'Fresh quote checked', 600, 10)
         row = totals.data['waits'][0]
         self.assertEqual(row['segments'], 1)
         self.assertEqual(row['durationMs'], 600)
         self.assertEqual(row['minQuoteAgeMs'], 1100)
         self.assertEqual(row['maxQuoteAgeMs'], 1600)
+        self.assertEqual(row['firstStaleQuote'], dict(tickUtcMs=5000, nativeCapturedAt=6090, checkedAtMs=6100))
+        self.assertEqual(row['lastStaleQuote']['nativeCapturedAt'], 6590)
 
     def test_accounts_have_independent_buffers(self):
         first, second = EntryWaitTotals(), EntryWaitTotals()

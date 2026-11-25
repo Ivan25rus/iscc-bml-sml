@@ -1,5 +1,5 @@
 const {Worker,isMainThread,parentPort}=require('node:worker_threads');
-const {isEntryPlan}=require('./entryPlanJournal');
+const {isEntryPlan,usesJournalChanges}=require('./entryPlanJournal');
 const now=()=>Number(process.hrtime.bigint())/1e6;
 
 if(!isMainThread) {
@@ -12,7 +12,7 @@ if(!isMainThread) {
     const tail=(tails.get(message.file) || Promise.resolve()).catch(()=>{}).then(async()=>{
       try {
         const started=now(),timings={journalWorkerQueueMs:started-message.postedAt};
-        if (isEntryPlan(message.file)) {
+        if (usesJournalChanges(message.file)) {
           let state=files.get(message.file);
           if (!state) {
             const {validBytes,size}=loadEntryPlans(message.file);
@@ -24,8 +24,7 @@ if(!isMainThread) {
             const serializing=now(),text=changeBatch(message.changes);
             timings.journalSerializeMs=now()-serializing;
             const writing=now();
-            // Entry-plan writes have a dedicated worker. Keep its ordered
-            // disk operations off the process-wide asynchronous file queue.
+            // Keep ordered writes off the process-wide asynchronous file queue.
             appendEntryPlanBatch(message.file,state,text);
             timings.journalDurableMs=now()-writing;
           }
@@ -57,14 +56,15 @@ if(!isMainThread) {
 } else {
   let serial=0;
   const workers=new Map();
-  function journalWorker(entryPlan=false) {
-    const existing=workers.get(entryPlan);
+  function journalWorker(file='') {
+    const kind=isEntryPlan(file) ? 'entry-plans' : usesJournalChanges(file) ? 'mt5-commands' : 'default';
+    const existing=workers.get(kind);
     if(existing)return existing;
     const current=new Worker(__filename),pending=new Map();
     const slot={current,pending};
-    workers.set(entryPlan,slot);
+    workers.set(kind,slot);
     const failed=error=>{
-      if(workers.get(entryPlan)===slot)workers.delete(entryPlan);
+      if(workers.get(kind)===slot)workers.delete(kind);
       for(const row of pending.values())row.reject(error);
       pending.clear();
     };
@@ -80,10 +80,10 @@ if(!isMainThread) {
     current.unref();
     return slot;
   }
-  const warm=()=>journalWorker().current;
+  const warm=file=>journalWorker(file).current;
   function request(file,changes,replace,prepare=false) {
     // Full history rewrites must not hold up durable entry plans.
-    const {current,pending}=journalWorker(isEntryPlan(file)),id=++serial;
+    const {current,pending}=journalWorker(file),id=++serial;
     // Only the changed records cross threads for command and receipt updates.
     return new Promise((resolve,reject)=>{
       const postedAt=now();

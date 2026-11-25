@@ -29,7 +29,7 @@ class PendingPollDeadlineTests(unittest.TestCase):
                    _protecting=lambda _: False, _positions=lambda *a, **kw: None,
                    _hybrid_fill_violation=lambda _: False, _independent_sync_stop=lambda *a: True,
                    _parallel_retry_ready=lambda *a: True, _remember=lambda _: None)
-        engine._parallel_quotes = lambda *a: ({account: tuple(quote)}, {account: None}, {})
+        engine._parallel_quotes = lambda *a: ({account: tuple(quote)}, {account: None}, {}, {})
         engine._parallel_pending = lambda s, a: ChunkEntries._parallel_pending(engine, s, a)
         engine._parallel_note = lambda s, a, phase, reason: s['accounts'][a].update(entryStatus=phase)
         engine._phase = lambda s, phase, reason: s.update(phase=phase, reason=reason)

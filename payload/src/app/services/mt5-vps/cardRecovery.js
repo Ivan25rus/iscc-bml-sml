@@ -1,4 +1,4 @@
-const {indexSymbol}=require('./approachPreparation');
+const {isTradingSymbol,normalizeTradingSymbol:indexSymbol}=require('./tradingSymbols');
 const {openingWatch,scanLinkedPlacement}=require('./levelControl');
 
 function recoveryCandidates(text) {
@@ -8,7 +8,7 @@ function recoveryCandidates(text) {
     if (record.kind==='level-order-group-completed' && record.accountsConfirmed===true) completed.add(record.parentRequestId);
     if (record.kind!=='level-order' || record.provider!=='mt5-vps' || record.valid!==true || !record.reqId) continue;
     const children=record.result?.raw?.results;
-    if (!Array.isArray(children) || !children.length || !['USTEC','SPX500'].includes(indexSymbol(record.plan?.ticker))) continue;
+    if (!Array.isArray(children) || !children.length || !isTradingSymbol(record.plan?.ticker)) continue;
     if (children.some(child=>openingWatch([child],record.plan.ticker,child.result?.primaryAccount).length)) groups.set(record.reqId,record);
   }
   return [...groups.values()].filter(record=>!completed.has(record.reqId));

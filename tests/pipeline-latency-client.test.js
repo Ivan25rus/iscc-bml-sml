@@ -18,3 +18,31 @@ test('Entry event waits own a bounded socket pool and leave state and execution 
   assert.equal(calls[1].options.agent,adapter.agents.commands);assert.equal(calls[2].options.agent,adapter.agents.commands);
   assert.ok(calls.every(row=>row.options.method==='GET'));
 });
+test('Linked account reads share the primary pool but priority requests keep independent sockets',async t=>{
+  const https=require('https'),calls=[];
+  const primary=new MT5VPSAdapter({enabled:true,endpoint:'https://127.0.0.1:19443',token:'fixture',caFile:__filename,account:900000002,server:'broker'});
+  const first=primary.createLinkedAdapter('900000003'),second=primary.createLinkedAdapter('900000004');
+  t.after(()=>{first.close();second.close();primary.close();});
+  t.mock.method(https,'request',(url,options)=>{
+    calls.push({route:url.pathname,options});const request=new EventEmitter();
+    request.end=()=>process.nextTick(()=>request.emit('error',Error('fixture read stopped')));
+    request.destroy=()=>request.destroyed=true;return request;
+  });
+  await assert.rejects(primary.request('/orders'));
+  await assert.rejects(first.request('/orders'));
+  await assert.rejects(second.request('/orders'));
+  await assert.rejects(first.request('/health',undefined,{execution:true}));
+  await assert.rejects(second.request('/entry-events?since=0'));
+  await assert.rejects(second.request('/minute-bars?symbol=USTEC'));
+  assert.equal(first.config.routePrefix,'/accounts/900000003');
+  assert.equal(second.config.routePrefix,'/accounts/900000004');
+  assert.equal(primary.agents.commands.maxFreeSockets,4);
+  assert.deepEqual(calls.slice(0,3).map(row=>row.route),['/orders','/accounts/900000003/orders','/accounts/900000004/orders']);
+  assert.ok(calls.slice(0,3).every(row=>row.options.agent===primary.agents.commands));
+  assert.equal(calls[3].options.agent,first.agents.execution);
+  assert.equal(calls[4].options.agent,second.agents.entryEvents);
+  assert.equal(calls[5].options.agent,second.agents.chartHistory);
+  const primaryDestroy=t.mock.method(primary.agents.commands,'destroy',()=>{});
+  first.close();
+  assert.equal(primaryDestroy.mock.callCount(),0);
+});

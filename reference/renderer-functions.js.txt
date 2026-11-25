@@ -1,6 +1,10 @@
 // Merge reference; do not replace the application renderer.
 
-const {canAttachRecoveredEntry}=require('./services/mt5-vps/cardIdentity');
+const {canAttachRecoveredEntry,coalesceIdleCards,keepsLtLevel,freshPositionAt}=require('./services/mt5-vps/cardIdentity');
+const {normalizeTradingSymbol:indexSymbol,isTradingSymbol:isMT5Index}=require('./services/mt5-vps/tradingSymbols');
+const {validateTrackedEntry,availableLtLevels}=require('./services/levelOrder/manualEntry');
+const {NEAREST_TRACKED_LEVEL_PLACEHOLDER,normalizeLevelPlaceholder}=require('./services/levelOrder/provider');
+const nativeIndexPositions=new Map();
 const {unfilledEntryCanReset,closedSnapshotCanReplace}=require('./services/mt5-vps/entryLifecycle');
 const {EntryCloseControl,pendingEntryCloseConfirmation}=require('./services/mt5-vps/entryCloseControl');
 const {retainControlEntry}=require('./services/mt5-vps/entryControlState');
@@ -12,6 +16,21 @@ let chunkEntriesReadWaiters=[];
 const chunkEntryChecks=new Set();
 const chunkEntryProgress=new Map();
 let chunkEventsActive=false;
+
+function chunkEntryLimit(reason) {
+  const message=String(reason || '').replace(/^Вход не запущен\. /,'');
+  if(message==='Вход запрещён. В настройках MT5 выключены все торговые счета.')return 'все торговые счета выключены';
+  if(message==='Позиция открыта. Для нового входа нажми «Другой ЛТ».')return 'позиция уже открыта';
+  if(message==='Этот уровень уже закреплён за сделкой. Выбери другой ЛТ.')return 'уровень уже используется';
+  if(message==='Состояние позиции MT5 уточняется. Повтори вход после сверки.')return 'идёт сверка позиции';
+  const risk=message.match(/^Дневной риск (\d+(?:[,.]\d+)?%): доступно /);
+  if(risk)return `дневной лимит риска ${risk[1]}`;
+  return message==='Нью-Йорк 09:30–16:00: исчерпан лимит трёх входов' ? 'лимит трёх входов' : '';
+}
+
+function accountStageText(rows=[]) {
+  return rows.map(([account,description])=>`${displayMT5Account(account)}: ${description}`).join('\n');
+}
 
 function chunkReason(entry) {
   const reason=entry?._readError || entry?.reason || '';
@@ -92,6 +111,8 @@ function chunkAccountText(entry) {
   return Object.entries(entry?.accounts || {}).map(([account,value])=>{
     const filled=value?.filledVolume,target=value?.targetVolume;
     const name=displayMT5Account(account);
+    const limit=chunkAccountLimit(entry,account,value);
+    if(limit)return `${name} · ${filled>0 ? `Набрано ${filled.toLocaleString('ru-RU')} лот. Добор запрещён` : 'Вход запрещён'} · ${limit}`;
     if(filled===0 && !value.positionsClosed && entry.positionLifecycle!=='closed') {
       const open=entry.positionsConfirmed===true && entry.hasOpenPositions===true && !entry._readError && entry.livePositions?.some(row=>
         String(row.account)===account && Number.isFinite(row.volume) && row.volume>0);
@@ -135,6 +156,27 @@ function logChunkDiagnostic(panel,entry,detail) {
   ipcRenderer.send?.('level-order:entry-diagnostic',record);
 }
 
+function compactIdleIndexCards() {
+  const focusedKey=document.activeElement?.closest?.('.card')?.dataset.rowkey;
+  const pending=new Set(pendingByReqId.values());
+  for(const group of levelOrderGroups.values())pending.add(group.key);
+  const result=coalesceIdleCards(state.rows,{key:rowKey,symbol:row=>indexSymbol(row.ticker),preferredKey:focusedKey,
+    priority:row=>indexCardEdits.get(rowKey(row)) || 0,
+    eligible:row=>isLiveIndexCard(row) && row.cardType==='levelOrder' && !row.separateLt,
+    protectedRow:row=>!!row.chunkEntryId || cardStates.has(rowKey(row)) || chunkEntriesByKey.has(rowKey(row))
+      || chunkEntryBusy.has(rowKey(row)) || pending.has(rowKey(row))});
+  if(!result.removed.length)return false;
+  state.rows=result.rows;
+  const retained=new Set(state.rows.map(rowKey));
+  for(const row of result.removed)if(!retained.has(rowKey(row))){uiState.delete(rowKey(row));indexCardEdits.delete(rowKey(row));}
+  return true;
+}
+
+function isLiveIndexCard(row) {
+  return isMT5Index(row?.ticker) && row.instrumentType !== 'OPT'
+    && (row.provider === 'mt5-vps' || (!row.provider && mt5VpsEnabled));
+}
+
 function syncChunkPercentField(input,entry,draft,defaultPercent=20) {
   const percent=entry?.chunkPercent==null ? NaN : Number(entry.chunkPercent);
   const hybrid=entry?.executionPolicy==='hybrid-market-limit-v1';
@@ -167,7 +209,6 @@ function syncChunkPercentField(input,entry,draft,defaultPercent=20) {
 }
 
 function createLevelOrderBody(row, key, $pointSize) {
-  const setChanged = (target, property, value) => { if (target[property] !== value) target[property] = value; };
   const defaults = resolveLevelOrderDefaults(levelOrderCfg, row.ticker);
   const maxLot = Number(defaults.maxLot ?? 0);
   const stopMode = row.stopMode ?? defaults.stopMode;
@@ -180,10 +221,10 @@ function createLevelOrderBody(row, key, $pointSize) {
     maxLot:String(row.maxLot ?? defaults.maxLot ?? 0),
     takeProfitPts:String(row.takeProfitPts ?? defaults.takeProfitPts ?? ''),
     pointSize:String(row.pointSize ?? '')
-  },indexCardDrafts.get(indexSymbol(row.ticker)),!isLiveIndexCard(row) || !!row.chunkEntryId || chunkCardLocked(key) || cardStates.has(key));
+  },indexCardDrafts.get(indexSymbol(row.ticker)),row.separateLt || !isLiveIndexCard(row) || !!row.chunkEntryId || chunkCardLocked(key) || cardStates.has(key));
   let tracksLevel = row.followNearestLT || normalizeLevelPlaceholder(saved.level) === NEAREST_TRACKED_LEVEL_PLACEHOLDER;
   let trackedPreview = trackedLevelPreviews.get(trackedTickerKey(row.ticker));
-  const allowsMarketEntry = isLiveIndexCard(row) && tracksLevel;
+  const allowsMarketEntry = isLiveIndexCard(row) && (tracksLevel || row.separateLt);
   let marketGroups = [], marketReadyAt = 0, marketWarming = false;
   if ($pointSize) $pointSize.value = saved.pointSize || '';
 
@@ -215,7 +256,7 @@ function createLevelOrderBody(row, key, $pointSize) {
   $stopOffset.value = saved.stopOffsetPts;
   $tp.value = saved.takeProfitPts;
   $level.placeholder='—';
-  $level.title=tracksLevel ? 'Ближайший уровень LT: переключается автоматически.' : 'Ручной уровень';
+  $level.title=row.separateLt ? 'Отслеживает ближайший незанятый уровень ЛТ' : tracksLevel ? 'Ближайший уровень LT: переключается автоматически.' : 'Ручной уровень';
   $level.setAttribute('aria-label','Уровень набора');
   $risk.title='Риск в долларах на основном счёте.';
   $tp.title='Тейк-профит в шагах цены.';
@@ -224,15 +265,12 @@ function createLevelOrderBody(row, key, $pointSize) {
   line.append($level,$risk);
   if(riskModeLabel) line.append(riskModeLabel);
   line.append($stopOffset,$tp);
+  let separateIndex,separateGroups,separateOccupied;
 
   const marketButtons = [];
   for (const [action,label,style] of [['MB','BML','bl'],['MS','SML','sl']]) {
     const button = btn(label,style,async () => {
       const clickAt=Date.now();
-      const existing=chunkEntriesByKey.get(key);
-      if(existing && existing.side===(action==='MB'?'buy':'sell')) {
-        await continueChunkEntry(key);return;
-      }
       if (cardStates.has(key) || chunkCardLocked(key)) return;
       const value = validateMarket(action);
       if (value.valid) await armChunkEntry(action,row,value,row.instrumentType || detectInstrumentType(row.ticker),clickAt);
@@ -281,16 +319,29 @@ function createLevelOrderBody(row, key, $pointSize) {
       .finally(()=>{marketWarming=false;if(cardByKey(key)?.contains($level))body.validate();});
   }
   function validateMarket(action) {
-    const level=_normNum($level.value),info=instrumentInfoFor(row.ticker,row);
+    const info=instrumentInfoFor(row.ticker,row);
+    const locked=cardStates.has(key) || chunkCardLocked(key);
+    if(!action && row.separateLt && !locked) {
+      const occupied=occupiedLtLevels(row.ticker),signature=occupied.join(',');
+      if(marketGroups!==separateGroups || signature!==separateOccupied) {
+        separateGroups=marketGroups;separateOccupied=signature;
+        separateIndex=require('./services/levelTrack/level-index').createLevelIndex(availableLtLevels(marketGroups,row.ticker,occupied));
+      }
+      const age=Date.now()-Number(info?.quoteUpdatedAt),price=Number.isFinite(info?.price) ? info.price : (info?.bid+info?.ask)/2;
+      if(age>=0 && age<1000 && Number.isFinite(price)) {
+        const nearest=separateIndex.nearest(price);
+        setChanged($level,'value',nearest ? String(nearest.level) : '');
+      }
+    }
+    const level=_normNum($level.value);
     const risk=_normNum($risk.value),stopOffsetPts=_normNum($stopOffset.value),takeProfitPts=_normNum($tp.value);
     const specifications=info?.provider==='mt5-vps' && [info.tickSize,info.quantityStep,info.contractSize,info.maxQty].every(isPos);
-    if (!action && allowsMarketEntry && specifications && isPos(level)) prepareMarketEntry();
+    if (!action && allowsMarketEntry && specifications && (isPos(level) || row.separateLt)) prepareMarketEntry();
     const check=validateTrackedEntry({groups:marketGroups,symbol:row.ticker,level,entryPrice:level});
-    const locked=cardStates.has(key) || chunkCardLocked(key);
     const reason=!allowsMarketEntry ? 'BML/SML доступны для уровня LT' : locked ? 'Вход уже создан'
       : !specifications ? 'Ожидание спецификации MT5'
-      : !check.ok ? check.reason : (!percentRisk && !isPos(risk)) || !isSL(stopOffsetPts) || !Number.isFinite(maxLot) || maxLot<0
-        || ($tp.value!=='' && !isPos(takeProfitPts)) ? (percentRisk ? 'Проверь стоп, лот и тейк' : 'Проверь риск, стоп, лот и тейк') : '';
+      : ltTradingReason(row,level) || (!check.ok ? check.reason : (!percentRisk && !isPos(risk)) || !isSL(stopOffsetPts) || !Number.isFinite(maxLot) || maxLot<0
+        || ($tp.value!=='' && !isPos(takeProfitPts)) ? (percentRisk ? 'Проверь стоп, лот и тейк' : 'Проверь риск, стоп, лот и тейк') : '');
     const chunkPercent=resolveMarketChunkPercent(levelOrderCfg,row.ticker);
     const planFor=kind=>reason ? {ok:false,reason} : calculateMarketZoneTradePlan({
       action:kind,ticker:row.ticker,instrumentType:row.instrumentType || detectInstrumentType(row.ticker),
@@ -342,7 +393,7 @@ function createLevelOrderBody(row, key, $pointSize) {
       const entry=chunkEntriesByKey.get(key),locked=!!entry,card=cardByKey(key);
       if(!entry && chunkPanel.dataset.entryId) {
         delete chunkPanel.dataset.entryId;
-        const draft=indexCardDrafts.get(indexSymbol(row.ticker));
+        const draft=row.separateLt ? null : indexCardDrafts.get(indexSymbol(row.ticker));
         for(const [field,input]of [['risk',$risk],['stopOffsetPts',$stopOffset],['takeProfitPts',$tp]])
           if(draft && Object.hasOwn(draft,field))input.value=draft[field];
         persist();
@@ -358,7 +409,8 @@ function createLevelOrderBody(row, key, $pointSize) {
       if(percentRisk && riskModeLabel)setChanged(riskModeLabel,'textContent',
         Number.isFinite(entry?.riskUsd) ? '$'+entry.riskUsd+' зафиксировано' : balanceLabel);
       if(entry)setChanged($level,'title','Уровень набора: '+$level.value+'. Зафиксирован при запуске.');
-      else setChanged($level,'title',tracksLevel ? trackedLevelReason() || 'Ближайший уровень LT: переключается автоматически.' : 'Ручной уровень');
+      else setChanged($level,'title',row.separateLt ? 'Отслеживает ближайший незанятый уровень ЛТ'
+        : tracksLevel ? trackedLevelReason() || 'Ближайший уровень LT: переключается автоматически.' : 'Ручной уровень');
       const progress=chunkDisplayEntry(key,entry);
       const closeConfirmation=chunkCloseConfirmations.get(entry?.id);
       const accounts=closeConfirmation ? closeConfirmation.accounts.split('\n').map(line=>
@@ -366,19 +418,30 @@ function createLevelOrderBody(row, key, $pointSize) {
       const pendingLimit=entry?.livePendingOrders?.length>0 || progress && !chunkTerminalPhases.has(progress.phase)
         && progress.phase!=='unknown' && progress.children?.some(child=>child.type==='limit' && child.state==='pending');
       const stopUnconfirmed=entry?._stopUnconfirmed===true;
+      const accountRows=Object.entries(progress?.accounts || {});
+      const limitedAccounts=new Set(accountRows.filter(([account,row])=>chunkAccountLimit(progress,account,row)).map(([account])=>account));
+      const refusal=chunkEntryErrorsByKey.get(key) || '';
+      const planLimit=chunkEntryLimit(progress ? progress.reason : refusal);
+      const limitStop=progress?.phase==='stopped' && (planLimit || limitedAccounts.size>0
+        && accountRows.every(([account,row])=>limitedAccounts.has(account) || (progress.lanePhases?.[account] || row.entryStatus)==='completed'));
+      const fullyProhibited=limitStop && (planLimit || limitedAccounts.size===accountRows.length)
+        && !accountRows.some(([,row])=>row.filledVolume>0);
       const laneFailed=Object.entries(progress?.lanePhases || {}).some(([account,value])=>value==='unknown'
-        || value==='stopped' && !progress.accounts?.[account]?.userStopped && !!progress.accounts?.[account]?.laneStopReason);
+        || value==='stopped' && !limitedAccounts.has(account) && !progress.accounts?.[account]?.userStopped && !!progress.accounts?.[account]?.laneStopReason);
       const stoppedByUser=progress?.phase==='stopped' && Object.values(progress.accounts || {}).some(account=>account.userStopped===true);
       const detail=stopUnconfirmed ? 'VPS ещё не подтвердил команду остановки.' : closeConfirmation ? closeConfirmation.detail
-        : progress ? (laneFailed || progress._readError || ['stopped','paused','unknown'].includes(progress.phase)
+        : progress ? (laneFailed || limitedAccounts.size || progress._readError || ['stopped','paused','unknown'].includes(progress.phase)
           || Object.values(progress.accounts || {}).some(account=>account.entryStatus==='waiting-quote')) ? chunkReason(progress) : ''
-        : chunkEntryErrorsByKey.get(key) || '';
+        : refusal;
       const lifecycleChecking=progress?._readErrorKind==='checking';
-      const failed=!closeConfirmation && (laneFailed || !!progress?._readError && !lifecycleChecking || progress?.phase==='unknown' || !!detail && !progress
-        || progress?.phase==='stopped' && !stoppedByUser && !!detail && !/stopped by user|Further entry stopped; positions retained|fully closed|fully confirmed|target confirmed|cancelled before admission/i.test(progress.reason || ''));
+      const failed=!closeConfirmation && (laneFailed || !!progress?._readError && !lifecycleChecking || progress?.phase==='unknown' || !!detail && !progress && !planLimit
+        || progress?.phase==='stopped' && !limitStop && !stoppedByUser && !!detail && !/stopped by user|Further entry stopped; positions retained|fully closed|fully confirmed|target confirmed|cancelled before admission/i.test(progress.reason || ''));
       const caption=stopUnconfirmed ? 'Проверка остановки' : closeConfirmation ? closeConfirmation.caption : failed ? 'Ошибка'
+        : fullyProhibited || !progress && planLimit ? 'Вход запрещён'
         : (lifecycleChecking && progress===entry) || entry?._armUnconfirmed || progress?.reconciliation?.status==='checking' ? 'Проверка'
         : progress?.phase==='paused' ? 'Пауза'
+        : limitStop && accountRows.some(([account,row])=>!limitedAccounts.has(account)
+          && (progress.lanePhases?.[account] || row.entryStatus)==='completed') ? 'Набор завершён'
         : progress?.reason==='Hybrid target confirmed with a common stop on every account' ? 'Набор завершён'
         : progress?.phase==='stopped' ? 'Набор остановлен'
         : progress?.phase==='completed' ? 'Набор завершён'
@@ -390,14 +453,14 @@ function createLevelOrderBody(row, key, $pointSize) {
       const accountsLabel=closeConfirmation?'Подтверждение закрытия по счетам':'Объём набора по счетам';
       if(chunkAccounts.getAttribute('aria-label')!==accountsLabel)chunkAccounts.setAttribute('aria-label',accountsLabel);
       setChanged(chunkProgress,'title',detail || caption);
-      setChanged(chunkDetail,'textContent','');
-      setChanged(chunkDetail,'title','');
+      const limitDetail=!closeConfirmation && planLimit && !failed ? detail.replace(/^Вход не запущен\. /,'') : '';
+      setChanged(chunkDetail,'textContent',limitDetail);
+      setChanged(chunkDetail,'title',limitDetail);
       setChanged(chunkProgress.dataset,'phase',progress?.phase || '');
       setChanged(chunkProgress.dataset,'error',String(failed));
       setChanged(chunkActions.style,'visibility',locked ? 'visible' : 'hidden');
       const hasFills=Object.values(entry?.accounts || {}).some(account=>Number(account.filledVolume)>0);
       setChanged($chunkProtection,'hidden',!require('./services/mt5-vps/managementTarget').entryTarget(entry));
-      const canContinue=chunkDisplayCanContinue(entry,progress);
       const stopping=chunkEntryStopBusy.has(key);
       const terminalStop=chunkStopCanReset(entry);
       setChanged($chunkStop,'textContent',stopping ? 'Останавливаю…' : stopUnconfirmed ? 'Подтвердить остановку'
@@ -405,7 +468,7 @@ function createLevelOrderBody(row, key, $pointSize) {
         : entry?.phase==='arming' ? 'Отменить вход'
         : terminalStop ? 'Вернуться к входу'
         : ['zone','boundary','side-zone'].includes(entry?.entryMode) && !hasFills ? 'Снять ожидание' : 'Остановить вход');
-      setChanged($chunkStop,'disabled',!locked || stopping || chunkEntryBusy.has(key) && !chunkStopOvertakesContinue(entry));
+      setChanged($chunkStop,'disabled',!locked || stopping || chunkEntryBusy.has(key));
       setChanged($chunkStop,'hidden',terminalStop && !unfilledEntryCanReset(entry));
       const checking=!!entry && chunkEntryChecks.has(entry.id);
       setChanged($chunkVerify,'hidden',!entry || !(checking || stopUnconfirmed || entry._armUnconfirmed || entry._readError
@@ -413,7 +476,7 @@ function createLevelOrderBody(row, key, $pointSize) {
       setChanged($chunkVerify,'disabled',checking || chunkEntryBusy.has(key) || stopping);
       setChanged($chunkVerify,'textContent',checking?'Сверяю…':'Сверить с MT5');
       setChanged(chunkActions,'hidden',!locked);
-      setChanged(chunkActions.style,'visibility',locked && (!$chunkStop.hidden || !$chunkVerify.hidden || canContinue) ? 'visible' : 'hidden');
+      setChanged(chunkActions.style,'visibility',locked && (!$chunkStop.hidden || !$chunkVerify.hidden) ? 'visible' : 'hidden');
       card?.classList.toggle('card--chunk-open',locked);
       const wasLocked=chunkPanel.dataset.locked==='true';
       if (card && locked) {
@@ -421,12 +484,8 @@ function createLevelOrderBody(row, key, $pointSize) {
         // Enforce ownership on its actual controls even when that marker exists.
         card.querySelectorAll('input,select,.btns button').forEach(control=>setChanged(control,'disabled',true));
         for(const button of marketButtons) {
-          const matching=entry.side===(button.dataset.kind==='MB'?'buy':'sell');
-          setChanged(button,'textContent',(matching && canContinue?'Добрать ':'')+(button.dataset.kind==='MB'?'BML':'SML'));
-          setChanged(button,'disabled',!matching || !canContinue || chunkEntryBusy.has(key) || chunkEntryStopBusy.has(key));
-          setChanged(button,'title','Продолжить прежний набор до исходного объёма только на недобравших счетах; сначала сверить позиции и лимитки');
-          if(matching && canContinue)chunkActions.append(button);
-          else this._btns?.append(button);
+          setChanged(button,'disabled',true);
+          setChanged(button,'title','Другой уровень торгуется из отдельной карточки ЛТ');
         }
         const close=card.querySelector('.card__close');if(close)setChanged(close.style,'display','none');
         const stage=card.querySelector('.card__stage');if(stage){setChanged(stage.style,'display','none');setChanged(stage,'title',chunkProgress.title);}
@@ -524,6 +583,7 @@ function createLevelOrderBody(row, key, $pointSize) {
   $level._applyTrackedLevelPreview=preview=>{
     if(!tracksLevel || cardStates.has(key) || chunkCardLocked(key))return;
     trackedPreview=preview;
+    if(row.separateLt){body.validate();return;}
     const result=preview?.result;
     const nearest=(result?.source?.candidates || []).filter(candidate=>Number(candidate.nearestLevel)>0 && Number.isFinite(Number(candidate.distance)))
       .sort((a,b)=>Number(a.distance)-Number(b.distance))[0]?.nearestLevel;
@@ -535,6 +595,7 @@ function createLevelOrderBody(row, key, $pointSize) {
     body.validate();
   };
   $level.addEventListener('input',()=>{
+    if(row.separateLt)return;
     if(row.followNearestLT){$level._applyTrackedLevelPreview(trackedLevelPreviews.get(trackedTickerKey(row.ticker)));return;}
     tracksLevel=normalizeLevelPlaceholder($level.value)===NEAREST_TRACKED_LEVEL_PLACEHOLDER;
     if(tracksLevel){$level.dataset.trackedTicker=row.ticker;$level._applyTrackedLevelPreview(trackedLevelPreviews.get(trackedTickerKey(row.ticker)));requestTrackedLevelPreview(row.ticker);}
@@ -543,7 +604,7 @@ function createLevelOrderBody(row, key, $pointSize) {
   for(const input of [$level,$risk,$stopOffset,$tp,$pointSize].filter(Boolean)) {
     input.addEventListener('input',()=>{
       indexCardEdits.set(key,++indexCardEditRevision);markTouched(row.ticker);persist();
-      if(isLiveIndexCard(row) && !chunkCardLocked(key) && !cardStates.has(key))indexCardDrafts.set(indexSymbol(row.ticker),uiState.get(key));
+      if(isLiveIndexCard(row) && !row.separateLt && !chunkCardLocked(key) && !cardStates.has(key))indexCardDrafts.set(indexSymbol(row.ticker),uiState.get(key));
       body.validate();
     });
   }
@@ -557,13 +618,58 @@ function paintChunkEntry(key) {
   card?._validate?.();
 }
 
-function chunkStopOvertakesContinue(entry) {
-  return entry?.controlContract==='entry-stop-priority-v1' && (chunkEntryContinueIds.get(entry.id)?.size || 0)>0;
+function hasIndexPosition(ticker) {
+  return freshPositionAt(nativeIndexPositions.get(indexSymbol(ticker)));
+}
+
+function occupiedLtLevels(ticker) {
+  const symbol=indexSymbol(ticker);
+  return [...chunkEntriesByKey.values()].filter(entry=>indexSymbol(entry.symbol)===symbol && keepsLtLevel(entry))
+    .map(entry=>Number(entry.level)).filter(level=>Number.isFinite(level) && level>0);
+}
+
+function ltTradingReason(row,level) {
+  if(row.separateLt)return occupiedLtLevels(row.ticker).some(value=>Math.abs(value-level)<1e-8)
+    ? 'Этот уровень уже закреплён за сделкой. Выбери другой ЛТ.' : '';
+  return isLiveIndexCard(row) && hasIndexPosition(row.ticker) ? 'Позиция открыта. Для нового входа нажми «Другой ЛТ».' : '';
+}
+
+function openSeparateLtCard(ticker) {
+  if(!hasIndexPosition(ticker))return;
+  const symbol=indexSymbol(ticker);
+  let draft=state.rows.find(row=>row.separateLt && indexSymbol(row.ticker)===symbol && !chunkCardLocked(rowKey(row)));
+  if(!draft) {
+    draft={ticker:symbol,provider:'mt5-vps',instrumentType:detectInstrumentType(symbol),cardType:'levelOrder',separateLt:true,
+      followNearestLT:true,level:NEAREST_TRACKED_LEVEL_PLACEHOLDER,cardSource:'lt-separate',
+      event:'lt-separate:'+Math.random().toString(36).slice(2,8),time:Date.now(),price:0};
+    state.rows.push(draft);
+  }
+  render();
+  const card=cardByKey(rowKey(draft));
+  card?.scrollIntoView?.({block:'nearest'});
+  card?.querySelector?.('.card__level')?.focus();
+}
+
+function updateIndexPositionEvidence(evidence) {
+  if(!evidence?.positionTimes)return;
+  const now=Date.now();
+  const previous=new Set(nativeIndexPositions.keys());
+  for(const [symbol,checkedAt] of nativeIndexPositions) {
+    if(!freshPositionAt(checkedAt,now) || evidence.complete===true && evidence.checkedAt>=checkedAt
+      && !Object.hasOwn(evidence.positionTimes,symbol))nativeIndexPositions.delete(symbol);
+  }
+  for(const [symbol,checkedAt] of Object.entries(evidence.positionTimes))
+    if(isMT5Index(symbol) && freshPositionAt(checkedAt,now) && checkedAt>(nativeIndexPositions.get(symbol) || 0))
+      nativeIndexPositions.set(symbol,checkedAt);
+  for(const row of state.rows) {
+    const symbol=indexSymbol(row.ticker);
+    if(isLiveIndexCard(row) && previous.has(symbol)!==nativeIndexPositions.has(symbol))paintChunkEntry(rowKey(row));
+  }
 }
 
 function chunkStopCanReset(entry) {
   return !!entry && !entry._armUnconfirmed && !entry._stopUnconfirmed
-    && chunkTerminalPhases.has(entry.phase) && !chunkStopOvertakesContinue(entry);
+    && chunkTerminalPhases.has(entry.phase);
 }
 
 function releaseChunkEntry(key) {
@@ -583,10 +689,13 @@ function releaseChunkEntry(key) {
 async function armChunkEntry(action,row,value,instrumentType,clickAt=Date.now()) {
   const key=rowKey(row);
   if (!value.valid || chunkCardLocked(key) || cardStates.has(key)) return;
+  const ltReason=ltTradingReason(row,value.level);
+  if(ltReason){toast(ltReason);return;}
   const requestId=`chunks_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
   chunkEntryErrorsByKey.delete(key);
   chunkEntryProgress.delete(key);
   const local={id:requestId,symbol:row.ticker,side:['BS','MB'].includes(action) ? 'buy' : 'sell',entryMode:value.entryMode,
+    ...(row.separateLt ? {separateLt:true} : {}),
     trigger:value.entryPrice,level:value.level,zoneMultiplier:value.zoneMultiplier,phase:'arming',accounts:{}};
   chunkEntriesByKey.set(key,local);row.chunkEntryId=requestId;
   try {
@@ -597,6 +706,7 @@ async function armChunkEntry(action,row,value,instrumentType,clickAt=Date.now())
       sellPriceSource:value.sellPriceSource,pointSize:value.pointSize,tickSize:value.tickSize,
       chunkPercent:value.chunkPercent,
       entryMode:value.entryMode,zoneMultiplier:value.zoneMultiplier,
+      ...(row.separateLt ? {separateLt:true} : {}),
       requestId,strategyId:requestId,clickAt
     });
     try {paintChunkEntry(key);}
@@ -606,6 +716,9 @@ async function armChunkEntry(action,row,value,instrumentType,clickAt=Date.now())
     // may already have recovered a newer parent. Never restore the old launch
     // or overwrite a stop that is still awaiting its own confirmation.
     if(dismissedChunkEntries.has(requestId) || chunkEntriesByKey.get(key)!==local || local._stopRequested)return;
+    const native=result?.positionEvidence;
+    if(native?.symbol===indexSymbol(row.ticker))
+      updateIndexPositionEvidence({positionTimes:{[native.symbol]:native.checkedAt}});
     if(result?.entry?.id) {
       chunkEntriesByKey.set(key,result.entry);
       row.chunkEntryId=result.entry.id;
@@ -631,8 +744,7 @@ async function armChunkEntry(action,row,value,instrumentType,clickAt=Date.now())
 
 async function stopChunkEntry(key) {
   const entry=chunkEntriesByKey.get(key);
-  if(!entry || chunkEntryStopBusy.has(key) || chunkStopCanReset(entry)
-    || chunkEntryBusy.has(key) && !chunkStopOvertakesContinue(entry))return;
+  if(!entry || chunkEntryStopBusy.has(key) || chunkStopCanReset(entry) || chunkEntryBusy.has(key))return;
   entry._stopRequested=true;
   const stopVersion=(chunkEntryStopVersions.get(entry.id) || 0)+1;
   chunkEntryStopVersions.set(entry.id,stopVersion);
@@ -646,8 +758,7 @@ async function stopChunkEntry(key) {
     current.phase='unknown';current._stopUnconfirmed=true;
   };
   try {
-    const result=await ipcRenderer.invoke('level-order:stop-chunks',{entryId:entry.id,
-      ...(entry.controlContract==='entry-stop-priority-v1' ? {cancelContinueIds:[...(chunkEntryContinueIds.get(entry.id) || [])]} : {})});
+    const result=await ipcRenderer.invoke('level-order:stop-chunks',{entryId:entry.id});
     if(result?.entry?.id===entry.id && chunkEntriesByKey.get(key)?.id===entry.id) {
       chunkEntriesByKey.set(key,result.entry);
       release=unfilledEntryCanReset(result.entry);
@@ -660,40 +771,6 @@ async function stopChunkEntry(key) {
     chunkEntryStopBusy.delete(key);
     if(!release || !releaseChunkEntry(key))paintChunkEntry(key);
   }
-}
-
-function chunkContinueAccounts(entry) {
-  if(!entry || !['independent-v4','independent-v5'].includes(entry.accountExecution) || entry._armUnconfirmed || entry._stopUnconfirmed
-    || entry.protectionPending || entry.closurePending || entry.positionLifecycle==='closed'
-    || !Object.values(entry.accounts || {}).some(row=>Number(row.filledVolume)>0))return [];
-  return Object.entries(entry.accounts || {}).filter(([account,row])=>
-    Number(row.targetVolume)-Number(row.filledVolume)>1e-8 &&
-    (entry.lanePhases?.[account]!=='stopped' || row.userStopped===true || !!row.laneStopReason) &&
-    !row.commonStopUncertain && !row.riskRepairRequired && !row.stopCheckRejected &&
-    entry.lanePhases?.[account]!=='completed').map(([account])=>account);
-}
-
-async function continueChunkEntry(key) {
-  const entry=chunkEntriesByKey.get(key),accounts=chunkContinueAccounts(entry);
-  if(!accounts.length || chunkEntryBusy.has(key) || chunkEntryStopBusy.has(key))return;
-  const stopVersion=chunkEntryStopVersions.get(entry.id) || 0;
-  const attempts=accounts.map(account=>({account,requestId:`continue_${Date.now()}_${Math.random().toString(36).slice(2,10)}_${account}`}));
-  const ids=new Set(attempts.map(row=>row.requestId));chunkEntryContinueIds.set(entry.id,ids);
-  chunkEntryBusy.add(key);paintChunkEntry(key);
-  try {
-    await Promise.allSettled(attempts.map(async({account,requestId})=>{
-      try {
-        const result=await ipcRenderer.invoke('level-order:continue-chunks',{entryId:entry.id,account,requestId});
-        if((chunkEntryStopVersions.get(entry.id) || 0)!==stopVersion || chunkEntriesByKey.get(key)?.id!==entry.id)return;
-        if(result?.entry?.id===entry.id) {
-          const current=chunkEntriesByKey.get(key);
-          if(!current || Number(result.entry.updatedAt || 0)>=Number(current.updatedAt || 0))chunkEntriesByKey.set(key,result.entry);
-        } else toast('Счёт '+account+': '+(result?.reason || 'Подтверждение добора пока не получено; сверяем состояние'));
-      } catch(error) {if((chunkEntryStopVersions.get(entry.id) || 0)===stopVersion)toast('Счёт '+account+': подтверждение добора пока не получено');}
-      finally {ids.delete(requestId);}
-    }));
-  } catch(error) {toast('Подтверждение добора пока не получено: '+(error?.message || error));}
-  finally {chunkEntryContinueIds.delete(entry.id);chunkEntryBusy.delete(key);if(!releaseChunkEntry(key))paintChunkEntry(key);}
 }
 
 async function closeChunkPosition(key,expectedEntryId) {
@@ -806,13 +883,6 @@ function chunkDisplayEntry(key,entry) {
     children:progress.children || entry.children,lanePhases:progress.lanePhases,reconciliation:progress.reconciliation};
 }
 
-function chunkDisplayCanContinue(entry,progress) {
-  const accounts=chunkContinueAccounts(entry);
-  if(progress===entry)return accounts.length>0;
-  const visible=chunkContinueAccounts(progress);
-  return accounts.length>0 && accounts.every(account=>visible.includes(account));
-}
-
 function applyChunkEntries(entries,stopVersions,{progressOnly=false,event=false,preferredId,startingEntries}={}) {
   let structureChanged=false,verifiedEntry;
   const keys=new Map([...chunkEntriesByKey].map(([key,entry])=>[entry.id,key]));
@@ -864,12 +934,12 @@ function applyChunkEntries(entries,stopVersions,{progressOnly=false,event=false,
       if(!canAttachRecoveredEntry(entry))continue;
       let row=state.rows.find(item=>item.chunkEntryId===entry.id);
       if(row && chunkCardLocked(rowKey(row)))continue;
-      if(!row)row=state.rows.find(item=>isLiveIndexCard(item) && indexSymbol(item.ticker)===indexSymbol(entry.symbol)
+      if(!row && !entry.separateLt)row=state.rows.find(item=>isLiveIndexCard(item) && !item.separateLt && indexSymbol(item.ticker)===indexSymbol(entry.symbol)
         && item.cardType==='levelOrder' && !cardStates.has(rowKey(item)) && !chunkCardLocked(rowKey(item)));
       if(!row) {
         row={ticker:entry.symbol,provider:'mt5-vps',instrumentType:detectInstrumentType(entry.symbol),cardType:'levelOrder',
           cardSource:'lt-chunks',event:`chunks:${entry.id}`,time:entry.createdAt || Date.now(),price:entry.trigger,
-          level:entry.level,followNearestLT:true,riskUsd:entry.riskUsd,stopMode:entry.stopMode || 'entry',
+          level:entry.level,followNearestLT:true,separateLt:entry.separateLt===true,riskUsd:entry.riskUsd,stopMode:entry.stopMode || 'entry',
           stopOffsetPts:entry.stopOffsetPts,takeProfitPts:entry.takeProfitPts};
         state.rows.push(row);
       }
@@ -905,6 +975,7 @@ async function refreshChunkEntries(eventResult,controlVersions,preferredId) {
   try {
     const result=await ipcRenderer.invoke('level-order:chunk-entries',preferredId);
     if(result?.status!=='ok' || !Array.isArray(result.entries))throw Error(result?.reason || 'Нет свежего статуса VPS');
+    updateIndexPositionEvidence(result.indexPositions);
     return applyChunkEntries(result.entries,stopVersions,{preferredId,startingEntries});
   } catch(error) {
     for(const [key,entry] of chunkEntriesByKey) {

@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const isEntryPlan = file => file.endsWith('.entry-plans.json');
+const usesJournalChanges = file => isEntryPlan(file) || /^mt5-command-journal(?:-\d+)?\.json$/.test(path.basename(file));
 const changeFile = file => file + '.changes';
 
 function loadEntryPlans(file) {
@@ -53,4 +54,4 @@ function appendEntryPlansSync(file, changes) {
   appendEntryPlanBatch(file, loadEntryPlans(file), changeBatch(changes));
 }
 
-module.exports = {isEntryPlan, changeFile, loadEntryPlans, changeBatch, appendEntryPlanBatch, appendEntryPlansSync};
+module.exports = {isEntryPlan, usesJournalChanges, changeFile, loadEntryPlans, changeBatch, appendEntryPlanBatch, appendEntryPlansSync};

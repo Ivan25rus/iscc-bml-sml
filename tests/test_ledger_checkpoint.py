@@ -65,6 +65,28 @@ class LedgerCheckpointTests(unittest.TestCase):
         self.assertEqual(restarted.place(self.fixture.order)['result']['status'], 'ok')
         self.assertEqual(len(self.fixture.mt5.sent), 1)
 
+    def test_failed_timed_intent_rolls_back_both_records_before_order_send(self):
+        from datetime import datetime, timedelta, timezone
+        from mt5_bridge import new_york_zone
+
+        due = (datetime.now(timezone.utc) + timedelta(minutes=5)).replace(second=0, microsecond=0)
+        local = due.astimezone(new_york_zone())
+        payload = dict(self.fixture.order, closeAtUtc=due.timestamp()*1000, closeTimeZone='America/New_York',
+                       closeLocalDate=local.strftime('%Y-%m-%d'), closeLocalTime=local.strftime('%H:%M'),
+                       cancelPendingAtDeadline=True)
+        database = self.bridge.db
+        database.execute("CREATE TRIGGER reject_opening_intent BEFORE INSERT ON time_rules "
+                         "BEGIN SELECT RAISE(ABORT, 'fixture write failure'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'fixture write failure'):
+            self.bridge.place(payload)
+        self.assertFalse(database.in_transaction)
+        for table in ('requests', 'time_rules'):
+            self.assertIsNone(database.execute(f'SELECT id FROM {table} WHERE id=?', (payload['id'],)).fetchone())
+        self.assertFalse(self.fixture.mt5.sent)
+        database.execute('DROP TRIGGER reject_opening_intent')
+        self.assertEqual(self.bridge.place(payload)['result']['status'], 'ok')
+        self.assertEqual(len(self.fixture.mt5.sent), 1)
+
     def test_blocked_checkpoint_holds_no_native_account_lock(self):
         entered, release = threading.Event(), threading.Event()
 

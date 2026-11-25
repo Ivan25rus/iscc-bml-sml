@@ -18,7 +18,7 @@ import multiprocessing
 import subprocess
 import sys
 from contextlib import contextmanager, nullcontext
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from functools import wraps, lru_cache
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from datetime import datetime, timezone
@@ -32,6 +32,7 @@ TIME_EXIT_FROZEN_RETRY_SECONDS = (1, 2, 4, 8, 15)
 RECEIVER_RETRY_SECONDS = 1
 BRIDGE_VERSION = 39
 ENTRY_PROTOCOL_CAPABILITIES = ('hybrid-entry-batch-v1', 'entry-admission-cancel-proof-v1', 'hybrid-quote-wait-v1', 'entry-cancel-proof-v1', 'entry-fill-priority-v1')
+REQUEST_DIGEST_JSON = json.JSONEncoder(sort_keys=True, allow_nan=False)
 
 class EntryPriceRejected(ValueError):
     def __init__(self, message, details):
@@ -59,6 +60,12 @@ def new_york_zone():
     from zoneinfo import ZoneInfo
     import base64, gzip, io
     return ZoneInfo.from_file(io.BytesIO(gzip.decompress(base64.b64decode(NEW_YORK_TZIF_GZIP))),key='America/New_York')
+
+
+@lru_cache(maxsize=64)
+def new_york_deadline_fields(due):
+    local = datetime.fromtimestamp(due/1000, timezone.utc).astimezone(new_york_zone())
+    return local.strftime('%Y-%m-%d'), local.strftime('%H:%M'), not (local.second or local.microsecond)
 
 
 def measured(timing, name, fn, *args):
@@ -296,7 +303,8 @@ class Bridge:
         # Only immutable timezone rules are cached. Clock freshness and the
         # supplied deadline are still validated for every command/account.
         new_york_zone()
-        self.db = sqlite3.connect(database, check_same_thread=False)
+        # The risk reader has no trade receipts or background rules to persist.
+        self.db = sqlite3.connect(':memory:' if config.get('_riskOnly') else database, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
         self.ledger_checkpoint = LedgerCheckpoint(self, database)
@@ -306,6 +314,10 @@ class Bridge:
         for account in (str(config['account']), *(str(row['account']) for row in config.get('linkedAccounts', []))):
             self._ensure_management_indexes(account)
         self.db.execute('CREATE TABLE IF NOT EXISTS time_rules (id TEXT PRIMARY KEY, payload TEXT, state TEXT, result TEXT)')
+        # The rule thread shares the account lock with preparation and snapshots.
+        # Index the working rules without adding completed history to these indexes.
+        self.db.execute("CREATE INDEX IF NOT EXISTS close_rules_armed ON close_rules(state) WHERE state='armed'")
+        self.db.execute("CREATE INDEX IF NOT EXISTS time_rules_armed ON time_rules(state) WHERE state='armed'")
         self.db.execute('CREATE TABLE IF NOT EXISTS request_targets (id TEXT PRIMARY KEY, ticket TEXT, symbol TEXT)')
         self.db.execute("CREATE INDEX IF NOT EXISTS request_unknown_ticket ON requests(CASE WHEN json_valid(result) THEN json_extract(result,'$.ticket') END) WHERE CASE WHEN json_valid(result) THEN json_extract(result,'$.status') ELSE 'invalid' END IN ('unknown','invalid')")
         self.db.execute("CREATE INDEX IF NOT EXISTS group_unknown_ticket ON groups(CASE WHEN json_valid(payload) THEN json_extract(payload,'$.payload.ticket') END) WHERE CASE WHEN json_valid(result) THEN json_extract(result,'$.status') ELSE 'invalid' END IN ('unknown','invalid')")
@@ -377,7 +389,8 @@ class Bridge:
                 self.write_time_rule(identifier, payload, 'unknown', result or
                     {'status':'unknown','reason':'Receiver interrupted; inspect MT5'})
         from chunk_entry import ChunkEntries, EntryDiagnostics
-        role='coordinator' if config.get('_coordinatorOnly') else 'mt5-'+str(config['account'])
+        role = ('coordinator' if config.get('_coordinatorOnly') else
+                ('risk-' if config.get('_riskOnly') else 'mt5-') + str(config['account']))
         self.entry_diagnostics=EntryDiagnostics(pathlib.Path(database).resolve().parent/'logs'/'entry-diagnostics'/(role+'.jsonl'),config['account'])
         self.chunk_entries = ChunkEntries(self,restore=not config.get('_nativeWorker') and not config.get('_coordinatorOnly'))
 
@@ -533,7 +546,7 @@ class Bridge:
             trace.update(staleSince=None, maxAge=None)
 
     @serialized
-    def entry_context(self, symbol, watch=(), pending_limits=()):
+    def entry_context(self, symbol, watch=(), pending_limits=(), exact_limit=None):
         # One account mutex/RPC. Read existing position proof before the quote.
         started = time.perf_counter()
         account = self.account()
@@ -543,19 +556,34 @@ class Bridge:
             proof = self._entry_positions_for(watch,account) if watch else None
             snapshot = self.entry_snapshot(symbol)
             changes = []
+            limit_view = None
+            if exact_limit is not None:
+                if not isinstance(exact_limit, str) or not re.fullmatch(r'[1-9][0-9]{0,19}', exact_limit):
+                    raise ValueError('Invalid captured limit ticket')
+                age = time.time()*1000 - snapshot['quote']['utcTime']*1000
+                if -250 <= age <= 1000:
+                    try:
+                        _, view = self._read_entry_limit(exact_limit, symbol, account)
+                        limit_view = (exact_limit, view)
+                    except (OSError, RuntimeError, ValueError):
+                        pass  # Fall back to the regular exact read.
             if pending_limits:
                 try:
-                    orders = self.read_timings.call('ordersRead', self.mt5.orders_get, symbol=symbol)
+                    selected = {'ticket': int(pending_limits[0][0])} if len(pending_limits) == 1 else {'symbol': symbol}
+                    orders = self.read_timings.call('ordersRead', self.mt5.orders_get, **selected)
                     if orders is not None:
-                        remaining = {str(row.ticket): row.volume_current for row in orders}
+                        remaining = {str(row.ticket): row.volume_current for row in orders if row.symbol == symbol}
                         # An absent or smaller order is only a reason to read exact proof.
                         changes = [ticket for ticket, volume in pending_limits
                                    if ticket not in remaining or remaining[ticket] < volume-1e-8]
                 except (OSError, RuntimeError, ValueError):
                     pass  # Keep the regular exact order poll available.
         finally:self.entry_read_context.account=previous
-        return dict(snapshot=snapshot, proof=proof, pendingLimitChanges=changes,
-            contextMs=round((time.perf_counter()-started)*1000, 3))
+        result = dict(snapshot=snapshot, proof=proof, pendingLimitChanges=changes,
+                      contextMs=round((time.perf_counter()-started)*1000, 3))
+        if limit_view is not None:
+            result['exactLimit'] = limit_view
+        return result
 
     @serialized
     def entry_primary_sizing(self, payload):
@@ -566,7 +594,7 @@ class Bridge:
         self._validate_entry_account(account)
         symbol = payload['symbol']
         if symbol not in self.config['symbols']:
-            raise ValueError('Only SPX500 and USTEC are allowed')
+            raise ValueError('Trading symbol is not configured')
         self._expire_specification(symbol)
         metadata = self.instrument_metadata.get(symbol)
         if metadata is None:
@@ -575,7 +603,7 @@ class Bridge:
         return primary_balance_risk_sizing(payload, account, metadata, self._risk_includes_credit(account))
 
     @serialized
-    def entry_admission(self, payload, primary_intent=None):
+    def entry_admission(self, payload, primary_intent=None, daily_budget=None):
         """One account-local read/preflight batch; no intent or broker send."""
         account=self.account()
         if (not self.config.get('tradingEnabled',False) or getattr(account,'margin_mode',None)!=2
@@ -593,6 +621,10 @@ class Bridge:
         if primary_intent is not None:
             primary_sizing = primary_balance_risk_sizing(primary_intent, account, snapshot['metadata'],
                                                          self._risk_includes_credit(account))
+            # Both the market parts and outstanding return limits use this
+            # saved account spec. The broker's native specification is intact.
+            if 'perOrderQuantityLimit' in primary_sizing:
+                spec['maxQty'] = primary_sizing['perOrderQuantityLimit']
             payload = dict(payload, **{key:primary_sizing[key] for key in size_fields})
         if has_widened_zone:
             payload = widened_zone_sizes(payload,snapshot)
@@ -601,6 +633,8 @@ class Bridge:
             risk_sizing = balance_risk_sizing(payload, account, snapshot['metadata'],
                                              include_credit=self._risk_includes_credit(account))
             payload = dict(payload, **{key:risk_sizing[key] for key in size_fields})
+        if daily_budget is not None:
+            self._check_daily_entry_risk(account, daily_budget, payload['riskUsd'])
         _, chunk=account_entry_sizes(payload,spec)
         state=dict(accounts={str(account.login):dict(parts=[chunk])})
         request=ChunkEntries._child(SimpleNamespace(primary=str(account.login)),payload,state,0,payload['trigger'])
@@ -635,6 +669,17 @@ class Bridge:
                 raise ValueError('Broker quote time is ambiguous or nonexistent at a clock change')
             return first.timestamp()
         return stamp - self.broker_utc_offset_seconds
+
+    def _entry_position_clock(self, position):
+        # Read the creation clock from the position already returned by MT5.
+        # Its timestamp is not the time of a subsequent partial execution.
+        if not getattr(position, 'time_msc', 0):
+            return {}
+        try:
+            opened_at = round(self.tick_utc_seconds(position)*1000)
+            return {'brokerOpenedAtMs': opened_at} if opened_at > 0 else {}
+        except (TypeError, ValueError, AttributeError, OverflowError, OSError):
+            return {}
 
     def observe_quote(self, symbol, tick, source, captured_at, read_ms):
         """Bounded evidence from existing native reads; never refresh a tick."""
@@ -690,23 +735,30 @@ class Bridge:
         started=time.perf_counter();timing={}
         account = self.account(timing)
         snapshots, unavailable = {}, []
+        gold, gold_unavailable = {}, False
         failure = None
         for symbol in self.config['symbols']:
             try:
-                snapshots[symbol] = self._snapshot(symbol, account)
+                data = self._snapshot(symbol, account)
+                (gold if symbol == 'XAUUSD' else snapshots)[symbol] = data
             except ValueError as error:
                 failure = error
-                unavailable.append(symbol)
-        if not snapshots:
+                if symbol == 'XAUUSD':
+                    gold_unavailable = True
+                else:
+                    unavailable.append(symbol)
+        if not snapshots and not gold:
             raise failure or ValueError('No valid broker quotes in the frame')
         return {'account': account.login, 'server': account.server, 'snapshots': snapshots,
                 'capturedAt': time.time() * 1000, 'intervalMs': round(self.quote_interval() * 1000),
                 **({'unavailableSymbols':unavailable} if unavailable else {}),
+                **({'additionalSnapshots':gold} if gold else {}),
+                **({'unavailableAdditionalSymbols':['XAUUSD']} if gold_unavailable else {}),
                 'quoteTiming':dict(timing,nativeMs=round((time.perf_counter()-started)*1000,3))}
 
     def _snapshot(self, symbol, account):
         if symbol not in self.config['symbols']:
-            raise ValueError('Only SPX500 and USTEC are allowed')
+            raise ValueError('Trading symbol is not configured')
         self._expire_specification(symbol)
         metadata = self.instrument_metadata.get(symbol)
         if metadata is None and not self.mt5.symbol_select(symbol, True):
@@ -723,7 +775,7 @@ class Bridge:
                 raise ValueError('Cannot obtain broker instrument specifications')
             value = self.mt5.order_calc_profit(self.mt5.ORDER_TYPE_BUY, symbol, 1., tick.ask, tick.ask + 1.)
             if value is None or not math.isfinite(value) or value <= 0:
-                raise ValueError('Cannot obtain USD value of one index point')
+                raise ValueError('Cannot obtain USD value of one price unit')
             metadata = {'tickSize': info.trade_tick_size, 'quantityStep': info.volume_step,
                         'minQty': info.volume_min, 'maxQty': info.volume_max, 'contractSize': value}
             if any(not math.isfinite(number) or number <= 0 for number in metadata.values()) or metadata['maxQty'] < metadata['minQty']:
@@ -746,20 +798,82 @@ class Bridge:
     def place(self, payload):
         return self.execute('place', payload)
 
+    @staticmethod
+    def new_york_trade_zone():
+        return new_york_zone()
+
     @serialized
-    def check_opening(self, payload):
+    def daily_entry_risk(self):
+        from new_york_trade_limits import daily_pnl, risk_day_start
+
+        account = self.account()
+        now = time.time()
+        window_start = risk_day_start(now, new_york_zone())
+        offset = abs(self.broker_utc_offset_seconds) + 3600
+        deals = self.read_timings.call('dealHistory', self.mt5.history_deals_get,
+                                       math.floor(window_start - offset), math.ceil(now + offset))
+        if deals is None:
+            raise ValueError('Дневной риск: история MT5 недоступна')
+        start_balance, realized = daily_pnl(self.mt5,
+            (deal for deal in deals if window_start <= self.tick_utc_seconds(deal) <= now), account.balance)
+        positions = self.mt5.positions_get()
+        orders = self.mt5.orders_get()
+        if positions is None or orders is None:
+            raise ValueError('Дневной риск: позиции или заявки MT5 недоступны')
+        buys = {self.mt5.ORDER_TYPE_BUY, self.mt5.ORDER_TYPE_BUY_LIMIT, self.mt5.ORDER_TYPE_BUY_STOP,
+                getattr(self.mt5, 'ORDER_TYPE_BUY_STOP_LIMIT', 6)}
+        exposure = [self._opening_loss(row.symbol, row.type in buys, row.volume, row.price_open, row.sl) for row in positions]
+        exposure.extend(self._opening_loss(row.symbol, row.type in buys, row.volume_current, row.price_open, row.sl) for row in orders)
+        if self.account().balance != account.balance:
+            raise ValueError('Дневной риск: баланс изменился при проверке, повторите вход')
+        return dict(account=str(account.login), server=account.server, balance=account.balance, capturedAt=now,
+                    windowStart=window_start, startBalance=start_balance, realized=realized, exposure=math.fsum(exposure))
+
+    def _opening_loss(self, symbol, buy, volume, price, stop):
+        if not stop or stop <= 0:
+            raise ValueError('Дневной риск: есть позиция или заявка без подтверждённого стопа')
+        order_type = self.mt5.ORDER_TYPE_BUY if buy else self.mt5.ORDER_TYPE_SELL
+        profit = self.mt5.order_calc_profit(order_type, symbol, volume, price, stop)
+        if profit is None or not math.isfinite(profit):
+            raise ValueError('Дневной риск: MT5 не подтвердил риск до стопа')
+        return max(0., -profit)
+
+    @staticmethod
+    def _check_daily_entry_risk(account, budget, requested):
+        from new_york_trade_limits import check_daily_budget, risk_day_start
+
+        snapshot, reserved = budget
+        if 'error' in snapshot:
+            raise ValueError(snapshot['error'])
+        now = time.time()
+        captured_at = snapshot['capturedAt']
+        if (snapshot['account'] != str(account.login) or snapshot['server'] != account.server
+                or snapshot['balance'] != account.balance or not 0 <= now - captured_at <= 2
+                or snapshot.get('windowStart') != risk_day_start(now, new_york_zone())):
+            raise ValueError('Дневной риск: состояние счёта или торговый день изменились, повторите вход')
+        check_daily_budget(snapshot['startBalance'], snapshot['realized'], snapshot['exposure'] + reserved,
+                           requested, account=account.login)
+
+    @serialized
+    def check_opening(self, payload, requested_risk=None, daily_budget=None):
         # Internal worker RPC, never an HTTP trading endpoint. Both terminals
         # must pass this read-only barrier before either submission can begin.
         account=self.account()
         if not self.config.get('tradingEnabled',False): raise ValueError('MT5 receiver is in read-only mode')
-        self.open_request(payload)
+        request = self.open_request(payload)
         self.validate_deadline(payload)
         if 'closeAtUtc' in payload and getattr(account,'margin_mode',2)!=2:
             raise ValueError('Timed exit requires a hedging account with a separate position')
+        if daily_budget is not None:
+            if requested_risk is None:
+                requested_risk = self._opening_loss(request['symbol'], payload['side'] == 'buy', request['volume'],
+                                                    request['price'], request['sl'])
+            self._check_daily_entry_risk(account, daily_budget, requested_risk)
         return True
 
     @serialized
-    def execute(self, operation, payload, received=None, native_opening_guard_after_claim=False, next_entry_snapshot=False):
+    def execute(self, operation, payload, received=None, native_opening_guard_after_claim=False, next_entry_snapshot=False,
+                daily_budget=None):
         started = time.perf_counter()
         timing = {'receivedAt': received[0] if received else time.time()*1000,
                   'queueMs': round((started-received[1])*1000, 2) if received else 0.}
@@ -812,11 +926,12 @@ class Bridge:
         identifier = str(payload.get('id', ''))
         if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', identifier):
             raise ValueError('Missing or invalid request ID')
-        core = {key: value for key, value in payload.items() if key != 'expiresAt'}
+        core = dict(payload)
+        core.pop('expiresAt', None)
         # Keep existing opening digests compatible with the installed ledger.
         if operation != 'place':
             core['operation'] = operation
-        digest = hashlib.sha256(json.dumps(core, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        digest = hashlib.sha256(REQUEST_DIGEST_JSON.encode(core).encode()).hexdigest()
         timing['normalizeMs']=round((time.perf_counter()-normalize_started)*1000,2)
         previous = measured(timing,'journalLookupMs',lambda:self.db.execute('SELECT digest,result FROM requests WHERE id=?', (identifier,)).fetchone())
         if previous:
@@ -884,6 +999,10 @@ class Bridge:
                 self.validate_deadline(payload)
                 if 'closeAtUtc' in payload and getattr(account,'margin_mode',2)!=2:
                     raise ValueError('Timed exit requires a hedging account with a separate position')
+                if daily_budget is not None:
+                    risk = self._opening_loss(request['symbol'], payload['side'] == 'buy', request['volume'],
+                                              request['price'], request['sl'])
+                    self._check_daily_entry_risk(account, daily_budget, risk)
             else:
                 request = measured(timing, 'requestBuildMs', self.control_request, operation, payload, timing)
         except (ValueError, TypeError, KeyError) as error:
@@ -898,16 +1017,21 @@ class Bridge:
         ledger_started = time.perf_counter()
         timing['prepareMs'] = round((ledger_started-started)*1000, 2)
         timing['prepareOtherMs']=round(max(0,timing['prepareMs']-sum(timing.get(key,0.) for key in ('normalizeMs','journalLookupMs','accountCheckMs','requestBuildMs'))),2)
-        self.db.execute('INSERT INTO requests VALUES (?,?,?)', (identifier, digest, json.dumps(unknown)))
-        if operation!='place': self.db.execute('INSERT INTO request_targets VALUES (?,?,?)',(identifier,str(payload['ticket']),payload['symbol']))
-        if operation=='place' and 'closeAtUtc' in payload:
-            deadline={key:payload[key] for key in ('symbol','closeAtUtc','closeTimeZone','closeLocalDate','closeLocalTime','cancelPendingAtDeadline')}
-            deadline.update(openingId=identifier,createdAt=time.time()*1000,actions={})
-            self.db.execute('INSERT INTO time_rules VALUES (?,?,?,?)',(identifier,json.dumps(deadline),'opening',json.dumps(unknown)))
-        commit_started = time.perf_counter()
-        timing['ledgerInsertMs'] = round((commit_started-ledger_started)*1000, 2)
-        commit_cpu_started = time.thread_time()
-        self.db.commit()
+        encoded_unknown = json.dumps(unknown)
+        try:
+            self.db.execute('INSERT INTO requests VALUES (?,?,?)', (identifier, digest, encoded_unknown))
+            if operation!='place': self.db.execute('INSERT INTO request_targets VALUES (?,?,?)',(identifier,str(payload['ticket']),payload['symbol']))
+            if operation=='place' and 'closeAtUtc' in payload:
+                deadline={key:payload[key] for key in ('symbol','closeAtUtc','closeTimeZone','closeLocalDate','closeLocalTime','cancelPendingAtDeadline')}
+                deadline.update(openingId=identifier,createdAt=time.time()*1000,actions={})
+                self.db.execute('INSERT INTO time_rules VALUES (?,?,?,?)',(identifier,json.dumps(deadline),'opening',encoded_unknown))
+            commit_started = time.perf_counter()
+            timing['ledgerInsertMs'] = round((commit_started-ledger_started)*1000, 2)
+            commit_cpu_started = time.thread_time()
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
         committed_at = time.perf_counter()
         timing['ledgerCommitMs'] = round((committed_at-commit_started)*1000, 2)
         timing['ledgerCommitCpuMs'] = round((time.thread_time()-commit_cpu_started)*1000, 2)
@@ -1070,14 +1194,12 @@ class Bridge:
     @staticmethod
     def validate_deadline(payload):
         if 'closeAtUtc' not in payload: return
-        from datetime import datetime, timezone
         due=payload['closeAtUtc']
         if type(due) not in (int,float) or not math.isfinite(due) or not time.time()*1000<due<=time.time()*1000+26*3600000:
             raise ValueError('Timed exit must be in the future, within 26 hours')
-        local=datetime.fromtimestamp(due/1000,timezone.utc).astimezone(new_york_zone())
+        date, clock, on_minute = new_york_deadline_fields(due)
         if (payload.get('closeTimeZone')!='America/New_York' or payload.get('cancelPendingAtDeadline') is not True
-            or local.strftime('%Y-%m-%d')!=payload.get('closeLocalDate') or local.strftime('%H:%M')!=payload.get('closeLocalTime')
-            or local.second or local.microsecond):
+            or date!=payload.get('closeLocalDate') or clock!=payload.get('closeLocalTime') or not on_minute):
             raise ValueError('Timed exit date does not match New York clock')
 
     def write_time_rule(self, identifier, payload, state, result):
@@ -1325,7 +1447,11 @@ class Bridge:
         if time.monotonic()<self.time_rule_check_at: return
         self.time_rule_check_at=time.monotonic()+.1
         rules=self.db.execute("SELECT id,payload FROM time_rules WHERE state='armed'").fetchall()
-        due=[(i,json.loads(p)) for i,p in rules if json.loads(p)['closeAtUtc']<=time.time()*1000]
+        due = []
+        for identifier, raw in rules:
+            payload = json.loads(raw)
+            if payload['closeAtUtc'] <= time.time()*1000:
+                due.append((identifier, payload))
         # A closed opening no longer needs its deadline. Reconcile before that
         # deadline too, with the same broker-history and unknown-command checks.
         # Bound history work independently of the quote publisher's cadence.
@@ -1625,6 +1751,9 @@ class Bridge:
     def _capabilities(self):
         # Entry receipts also carry this full list: clients replace their
         # connection capability cache when an authenticated reply includes it.
+        from chunk_entry import GOLD_PRIMARY_PER_ORDER_CAPABILITY, gold_primary_order_limit
+        gold_per_order = (getattr(self,'isolated_entries',False) and 'XAUUSD' in self.config.get('symbols', ())
+                          and gold_primary_order_limit(self.config.get('account'), 'XAUUSD') is not None)
         return ['place','cancel','close','partial-close','modify','schedule-close','cancel-close','quote-stream','adaptive-quotes','timings','diagnostics','mirror-accounts','management-snapshot','linked-worker-recovery','scaled-accounts','percentage-close','time-exit','opening-history','group-admission','prepared-group-workers','latest-quote-publisher','batched-management-reads','chunked-breakout','market-zone-entry','market-zone-entry-stop','market-offset-entry','market-side-zone-entry','candle-levels','candle-levels-color','candle-levels-window','candle-levels-mappings',
                 'market-limit-side-zone-entry','hybrid-market-limit-v1','hybrid-position-protection-v1','hybrid-entry-speed-v1',
                 'hybrid-native-reconcile-v1','hybrid-support-reprice-v1','atomic-entry-admission-v1','entry-progress-snapshots-v1','independent-account-entry-v2',
@@ -1632,9 +1761,13 @@ class Bridge:
                 'independent-account-lanes-v4','entry-events-v1','entry-account-continue-v1','entry-stop-priority-v1',
                 'entry-control-recovery-v1','entry-stop-receipt-read-v1','entry-intent-delivery-v1','entry-status-order-v1','entry-exact-parent-close-v1','entry-account-controls-v1','entry-parent-partial-close-v1',
                 *(['entry-exact-parent-protection-v1','minute-chart-bars-v1','entry-parent-partial-take-v1'] if getattr(self,'isolated_entries',False) else []),
-                *(['independent-account-engines-v5','entry-initial-sizing-only-v1','management-active-v1','entry-balance-risk-v1','entry-primary-balance-risk-v1','entry-account-chunk-percent-v1','entry-account-zone-v1'] if getattr(self,'isolated_entries',False) else []),
+                *(['position-presence-v1'] if callable(getattr(self, 'position_presence_accounts', None)) else []),
+                *(['independent-account-engines-v5','entry-initial-sizing-only-v1','management-active-v1','entry-balance-risk-v1','entry-primary-balance-risk-v1','entry-account-chunk-percent-v1','entry-account-zone-v1','entry-followers-only-v1','entry-separate-lt-v1'] if getattr(self,'isolated_entries',False) else []),
                 *(['entry-account-start-v1'] if getattr(self,'isolated_entries',False) and not self.config.get('entryRiskLimitUsd') else []),
                 *(['entry-market-first-v1'] if getattr(self,'isolated_entries',False) and self.config.get('entryMarketFirst') is True else []),
+                *([GOLD_PRIMARY_PER_ORDER_CAPABILITY] if gold_per_order else []),
+                *(['entry-gold-v1'] if getattr(self,'isolated_entries',False) and 'XAUUSD' in self.config.get('symbols', ()) else []),
+                *(['new-york-trade-limits-v1'] if getattr(getattr(self,'chunk_entries',None),'trade_limits',None) else []),
                 *ENTRY_PROTOCOL_CAPABILITIES] + (['lt-level-sync-v1'] if getattr(self,'lt_level_sync',None) else []) + (['account-enrollment','mt4-preparation'] if getattr(self,'account_registry',None) else []) + (['chart-recorder-v1'] if getattr(self,'chart_recorder',None) else []) + (['tradehub-roles-v1'] if getattr(self,'tradehub_roles',None) else [])
 
     def _risk_includes_credit(self, account):
@@ -1690,12 +1823,65 @@ class Bridge:
                 return identifier,data,result
         raise ValueError('Selected position has no linked opening from ISCC')
 
-    def group_execute(self, operation, payload, received=None, *, volumes=None, guards=None, independent=False):
+    def submit_opening(self, payload, received=None, account=None):
+        primary = str(self.config['account'])
+        selected = self.linked.get(account) if account and account != primary else None
+        grouped = selected is None and bool(payload.get('mirrorAccount') or payload.get('mirrorAccounts'))
+        if 'excludePrimary' in payload and (payload['excludePrimary'] is not True or account is not None or not grouped):
+            raise ValueError('Followers-only opening requires linked accounts through the coordinator')
+        limits = self.chunk_entries.trade_limits
+        if not limits:
+            if selected:
+                return selected.call('execute', 'place', payload)
+            return self.group_execute('place', payload, received) if grouped else self.execute('place', payload, received)
+        return self._limited_opening(payload, received, account or primary, selected, grouped, limits)
+
+    def _limited_opening(self, payload, received, account, selected, grouped, limits):
+        from contextlib import ExitStack
+
+        identifier = str(payload.get('id', ''))
+        if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,130}', identifier):
+            raise ValueError('Missing or invalid request ID')
+        def reject(reason):
+            return dict(account=int(account), server=self.config['server'], result=dict(status='rejected', reason=reason))
+
+        engine = self.chunk_entries
+        slot = ('group:' if grouped else account + ':') + identifier
+        with ExitStack() as locks:
+            reserved = False
+            try:
+                if grouped:
+                    followers = tuple(self.requested_followers(payload))
+                    accounts = followers if payload.get('excludePrimary') is True else (account, *followers)
+                else:
+                    accounts = (account,)
+                shards = {login: engine._shard(login) for login in sorted(accounts)}
+                for shard in shards.values():
+                    locks.enter_context(shard.opening_budget_lock)
+                with engine.lock:
+                    reserved = limits.reserve_direct(slot, time.time())
+                budgets = engine.opening_budgets(shards, replay_possible=True)
+            except (ValueError, TypeError, KeyError) as error:
+                if reserved:
+                    limits.release_direct(slot)
+                return reject(str(error))
+            if grouped:
+                reply = self.group_execute('place', payload, received, daily_budgets=budgets)
+            else:
+                args = ('place', payload, received, False, False, budgets[account])
+                reply = selected.call('execute', *args) if selected else self.execute(*args)
+            if reply['result']['status'] == 'rejected':
+                limits.release_direct(slot)
+            return reply
+
+    def group_execute(self, operation, payload, received=None, *, volumes=None, guards=None, independent=False,
+                      daily_budgets=None):
         # Group coordination never owns the primary MT5/SQLite lock while
         # waiting for the other process. Same-ID groups remain serialized.
         received = received or (time.time()*1000,time.perf_counter())
         with self.group_lock:
-            return self._group_execute(operation, payload, received, volumes=volumes, guards=guards, independent=independent)
+            return self._group_execute(operation, payload, received, volumes=volumes, guards=guards, independent=independent,
+                                       daily_budgets=daily_budgets)
 
     def warm_group_executor(self):
         # The executor lives until receiver shutdown. An already running
@@ -1879,7 +2065,8 @@ class Bridge:
             result[account] = volume
         return result
 
-    def _group_execute(self, operation, payload, received, *, volumes=None, guards=None, independent=False):
+    def _group_execute(self, operation, payload, received, *, volumes=None, guards=None, independent=False,
+                       daily_budgets=None):
         if type(independent) is not bool or independent and (operation != 'place' or volumes is None or guards is None):
             raise ValueError('Independent batches require captured internal account guards')
         timing = {'receivedAt':received[0], 'queueMs':round((time.perf_counter()-received[1])*1000,2)}
@@ -1906,7 +2093,10 @@ class Bridge:
         followers=measured(timing,'followerValidationMs',self.requested_followers,payload)
         if operation=='place': measured(timing,'deadlineValidationMs',self.validate_deadline,payload)
         sizing_started=time.perf_counter()
-        requests={primary:dict(payload)}
+        exclude_primary = payload.get('excludePrimary') is True
+        if 'excludePrimary' in payload and (not exclude_primary or operation != 'place' or not followers):
+            raise ValueError('Followers-only opening requires linked accounts')
+        requests={} if exclude_primary else {primary:dict(payload)}
         states={}
         if operation!='place':
             with self.lock:
@@ -1958,6 +2148,7 @@ class Bridge:
                     request.update(volume=amount,expectedVolume=row['lots'])
         for request in requests.values():
             request.pop('mirrorAccount',None); request.pop('mirrorAccounts',None)
+            request.pop('excludePrimary', None)
         if volumes is not None or guards is not None:
             if (operation!='place' or not isinstance(volumes,dict) or not isinstance(guards,dict)
                     or not volumes or not set(volumes).issubset(requests) or set(guards)!=set(volumes)):
@@ -1977,14 +2168,16 @@ class Bridge:
             # Verify both real terminal identities in parallel, not just that
             # worker processes exist. A failed preflight sends no orders.
             check_started=time.perf_counter()
-            checks={account:executor.submit(self.linked[account].call,'check_opening',request)
+            def check_args(account):
+                return (requests[account], None, daily_budgets[account]) if daily_budgets is not None else (requests[account],)
+            checks={account:executor.submit(self.linked[account].call,'check_opening',*check_args(account))
                     for account,request in requests.items() if account!=primary}
             # The coordinator already has a thread. Start follower checks first
             # and perform the primary check here, removing a scheduling hop.
             # Every check still finishes before either submission is allowed.
             try:
-                if primary in requests: self.check_opening(requests[primary])
-                else: self.account()
+                if primary in requests: self.check_opening(*check_args(primary))
+                elif not exclude_primary: self.account()
             except (ValueError,OSError,RuntimeError) as error:
                 if independent and primary in requests: account_refusals[primary]=str(error)
                 else: preflight_error=str(error)
@@ -2303,7 +2496,7 @@ class Bridge:
         if not isinstance(previous,list) or len(previous)>200:
             raise ValueError('Invalid previous chunk positions')
         if previous:
-            current=self.mt5.positions_get()
+            current=self.mt5.positions_get(symbol=request['symbol'])
             if current is None: raise ValueError('Cannot confirm previous chunk positions')
             current={str(row.ticket):row for row in current}
             for expected in previous:
@@ -2585,7 +2778,7 @@ class Bridge:
             take = float(payload['tp']) if 'tp' in payload else None
             if 'takeDistance' in payload:
                 from chunk_entry import entry_take_price, number
-                if take is not None or symbol not in ('USTEC','SPX500') or 'breakeven' in payload:
+                if take is not None or symbol not in ('USTEC','SPX500','XAUUSD') or 'breakeven' in payload:
                     raise ValueError('Invalid weighted entry take profit policy')
                 distance = number(payload['takeDistance'], 'Entry take distance')
                 take = entry_take_price(average, direction, distance, tick_size)
@@ -2640,10 +2833,10 @@ class Bridge:
                     raise ValueError('Cannot confirm remaining target risk in USD')
                 future_risk = max(0., -float(profit))
             weighted = payload.get('weightedEntryStop') is True
-            if 'weightedEntryStop' in payload and (not weighted or symbol not in ('USTEC','SPX500')
+            if 'weightedEntryStop' in payload and (not weighted or symbol not in ('USTEC','SPX500','XAUUSD')
                     or 'stopDistance' not in payload
                     or 'tp' in payload):
-                raise ValueError('Invalid weighted Nasdaq entry stop policy')
+                raise ValueError('Invalid weighted entry stop policy')
             if final_risk > budget + 1e-8 or not weighted and initial_risk > budget + 1e-8:
                 raise ValueError('Common stop exceeds the reserved risk budget')
             base.update(averagePrice=average, sl=stop, riskUsed=final_risk, filledVolume=volume,
@@ -2681,8 +2874,13 @@ class Bridge:
                 result = response['result']
                 elapsed=(time.perf_counter()-modification_started)*1000
                 protection_timing['modifyMs']=round(protection_timing.get('modifyMs',0.)+elapsed,3)
-                observe_stage('broker-modification',elapsed,**{
-                    name:response.get('serverTiming',{}).get(name) for name in ('mt5Ms','ledgerBeforeMs','ledgerAfterMs')})
+                native_timing = {name:response.get('serverTiming',{}).get(name)
+                                 for name in ('mt5Ms','ledgerBeforeMs','ledgerAfterMs')}
+                if identifier.startswith('parent-protection:'):
+                    for name, value in native_timing.items():
+                        if value is not None:
+                            protection_timing[name] = round(protection_timing.get(name, 0.) + value, 3)
+                observe_stage('broker-modification',elapsed,**native_timing)
                 if result.get('status') != 'ok':
                     return finish('unknown' if result.get('status') == 'unknown' else 'rejected',
                                   'Common stop modification not confirmed: '+str(result.get('reason',result.get('status'))))
@@ -2718,6 +2916,25 @@ class Bridge:
         _, view = self._read_entry_limit(ticket, symbol)
         return view
 
+    @serialized
+    def entry_limit_states(self, tickets, symbol):
+        """Read sibling openings from one current positions/orders snapshot."""
+        if (symbol not in self.config['symbols'] or not 2 <= len(tickets) <= 8
+                or len(set(tickets)) != len(tickets)
+                or any(not re.fullmatch(r'[1-9][0-9]{0,19}', ticket) for ticket in tickets)):
+            raise ValueError('Invalid captured limit tickets or symbol')
+        data = self._orders(self.account(), symbol)
+        views = {}
+        for ticket in tickets:
+            try:
+                view = self._entry_limit_view(ticket, symbol, data)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            # Absence or terminal history needs the ordinary exact reread.
+            if view['terminal']['phase'] == 'active':
+                views[ticket] = view
+        return views
+
     def _entry_limit_snapshot(self, ticket, symbol, account=None):
         if account is None:
             account = self.account()
@@ -2726,15 +2943,15 @@ class Bridge:
         proof['checkedAt'] = checked_at
         return proof, self._entry_limit_view(ticket, symbol, proof)
 
-    def _read_entry_limit(self, ticket, symbol):
-        proof, view = self._entry_limit_snapshot(ticket, symbol)
+    def _read_entry_limit(self, ticket, symbol, account=None):
+        proof, view = self._entry_limit_snapshot(ticket, symbol, account)
         terminal = view['terminal']
         if (terminal['phase'] == 'unknown' and terminal.get('reason') in (
                 'Opening not found in broker history', 'No balanced full exit in broker history',
                 'Opening outcome unconfirmed')):
             # An accepted order can fill between positions_get and orders_get.
             # Reread once and match the same opening. Absence still proves nothing.
-            return self._entry_limit_snapshot(ticket, symbol)
+            return self._entry_limit_snapshot(ticket, symbol, account)
         return proof, view
 
     def _entry_limit_view(self, ticket, symbol, data):
@@ -2883,6 +3100,18 @@ class Bridge:
     def orders(self):
         return self._orders(self.account())
 
+    @serialized
+    def position_presence(self, symbol):
+        if symbol not in self.config['symbols']:
+            raise ValueError('Position symbol is not configured')
+        account = self.account()
+        checked_at = time.time()*1000
+        positions = self.read_timings.call('positionsRead', self.mt5.positions_get, symbol=symbol)
+        if positions is None:
+            raise ValueError('Cannot read MT5 positions')
+        return dict(account=account.login, server=account.server, symbol=symbol, checkedAt=checked_at,
+                    hasPosition=any(row.symbol == symbol and row.volume > 0 for row in positions))
+
     def _orders(self, account, symbol=None):
         query={} if symbol is None else dict(symbol=symbol)
         positions = self.read_timings.call('positionsRead', self.mt5.positions_get, **query)
@@ -2912,6 +3141,8 @@ class Bridge:
                                'quantityStep': info.volume_step if info else None,
                                'maxQty': info.volume_max if info else None,
                                'minQty': info.volume_min if info else None})
+                if position and symbol is not None:
+                    orders[-1].update(self._entry_position_clock(x))
                 if not position:
                     broker_evidence = opening_order_evidence(x, str(x.ticket), x.symbol)
                     if broker_evidence:
@@ -3022,6 +3253,78 @@ class Bridge:
         return self._entry_management_for(watch,account)
 
     @serialized
+    def entry_close_batch(self, identifier, payloads):
+        from async_parent_close import MAX_TICKETS, publish, ready_folder
+        from chunk_entry import native_parent_close_id
+
+        if self.config.get('entryAsyncClose') is not True:
+            return dict(available=False)
+        if not isinstance(payloads, list) or not 2 <= len(payloads) <= MAX_TICKETS:
+            raise ValueError('Invalid full-close batch size')
+        account = self.account()
+        if (not self.config.get('tradingEnabled', False) or account.margin_mode != 2
+                or not account.trade_allowed or not account.trade_expert):
+            raise ValueError('Account does not permit asynchronous full close')
+        terminal = self.last_terminal_info
+        folder = ready_folder(terminal.data_path, account.login, account.server) if terminal else None
+        if folder is None:
+            return dict(available=False)
+        batch = hashlib.sha256(identifier.encode()).hexdigest()
+        tickets, requests, intents = set(), [], []
+        for payload in payloads:
+            ticket, command_id = payload['ticket'], payload['id']
+            if ticket in tickets or command_id != native_parent_close_id(identifier, str(account.login), ticket):
+                raise ValueError('Invalid close batch ticket identity')
+            if payload['volume'] != payload['expectedVolume'] or payload['symbol'] != payloads[0]['symbol']:
+                raise ValueError('Async close is only for a single full parent')
+            tickets.add(ticket)
+            self.check_rule_unknown(payload)
+            requests.append(self.control_request('close', payload))
+            core = {key:value for key,value in payload.items() if key != 'expiresAt'}
+            stamp = hashlib.sha256(REQUEST_DIGEST_JSON.encode(dict(core,operation='close')).encode()).hexdigest()
+            unknown = dict(status='unknown', operation='close', ticket=ticket, asyncBatch=batch,
+                           requestedVolume=payload['volume'], reason='Async close intent saved; no automatic replay')
+            intents.append((command_id, stamp, json.dumps(unknown)))
+        expires = min(payload['expiresAt'] for payload in payloads)
+        if not 0 < expires-time.time()*1000 <= 3000:
+            raise ValueError('Async close command expired')
+        with self.db:
+            self.db.executemany('INSERT INTO requests VALUES (?,?,?)', intents)
+            self.db.executemany('INSERT INTO request_targets VALUES (?,?,?)',
+                ((row['id'],row['ticket'],row['symbol']) for row in payloads))
+        publish(folder, batch, account.login, account.server, expires, requests)
+        return dict(available=True, batch=batch, location=str(folder))
+
+    @serialized
+    def entry_close_batch_finish(self, batch, payloads):
+        from async_parent_close import BATCH_ID, read_reply, terminal_folder
+
+        if not BATCH_ID.fullmatch(batch):
+            raise ValueError('Invalid close batch receipt identity')
+        account = self.account()
+        terminal = self.last_terminal_info
+        if terminal is None:
+            raise ValueError('Cannot find the terminal close receipt')
+        folder = terminal_folder(terminal.data_path, account.login)
+        saved = {}
+        for payload in payloads:
+            ticket = payload['ticket']
+            receipt = self._request_receipt(payload['id'])
+            if (not receipt or receipt.get('ticket') != ticket or receipt.get('asyncBatch') != batch
+                    or receipt.get('requestedVolume') != payload['volume']):
+                raise ValueError('Async close has no matching durable intent')
+            saved[ticket] = receipt
+        outcomes = read_reply(folder, batch, {ticket:row['requestedVolume'] for ticket,row in saved.items()})
+        if outcomes is not None:
+            with self.db:
+                for payload in payloads:
+                    ticket = payload['ticket']
+                    saved[ticket].update(outcomes[ticket])
+                    self.db.execute('UPDATE requests SET result=? WHERE id=?', (json.dumps(saved[ticket]),payload['id']))
+            (folder / (batch + '.reply')).unlink(missing_ok=True)
+        return dict(account=account.login, server=account.server, results=saved)
+
+    @serialized
     def entry_close_reconciliation(self, identifier, watch):
         """Read exact exits despite this parent's own unresolved native close."""
         from chunk_entry import native_parent_close_id
@@ -3077,9 +3380,23 @@ class Bridge:
         if rows is None:raise ValueError('Cannot read captured positions')
         orders=[dict(ticket=str(row.ticket),symbol=row.symbol,lots=row.volume,open_price=row.price_open,
             sl=row.sl,tp=row.tp,type='buy' if row.type==0 else 'sell',__isPosition=True,
-            identifier=str(getattr(row,'identifier',row.ticket))) for row in rows if row.symbol in self.config['symbols']]
-        return dict(account=account.login,server=account.server,orders=orders,checkedAt=time.time()*1000,
-            openingStates={str(row['ticket']):self.opening_state(str(row['ticket']),row['symbol'],orders) for row in watch})
+            identifier=str(getattr(row,'identifier',row.ticket)), **self._entry_position_clock(row))
+            for row in rows if row.symbol in self.config['symbols']]
+        checked = time.time()*1000
+        opened = {}
+        if len(watch) > 1:
+            wanted = {(row['symbol'], str(row['ticket'])) for row in watch}
+            for row in orders:
+                for ticket in (row['ticket'], row['identifier']):
+                    key = (row['symbol'], ticket)
+                    if key in wanted:
+                        opened.setdefault(key, dict(phase='opened', ticket=row['ticket']))
+        states = {}
+        for row in watch:
+            ticket, symbol = str(row['ticket']), row['symbol']
+            known = opened.get((symbol, ticket))
+            states[ticket] = known if known is not None else self.opening_state(ticket, symbol, orders)
+        return dict(account=account.login,server=account.server,orders=orders,checkedAt=checked,openingStates=states)
 
     def _market_opening_from_deal(self, receipt, symbol):
         marker = receipt.get('marketDealOpening')
@@ -3565,11 +3882,13 @@ def worker_result(method, result):
 CANDLE_READ_METHODS=frozenset(('account','candle_levels','candle_symbols','candle_snapshot','minute_bars'))
 QUOTE_READ_METHODS=frozenset(('account','snapshot','quote_frame','set_quote_mode'))
 
-def native_worker_method(bridge, method, args, candle_only=False, quote_only=False):
+def native_worker_method(bridge, method, args, candle_only=False, quote_only=False, risk_only=False):
     if candle_only and method not in CANDLE_READ_METHODS:
         raise ValueError('Candle client permits read-only chart operations only')
     if quote_only and method not in QUOTE_READ_METHODS:
         raise ValueError('Quote client permits read-only price operations only')
+    if risk_only != (method == 'daily_entry_risk'):
+        raise ValueError('Daily risk snapshots require the dedicated read-only risk client')
     return worker_result(method,getattr(bridge,method)(*args))
 
 def _account_worker(connection, config, database):
@@ -3580,7 +3899,8 @@ def _account_worker(connection, config, database):
             raise RuntimeError('Cannot connect to linked MT5 terminal')
         candle_only=config.get('_candleOnly') is True
         quote_only=config.get('_quoteOnly') is True
-        read_only=candle_only or quote_only
+        risk_only=config.get('_riskOnly') is True
+        read_only=candle_only or quote_only or risk_only
         bridge = Bridge(mt5,dict(config,_nativeWorker=True,**({'tradingEnabled':False} if read_only else {})),database)
         bridge.account()
         if not read_only:bridge.start_rules()
@@ -3596,7 +3916,7 @@ def _account_worker(connection, config, database):
                 with bridge.lock:
                     bridge.native_command_revision += 1
                     bridge.entry_diagnostics.step(diagnostic,'rpc:'+method)
-                    result = native_worker_method(bridge,method,args,candle_only,quote_only)
+                    result = native_worker_method(bridge,method,args,candle_only,quote_only,risk_only)
                 connection.send((identifier,result,None))
             except Exception as error:
                 bridge.entry_diagnostics.finish(diagnostic,error=error)
@@ -3969,7 +4289,8 @@ class QuotePublisher:
             if (self.closed or self.failed or self.latest_frame is None or self.latest_at is None
                     or not 0 <= time.monotonic()-self.latest_at <= .1):
                 return None
-            value=self.latest_frame.get('snapshots',{}).get(symbol)
+            key = 'additionalSnapshots' if symbol == 'XAUUSD' else 'snapshots'
+            value=self.latest_frame.get(key,{}).get(symbol)
         return copy.deepcopy(value) if value is not None else None
 
     def run(self):
@@ -4122,12 +4443,14 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                     return
                 payload = None
                 operations = ('/place','/cancel','/close','/modify','/schedule-close','/cancel-close')
-                if self.command == 'POST' and route_path in (*operations, '/quote-mode', '/account-discovery', '/account-register', '/entry-plan', '/entry-plan-admit', '/entry-plan-stop', '/entry-plan-continue', '/entry-plan-protection', '/entry-plan-close', '/entry-parent-take', '/candle-levels', '/chart-recorder', '/tradehub-roles'):
+                if self.command == 'POST' and route_path in (*operations, '/place-followers', '/quote-mode', '/account-discovery', '/account-register', '/entry-plan', '/entry-plan-admit', '/entry-plan-stop', '/entry-plan-continue', '/entry-plan-protection', '/entry-plan-close', '/entry-parent-take', '/candle-levels', '/chart-recorder', '/tradehub-roles'):
                     length = int(self.headers.get('Content-Length', 0))
                     if not 0 < length <= 16384:
                         raise ValueError('Invalid body size')
                     payload = json.loads(self.rfile.read(length))
                 received = (time.time()*1000, time.perf_counter())
+                if route_path in operations and isinstance(payload, dict) and 'excludePrimary' in payload:
+                    raise ValueError('Use the followers-only opening route')
                 if self.command == 'POST' and route_path == '/modify' and isinstance(payload, dict):
                     selected_account = str(config['account']) if selected is bridge else match[1]
                     if bridge.chunk_entries.owned_entry(selected_account, payload.get('ticket')):
@@ -4150,6 +4473,14 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                         except (ValueError,TypeError,KeyError) as error:
                             values={'result':dict(status='rejected',reason=str(error),id=payload.get('id') if isinstance(payload,dict) else None,
                                 entryId=payload.get('entryId') if isinstance(payload,dict) else None)}
+                        if route_path != '/entry-parent-take' and values['result']['status'] == 'ok':
+                            entry = values.get('entry')
+                            if entry is not None:
+                                # Keep exact proofs and the entry summary in the reply.
+                                # Full telemetry is available through the exact entry GET.
+                                accounts = {account: {key: value for key, value in details.items() if key != 'entryTiming'}
+                                            for account, details in entry['accounts'].items()}
+                                values = dict(values, entry=dict(entry, accounts=accounts))
                         with bridge.lock: result=bridge.envelope(**values)
                     elif self.command=='GET' and route_path=='/entry-readiness':
                         readiness=bridge.chunk_entries.account_readiness()
@@ -4180,6 +4511,12 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                         # authenticated after a saved plan, the client must keep
                         # its result unknown rather than silently rearming.
                         try:
+                            if (route_path in ('/entry-plan','/entry-plan-admit') and 'excludePrimary' in payload
+                                    and (route_path!='/entry-plan-admit' or 'entry-followers-only-v1' not in bridge._capabilities())):
+                                raise ValueError('Followers-only entry requires the supported atomic admission route')
+                            if (route_path in ('/entry-plan','/entry-plan-admit') and 'separateLt' in payload
+                                    and (route_path!='/entry-plan-admit' or 'entry-separate-lt-v1' not in bridge._capabilities())):
+                                raise ValueError('Separate LT entry requires the supported atomic admission route')
                             if route_path=='/entry-plan-admit':
                                 required=payload.get('requiredCapabilities')
                                 if (payload.get('admissionContract')!='atomic-entry-admission-v1'
@@ -4226,6 +4563,13 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                     elif self.command=='POST' and route_path=='/account-register':
                         result=bridge.envelope(registration=registry.register(payload))
                     else: raise ValueError('Unsupported account enrollment request')
+                elif self.command == 'GET' and selected is bridge and route_path == '/position-presence':
+                    query = parse_qs(route.query, keep_blank_values=True)
+                    symbols, accounts = query.get('symbol', ()), query.get('accounts', ())
+                    read = getattr(bridge, 'position_presence_accounts', None)
+                    if not callable(read) or len(symbols) != 1 or len(accounts) != 1:
+                        raise ValueError('Position presence needs one symbol and an account list')
+                    result = read(symbols[0], accounts[0].split(','))
                 elif self.command=='GET' and route_path=='/management':
                     query=parse_qs(route.query,keep_blank_values=True)
                     view=query.get('view',['full'])
@@ -4258,9 +4602,17 @@ def create_server(bridge, address, *, tls_context=None, handshake_timeout=3.0,
                         method,args = methods[route_path]
                         result = (selected.call_if_idle(method) if method == 'quote_diagnostics'
                                   and callable(getattr(selected,'call_if_idle',None)) else selected.call(method,*args))
+                    elif self.command=='POST' and route_path == '/place' and getattr(bridge.chunk_entries,'trade_limits',None):
+                        result = bridge.submit_opening(payload,received,match[1])
                     elif self.command=='POST' and route_path in operations:
                         result = selected.call('execute',route_path[1:],payload)
                     else: raise ValueError('Unsupported linked account route')
+                elif self.command=='POST' and route_path == '/place-followers':
+                    if 'entry-followers-only-v1' not in bridge._capabilities() or not isinstance(payload, dict) or 'excludePrimary' in payload:
+                        raise ValueError('Followers-only opening route unavailable')
+                    result = bridge.submit_opening({**payload, 'excludePrimary':True}, received)
+                elif self.command=='POST' and route_path == '/place' and getattr(bridge.chunk_entries,'trade_limits',None):
+                    result = bridge.submit_opening(payload,received)
                 elif self.command=='POST' and route_path in operations:
                     result = bridge.group_execute(route_path[1:],payload,received) if payload.get('mirrorAccount') or payload.get('mirrorAccounts') else bridge.execute(route_path[1:],payload,received)
                 elif self.command=='GET' and route_path=='/receipt':
@@ -4388,8 +4740,8 @@ class CoordinatorBridge(Bridge):
     """
     NATIVE_METHODS = frozenset(('entry_snapshot','entry_context','entry_admission','entry_primary_sizing','entry_positions','lot_specs',
         'execute','check_opening','entry_position_identity','entry_position_remainder','entry_common_stop','entry_common_stop_receipt',
-        'entry_protection_plan','entry_limit_state','entry_cancel_limit','entry_management','entry_close_reconciliation','entry_reconcile',
-        'entry_confirm_reconciled','local_management','orders','close_rules'))
+        'entry_protection_plan','entry_limit_state','entry_limit_states','entry_cancel_limit','entry_management','entry_close_reconciliation','entry_close_batch','entry_close_batch_finish','entry_reconcile',
+        'entry_confirm_reconciled','local_management','orders','position_presence','close_rules'))
 
     def __init__(self, config, database, primary_worker):
         self.native_database=pathlib.Path(database)
@@ -4409,6 +4761,10 @@ class CoordinatorBridge(Bridge):
         self.quote_worker_factory = AccountWorker
         self.quote_client_database = pathlib.Path(database).with_name('quote-client.sqlite3')
         self.quote_client_closed = False
+        self.risk_clients = {}
+        self.risk_client_lock = threading.Lock()
+        self.risk_client_factory = AccountWorker
+        self.risk_clients_closed = False
         super().__init__(None,dict(config,_coordinatorOnly=True),coordinator_database)
         # This is authenticated routing metadata, never broker evidence.
         # Every selected account still proves its actual identity in admission
@@ -4523,6 +4879,28 @@ class CoordinatorBridge(Bridge):
     def quote_diagnostics(self):
         return self.primary_worker.call_if_idle('quote_diagnostics')
 
+    def read_opening_budget(self, account):
+        # Each account has a separate, on-demand SDK connection and RPC pipe.
+        # A blocked read must never fall back to the execution worker.
+        login = str(account)
+        with self.risk_client_lock:
+            if self.risk_clients_closed:
+                raise ValueError('Дневной риск: проверка счёта остановлена')
+            client = self.risk_clients.get(login)
+            if client is None:
+                worker = self.primary_worker if login == str(self.config['account']) else self.linked[login]
+                if not worker.available():
+                    raise WorkerDispatchNotSent('Дневной риск: терминал счёта подключается')
+                config = dict(worker.config, _riskOnly=True, _primaryWorker=False, tradingEnabled=False, linkedAccounts=[])
+                database = self.native_database.with_name('entry-risk-' + login + '.sqlite3')
+                client = self.risk_clients[login] = self.risk_client_factory(config, database)
+        deadline = time.monotonic() + 2
+        while not client.available() and time.monotonic() < deadline:
+            time.sleep(.02)
+        if not client.available():
+            raise ValueError('Дневной риск: чтение счёта MT5 пока недоступно, повторите вход')
+        return client.call('daily_entry_risk')
+
     def close_group_executor(self):
         with self.quote_client_lock:
             self.quote_client_closed=True
@@ -4530,6 +4908,12 @@ class CoordinatorBridge(Bridge):
                 self.quote_client.close();self.quote_client=None
         if self.candle_client is not None:
             self.candle_client.close();self.candle_client=None
+        with self.risk_client_lock:
+            self.risk_clients_closed = True
+            clients = tuple(self.risk_clients.values())
+            self.risk_clients.clear()
+        for client in clients:
+            client.close()
         return super().close_group_executor()
 
     def __getattribute__(self, name):
@@ -4557,6 +4941,9 @@ class CoordinatorBridge(Bridge):
             native=dict(self._health(self.identity),connected=False,brokerIdentityVerified=False,
                         reason='Primary MT5 connector is starting or recovering')
         else:native = self.primary_worker.call('health')
+        if self.chunk_entries.trade_limits:
+            from new_york_trade_limits import limits_policy
+            native = dict(native, entryLimits=limits_policy())
         return dict(native,capabilities=self._capabilities(),linkedAccounts=list(self.linked),
                     accountReadiness={account:(worker.available() if callable(getattr(worker,'available',None)) else True)
                         for account,worker in {str(self.config['account']):self.primary_worker,**self.linked}.items()},
@@ -4588,6 +4975,25 @@ class CoordinatorBridge(Bridge):
                     capabilities=self._capabilities(),linkedAccounts=list(self.linked),
                     parentTakes=self.chunk_entries.partial_takes.list(),
                     entryProgress=self.chunk_entries.progress_observer.snapshot() if self.chunk_entries.progress_observer else None)
+
+    def position_presence_accounts(self, symbol, accounts):
+        workers = {str(self.config['account']): self.primary_worker, **self.linked}
+        if (symbol not in self.config['symbols'] or not 1 <= len(accounts) <= 17
+                or len(set(accounts)) != len(accounts) or any(account not in workers for account in accounts)):
+            raise ValueError('Invalid position symbol or accounts')
+        executor = self.warm_group_executor()
+        jobs = {account: executor.submit(workers[account].call, 'position_presence', symbol) for account in accounts}
+        done, pending = wait(jobs.values(), timeout=2)
+        for future in pending:
+            future.cancel()
+        states = dict.fromkeys(accounts)
+        for account, future in jobs.items():
+            if future in done:
+                try:
+                    states[account] = future.result()
+                except (OSError, ValueError, RuntimeError):
+                    pass  # A missing read cannot establish that an account is flat.
+        return self.envelope(symbol=symbol, positionStates=states)
 
     def observe_native(self, account, value):
         # Reuse immutable normal native reads, without a new poll or writer in
@@ -4743,7 +5149,8 @@ def start_account_workers(config, file, factory=None):
 def serve(config_file):
     file = pathlib.Path(config_file).resolve()
     config = json.loads(file.read_text(encoding='utf-8'))
-    config.setdefault('entryMarketFirst', True)
+    config.setdefault('entryMarketFirst', False)
+    config.setdefault('newYorkTradeLimits', False)
     if len(config.get('token', '')) < 32:
         raise ValueError('A strong receiver token is required')
     chart_root = None

@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const {createChunkAdmission} = require('../payload/src/app/services/levelOrder/chunkAdmission');
 const {MT5VPSAdapter} = require('../payload/src/app/services/mt5-vps/client');
 const {buildEntryRequest} = require('../payload/src/app/services/mt5-vps/chunkEntryClient');
+const {projectGroups} = require('../payload/src/app/services/mt5-vps/levelSync');
+const {resolveLevelOrderDefaults} = require('../payload/src/app/services/levelOrder/strategy');
 
 function fixture(overrides = {}) {
   const sent = [], rules = [];
@@ -29,6 +31,31 @@ test('market arm accepts lost LT and a reversal, takes play from saved groups an
   assert.equal(plan.maxGap,12); assert.equal(plan.riskUsd,50);
   assert.equal(plan.executionPolicy,'hybrid-market-limit-v1');
   assert.equal(f.rules[0].type,'market'); assert.equal(f.rules[0].price,25012);
+});
+
+test('gold BML and SML keep a three-dollar LT zone and use the native contract size', async () => {
+  const group = {key:'Gold · TV → MT5',ticker:'XAUUSD',levels:[3600],maxOffset:3,source:'tv-mt5-candles'};
+  assert.equal(projectGroups({config:{groups:[group]}})[0].maxOffset, 3);
+  assert.deepEqual(projectGroups({config:{groups:[group]}}, {includeGold:false}), []);
+  const adapter = new MT5VPSAdapter({spxSymbol:'SPX500',ustecSymbol:'USTEC'});
+  assert.equal(adapter.brokerSymbol('OANDA:XAUUSD'), 'XAUUSD');
+  const config = {defaults:{stopOffsetPts:40,takeProfitPts:200}};
+  assert.equal(resolveLevelOrderDefaults(config,'XAUUSD').takeProfitPts, null);
+  assert.equal(resolveLevelOrderDefaults(config,'SPX500').takeProfitPts, 200);
+  assert.equal(resolveLevelOrderDefaults({...config,symbols:[{ticker:'XAUUSD',takeProfitPts:3200}]}, 'XAUUSD').takeProfitPts, 3200);
+  const f = fixture({
+    getGroups: () => [group],
+    getSnapshot: async () => ({provider:'mt5-vps', symbol:'XAUUSD', quoteUpdatedAt:Date.now(),
+      quote:{bid:3599.85,ask:3600}, metadata:{tickSize:.01, quantityStep:1, minQty:1, maxQty:10, contractSize:1}})
+  });
+  for (const [action,zoneLower,zoneUpper,stopPrice] of [['MB',3600,3603,3590],['MS',3597,3600,3610]]) {
+    const result = await f.service.arm({...f.payload,ticker:'XAUUSD',action,level:3600,entryPrice:3600,
+      riskUsd:50, stopOffsetPts:1000, stopMode:'level', zoneMultiplier:1});
+    assert.equal(result.status,'ok');
+    const plan = f.sent.at(-1);
+    assert.deepEqual([plan.zoneLower,plan.zoneUpper,plan.stopPrice], [zoneLower,zoneUpper,stopPrice]);
+    assert.equal(plan.totalQty,3);
+  }
 });
 
 test('primary balance is read again for each new entry and replaces the card amount',async()=>{
@@ -66,6 +93,35 @@ test('native primary risk arms without a balance HTTP read and keeps the capture
   assert.equal(result.request.volume,undefined);
   assert.ok(result.request.requiredCapabilities.includes('entry-primary-balance-risk-v1'));
   assert.equal(result.request.mirrorAccounts[0].riskPercent,.2);
+});
+
+test('gold captures the broker specification and explicit Max lot on any account',async()=>{
+  const capabilities=['atomic-entry-admission-v1','entry-primary-balance-risk-v1',
+    'independent-account-engines-v5','entry-initial-sizing-only-v1','entry-gold-primary-per-order-v1','entry-gold-v1'];
+  const cases=[...['900000003','900000005','900000004','900000001'].map(account=>({account,symbol:'XAUUSD',quantityLimit:100})),
+    {account:'900000003',symbol:'XAUUSD',quantityLimit:0,expectedTotal:0},
+    {account:'900000003',symbol:'USTEC',quantityLimit:100,expectedTotal:100},
+    {account:'900000003',symbol:'SPX500',quantityLimit:100,expectedTotal:100}];
+  for (const {account,symbol,quantityLimit,expectedTotal} of cases) {
+    const adapter={config:{account,primaryRiskByAccount:{[account]:{mode:'balance',percent:.25}}},
+      capabilities,brokerSymbol:s=>s,request:()=>assert.fail('separate balance HTTP request'),
+      armChunkEntry:async plan=>({status:'ok',request:buildEntryRequest(adapter,plan)})};
+    const maxQty={XAUUSD:1000,USTEC:100,SPX500:200}[symbol];
+    const step=symbol==='XAUUSD' ? 1 : .1;
+    const f=fixture({getAdapter:()=>adapter,getQuantityLimit:()=>quantityLimit,
+      getGroups:()=>[{ticker:symbol,levels:[3636.71],maxOffset:.5}],
+      getSnapshot:async()=>({provider:'mt5-vps',symbol,metadata:{tickSize:.01,quantityStep:step,minQty:step,maxQty,contractSize:1}})});
+    const result=await f.service.arm({...f.payload,ticker:symbol,level:3636.71,entryPrice:3636.71,
+      stopMode:'level',stopOffsetPts:150,zoneMultiplier:1,maxLot:80});
+    assert.equal(result.status,'ok');
+    const request=result.request.primaryRiskRequest;
+    assert.equal(request.account,account);
+    assert.equal(request.maxQty,maxQty);
+    assert.equal(request.maxLot,80);
+    assert.equal(request.perOrderQuantityLimit,undefined);
+    assert.equal(request.quantityLimit,expectedTotal);
+    assert.equal(result.request.requiredCapabilities.includes('entry-gold-primary-per-order-v1'),false);
+  }
 });
 
 test('a click keeps its account, exit and size settings while instrument metadata is pending',async()=>{

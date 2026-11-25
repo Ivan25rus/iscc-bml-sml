@@ -33,12 +33,14 @@ function captureEntrySettings(adapter,ticker,now=Date.now()) {
   const copies=followers(config).filter(row=>row.enabled).map(row=>Object.freeze(row));
   const percentages=config.accountChunkPercents;
   const multipliers=config.accountZoneMultipliers;
-  const accounts=[String(config.account),...copies.map(row=>row.account)];
+  const excludePrimary=config.primaryTradingEnabled===false;
+  const accounts=[...(excludePrimary ? [] : [String(config.account)]),...copies.map(row=>row.account)];
+  if(!accounts.length)throw Error(admission.NO_TRADING_ACCOUNTS);
   const selected=value=>value && Object.freeze(Object.fromEntries(accounts
     .filter(account=>Object.hasOwn(value,account)).map(account=>[account,value[account]])));
   return Object.freeze({account:String(config.account),server:config.server,
     symbol:adapter.brokerSymbol?.(ticker),deadline:Object.freeze(deadlineForNewTrade(config,now)),
-    copies:Object.freeze(copies),
+    copies:Object.freeze(copies),excludePrimary,
     accountChunkPercents:selected(percentages),accountZoneMultipliers:selected(multipliers),
     entryRiskLimitUsd:entryRiskLimit(config)});
 }
@@ -47,6 +49,8 @@ function buildEntryRequest(adapter,plan,{requestId=randomUUID(),cardPayload,entr
   const {deadline,copies}=captured;
   if(captured.account!==String(adapter.config?.account) || captured.server!==adapter.config?.server)
     throw Error('Основной счёт изменился. Запусти новый вход заново');
+  if(Boolean(captured.excludePrimary)!==(adapter.config?.primaryTradingEnabled===false))
+    throw Error('Участие основного счёта изменилось. Запусти новый вход заново');
   if (!deadline) throw Error('Для набора частями включите закрытие по времени: у набора должен быть ограниченный срок');
   const side=plan?.orderSide;
   if (!['buy','sell'].includes(side)) throw Error('Неверное направление набора');
@@ -119,6 +123,17 @@ function buildEntryRequest(adapter,plan,{requestId=randomUUID(),cardPayload,entr
   if(copies.some(row=>row.riskPercent!=null) && (request.accountExecution!=='independent-v5'
     || !adapter.capabilities?.includes('entry-balance-risk-v1')))throw Error('Для риска от баланса обновите VPS и используйте БМЛ/СМЛ');
   if (copies.length) request.mirrorAccounts=copies.map(({account,multiplier,riskPercent})=>({account,multiplier,...(riskPercent==null ? {} : {riskPercent})}));
+  if(captured.excludePrimary) {
+    if(!copies.length)throw Error(admission.NO_TRADING_ACCOUNTS);
+    if(request.accountExecution!=='independent-v5' || ![admission.CAPABILITY,admission.FOLLOWERS_ONLY_CAPABILITY]
+      .every(value=>adapter.capabilities?.includes(value)))throw Error('Для входа без основного счёта обнови VPS и используй БМЛ/СМЛ');
+    request.excludePrimary=true;
+  }
+  if(plan.separateLt===true) {
+    if(request.accountExecution!=='independent-v5' || ![admission.CAPABILITY,admission.SEPARATE_LT_CAPABILITY]
+      .every(value=>adapter.capabilities?.includes(value)))throw Error('Для отдельного входа по ЛТ обнови VPS');
+    request.separateLt=true;
+  }
   if(request.executionPolicy==='hybrid-market-limit-v1' && Object.keys(captured.accountChunkPercents || {}).length) {
     if(request.accountExecution!=='independent-v5' || !adapter.capabilities?.includes(admission.ACCOUNT_CHUNK_CAPABILITY)
       || !adapter.capabilities?.includes(admission.CAPABILITY))throw Error('Обнови VPS для индивидуального размера частей');
@@ -197,12 +212,13 @@ function unavailable(adapter) {
   if (adapter.closed || adapter.connectionRestarting || adapter.accountEnrollmentBusy) return 'Подключение обновляется. Дождись готовности счетов';
 }
 function capturedAccounts(adapter,request) {
-  const accounts=new Map([[String(adapter.config.account),1]]);
+  const primary=String(adapter.config.account);
+  const accounts=new Map(request.excludePrimary ? [] : [[primary,1]]);
   const copies=request.mirrorAccounts || (request.mirrorAccount ? [{account:request.mirrorAccount,multiplier:1}] : []);
   if(!Array.isArray(copies) || copies.length>16)throw Error('Не подтверждён сохранённый состав счетов набора');
   for(const copy of copies) {
     const account=String(copy?.account),multiplier=copy?.multiplier;
-    if(!/^[1-9][0-9]{0,15}$/.test(account) || accounts.has(account) || !Number.isFinite(multiplier) || multiplier<=0 || multiplier>100)
+    if(!/^[1-9][0-9]{0,15}$/.test(account) || account===primary || accounts.has(account) || !Number.isFinite(multiplier) || multiplier<=0 || multiplier>100)
       throw Error('Не подтверждён сохранённый состав счетов набора');
     accounts.set(account,multiplier);
   }
@@ -212,12 +228,15 @@ function verifyPrimarySizing(entry,request) {
   if(!request.primaryRiskRequest)return;
   const expected=request.primaryRiskRequest,sizing=entry.primaryRiskSizing;
   if(request.accountStart) {
+    if(request.excludePrimary && entry.accountStart===request.accountStart && !sizing
+      && entry.volume===0 && entry.chunkVolume===0 && entry.riskUsd===0)return;
     if(entry.accountStart!==request.accountStart || entry.accounts?.[expected.account]?.riskPercent!==expected.percent)
       throw Error('VPS не подтвердил независимый запуск счетов');
     if(!sizing && entry.volume===0 && entry.chunkVolume===0 && entry.riskUsd===0
       && require('./entryLifecycle').zeroSizedBalanceAdmission(entry,expected.account))return;
   }
   const base=sizing?.credit===undefined ? sizing?.balance : sizing.riskBase;
+  const orderCap=expected.perOrderQuantityLimit;
   if(sizing?.account!==expected.account || sizing?.percent!==expected.percent
     || !Number.isFinite(base) || base<=0 || !Number.isFinite(sizing.balance)
     || sizing.credit!==undefined && (!Number.isFinite(sizing.credit) || sizing.credit<0
@@ -227,6 +246,8 @@ function verifyPrimarySizing(entry,request) {
     || !(sizing.volume>0) || !(sizing.chunkVolume>0) || sizing.chunkVolume>sizing.volume
     || entry.riskUsd!==sizing.riskUsd || entry.volume!==sizing.volume || entry.chunkVolume!==sizing.chunkVolume
     || request.entryRiskLimitUsd && sizing.riskUsd>request.entryRiskLimitUsd+1e-8
+    || orderCap!=null && (!Number.isFinite(sizing.perOrderQuantityLimit) || sizing.perOrderQuantityLimit<expected.minQty
+      || sizing.perOrderQuantityLimit>Math.min(orderCap,expected.maxQty) || sizing.chunkVolume>sizing.perOrderQuantityLimit)
     || expected.quantityLimit!=null && sizing.volume>expected.quantityLimit)
     throw Error('VPS не подтвердил расчёт риска основного счёта');
 }
@@ -242,6 +263,8 @@ function validateRecoveredEntry(adapter,response,request) {
   const lifecycle=require('./entryLifecycle'),entry=response?.entry;
   if(request.fillPriority!==undefined && !response?.capabilities?.includes('entry-fill-priority-v1'))
     throw Error('VPS не подтвердил настройку приоритета добора');
+  if(request.excludePrimary && !response?.capabilities?.includes(admission.FOLLOWERS_ONLY_CAPABILITY))
+    throw Error('VPS не подтвердил запуск без основного счёта');
   if(request.accountExecution && (entry?.accountExecution!==request.accountExecution
     || !response.capabilities?.includes(request.accountExecution==='independent-v5' ? 'independent-account-engines-v5' : request.accountExecution==='independent-v4' ? 'independent-account-lanes-v4'
       : request.accountExecution==='independent-v3' ? 'parallel-account-entry-v3' : 'independent-account-entry-v2')))
@@ -263,7 +286,7 @@ function validateRecoveredEntry(adapter,response,request) {
   // The broker can reduce the initial part to its per-order maximum. SL/TP can
   // subsequently be changed by the user's whole-parent protection controls.
   const primaryPendingOrStopped=request.accountStart && !entry.primaryRiskSizing
-    && lifecycle.zeroSizedBalanceAdmission(entry,request.primaryRiskRequest.account);
+    && (request.excludePrimary || lifecycle.zeroSizedBalanceAdmission(entry,request.primaryRiskRequest.account));
   if(entry.fillPriority!==request.fillPriority || entry.stopMode!==request.stopMode || !Number.isFinite(entry.chunkVolume)
     || (!primaryPendingOrStopped && entry.chunkVolume<=0)
     || entry.chunkVolume>request.chunkVolume+1e-7 || !entry.accounts || Array.isArray(entry.accounts)
@@ -272,6 +295,10 @@ function validateRecoveredEntry(adapter,response,request) {
   const accounts=capturedAccounts(adapter,request);
   if(Object.keys(entry.accounts).sort().join(',')!==[...accounts.keys()].sort().join(','))
     throw Error('Точный журнал VPS не подтвердил захваченные счета набора');
+  if(Boolean(request.excludePrimary)!==(entry.excludePrimary===true))
+    throw Error('Точный журнал VPS не подтвердил участие основного счёта');
+  if(Boolean(request.separateLt)!==(entry.separateLt===true))
+    throw Error('Точный журнал VPS не подтвердил отдельный вход по ЛТ');
   for(const [account,multiplier] of accounts) {
     const details=entry.accounts[account];
     const independentPrimary=request.accountStart && account===request.primaryRiskRequest.account;
@@ -543,6 +570,8 @@ async function runMutation(adapter,operation,request,{clickAt,preparation={}}={}
         const unavailableReason=unavailable(adapter);
         if(unavailableReason || String(adapter.config.account)!==account || adapter.config.server!==server)
           return {status:'rejected',reason:unavailableReason || 'Основной счёт изменился. Запусти новый вход заново'};
+        if(operation==='arm' && Boolean(request.excludePrimary)!==(adapter.config.primaryTradingEnabled===false))
+          return {status:'rejected',reason:'Участие основного счёта изменилось. Запусти новый вход заново'};
         submitted=true;
         const beforeSend=Date.now();
         // Expiry is transport metadata excluded from the durable identity.
@@ -563,6 +592,7 @@ async function runMutation(adapter,operation,request,{clickAt,preparation={}}={}
               command.operation==='stop' && command.request?.entryId===request.id);
             if(!atomic || error.entryArmNotSent!==true || !request.intentTtlMs
               || performance.now()-sendStarted>=request.intentTtlMs-2500 || unavailable(adapter)
+              || Boolean(request.excludePrimary)!==(adapter.config.primaryTradingEnabled===false)
               || String(adapter.config.account)!==account || adapter.config.server!==server || stopping())throw error;
             response=await adapter.request(route,request,{execution:true});
           }
@@ -601,7 +631,7 @@ async function runMutation(adapter,operation,request,{clickAt,preparation={}}={}
           const original=operation==='arm' ? request : journal?.records.find(row=>row.operation==='entry-plan-arm' && row.id===expected)?.payload;
           entry=require('./entryLifecycle').confirmAdmissionCancellation(entry,expected,response,original);
         } else if(operation==='arm'){
-          if(request.accountStart)validateRecoveredEntry(adapter,response,request);
+          if(request.accountStart || request.excludePrimary || request.separateLt)validateRecoveredEntry(adapter,response,request);
           else {
             verifyPrimarySizing(entry,request);
             verifyAccountSettings(entry,request);

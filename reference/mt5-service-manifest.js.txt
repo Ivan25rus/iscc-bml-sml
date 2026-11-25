@@ -6,9 +6,10 @@ const { CommandJournal } = require('./commandJournal');
 const events = require('../events');
 const {followers,accountChunkPercents,accountZoneMultipliers,transferCopying}=require('./sizing');
 const {normalizeAccountNames}=require('./accountNames');
-const {ACCOUNT_CHUNK_CAPABILITY,ACCOUNT_ZONE_CAPABILITY}=require('./entryAdmission');
+const {ACCOUNT_CHUNK_CAPABILITY,ACCOUNT_ZONE_CAPABILITY,FOLLOWERS_ONLY_CAPABILITY}=require('./entryAdmission');
 const {normalizePrimaryRisk,primaryRisk}=require('./primaryRisk');
 const {managementFreshness}=require('./managementFreshness');
+const {TRADING_SYMBOLS}=require('./tradingSymbols');
 settings.register('mt5-vps', path.join(__dirname,'config/mt5-vps.json'), path.join(__dirname,'config/mt5-vps-settings-descriptor.json'));
 settings.onApply('mt5-vps', ({ changedPaths }) => ({restartRequiredPaths:changedPaths}));
 function readConfig() { return loadConfig('../services/mt5-vps/config/mt5-vps.json'); }
@@ -34,12 +35,14 @@ function initService(api) {
         connection.commandJournal.prepareEntryPlans?.();
         connection.events = events;
         connection.quoteLogFile = path.join(app.getPath('userData'),'logs','mt5-quote-stream.jsonl');
+        const canonicalSymbol = symbol => symbol === connection.config.spxSymbol ? 'SPX500'
+          : symbol === connection.config.ustecSymbol ? 'USTEC' : symbol;
         connection.on('quote:updated', snapshot => {
-          const symbol = snapshot.symbol === connection.config.spxSymbol ? 'SPX500' : 'USTEC';
+          const symbol = canonicalSymbol(snapshot.symbol);
           api.instrumentInfo?.ingest?.({provider:'mt5-vps',symbol},snapshot);
         });
         connection.on('quote:stale',symbols => {
-          const selected=symbols?.map(symbol=>symbol===connection.config.spxSymbol ? 'SPX500' : 'USTEC') || ['SPX500','USTEC'];
+          const selected=symbols?.map(canonicalSymbol) || TRADING_SYMBOLS;
           for (const symbol of selected) api.instrumentInfo?.ingest?.({provider:'mt5-vps',symbol},{});
         });
         adapter = connection;
@@ -47,14 +50,15 @@ function initService(api) {
       }
       api.execution?.wireAdapter?.(adapter, 'mt5-vps');
       return adapter;
-    }
+    },
+    readAccountOrders(account) { return forAccount(account).request('/orders'); }
   };
   function forAccount(account) {
     const primary = api.mt5VPS.getAdapter();
     if (!account || String(account)===String(primary.config.account)) return primary;
     if (!followers(primary.config).some(row=>row.account===String(account)) && !primary.remoteAccounts?.includes(String(account))) throw Error('Счёт не настроен');
     if (!accountAdapters.has(String(account))) {
-      const connection = new MT5VPSAdapter({...primary.config, account:String(account),routePrefix:`/accounts/${account}`,mirrorAccount:null,followers:[]});
+      const connection = primary.createLinkedAdapter(account);
       connection.quoteLogFile=primary.quoteLogFile;
       connection.commandJournal = new CommandJournal(path.join(app.getPath('userData'),`mt5-command-journal-${account}.json`), {asyncWrites:true});
       connection.connectionRestarting=primary.connectionRestarting===true;
@@ -218,7 +222,8 @@ function initService(api) {
       // Settings need capabilities/account ids, not ticket histories,
       // reconciliation, command journals or a management execution lease.
       return {status:'ok',account:config.account,accounts:[config.account,...primary.remoteAccounts],
-        followers:followers(config),primaryRisk:primaryRisk(config),accountChunkPercents:accountChunkPercents(config.accountChunkPercents),
+        followers:followers(config),primaryRisk:primaryRisk(config),primaryTradingEnabled:config.primaryTradingEnabled!==false,
+        accountChunkPercents:accountChunkPercents(config.accountChunkPercents),
         accountZoneMultipliers:accountZoneMultipliers(config.accountZoneMultipliers),
         accountNames:normalizeAccountNames(config.accountNames),
         realAccounts:realEntryAccounts(state),
@@ -368,12 +373,19 @@ function initService(api) {
       if (String(value?.account)!==String(config.account) || String(primary.config.account)!==String(config.account))
         throw Error('Основной счёт изменился. Обнови настройки MT5');
       const risk=normalizePrimaryRisk(value);
+      const tradingEnabled=value.tradingEnabled ?? (config.primaryTradingEnabled!==false);
+      if(typeof tradingEnabled!=='boolean')throw Error('Неверная настройка участия основного счёта');
+      if(tradingEnabled!==(config.primaryTradingEnabled!==false) && api.execution?.isTradingBusy?.())
+        throw Error('Дождись подтверждения отправленной торговой команды и сохрани настройку ещё раз');
+      if(!tradingEnabled && config.primaryTradingEnabled!==false && !primary.capabilities?.includes(FOLLOWERS_ONLY_CAPABILITY))
+        throw Error('Для входа без основного счёта обнови VPS');
       const policies={...config.primaryRiskByAccount,[String(config.account)]:risk};
-      if (!settings.writeConfig('mt5-vps',{...config,primaryRiskByAccount:policies}))
-        throw Error('Не удалось сохранить риск основного счёта');
+      if (!settings.writeConfig('mt5-vps',{...config,primaryRiskByAccount:policies,primaryTradingEnabled:tradingEnabled}))
+        throw Error('Не удалось сохранить настройки основного счёта');
       primary.config.primaryRiskByAccount=policies;
+      primary.config.primaryTradingEnabled=tradingEnabled;
       api.ltLevelSync?.invalidateMobileProfile();
-      return {status:'ok',primaryRisk:risk};
+      return {status:'ok',primaryRisk:risk,primaryTradingEnabled:tradingEnabled};
     } catch(error) {return {status:'rejected',reason:error.message};}
   });
   ipcMain.handle('mt5-vps:save-account-chunk-percents',(_evt,value)=>{

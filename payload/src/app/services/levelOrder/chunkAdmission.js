@@ -6,10 +6,50 @@ const {calculateMarketZoneTradePlan,resolveMarketChunkPercent}=require('./market
 const {freshExecutionSnapshot,entrySpecification}=require('../mt5-vps/quoteSnapshot');
 const {primaryRisk,capturePrimaryRisk}=require('../mt5-vps/primaryRisk');
 const {CAPABILITY,PRIMARY_RISK_CAPABILITY}=require('../mt5-vps/entryAdmission');
+const {GOLD_ENTRY_CAPABILITY}=require('../mt5-vps/tradingSymbols');
 const {captureEntrySettings}=require('../mt5-vps/chunkEntryClient');
+const {keepsLtLevel,openIndexSymbols,hasEntryPosition,isOpenPosition,freshPositionAt}=require('../mt5-vps/cardIdentity');
+const {indexSymbol}=require('../mt5-vps/approachPreparation');
+
+async function verifyPositionPresence(adapter, readAccountOrders, accounts, symbol, preparation) {
+  const started=performance.now(), at=Date.now();
+  const uncertain='Состояние позиции MT5 уточняется. Повтори вход после сверки.';
+  let states;
+  const matches=(row,account)=>row && String(row.account)===account && row.server===adapter.config?.server;
+  try {
+    if(adapter.capabilities?.includes('position-presence-v1') && accounts.length) {
+      preparation.positionVerificationMode='symbol';
+      const query=new URLSearchParams({symbol,accounts:accounts.join(',')});
+      const reply=await adapter.request('/position-presence?'+query);
+      if(!matches(reply,String(adapter.config?.account)) || reply.symbol!==symbol)throw Error(uncertain);
+      states=accounts.map(account=>{
+        const row=reply.positionStates?.[account];
+        return matches(row,account) && row.symbol===symbol && freshPositionAt(row.checkedAt)
+          && typeof row.hasPosition==='boolean' ? row : null;
+      });
+    } else {
+      preparation.positionVerificationMode='account-orders';
+      const reads=await Promise.allSettled(accounts.map(async account=>{
+        const view=await readAccountOrders(account);
+        if(!matches(view,account) || !Array.isArray(view.orders))throw Error(uncertain);
+        return {checkedAt:at,hasPosition:view.orders.some(order=>isOpenPosition(order,symbol))};
+      }));
+      states=reads.map(read=>read.status==='fulfilled' ? read.value : null);
+    }
+  } catch {
+    throw Error(uncertain);
+  } finally {
+    preparation.positionVerificationMs=Number((performance.now()-started).toFixed(2));
+  }
+  if(!freshPositionAt(at))throw Error(uncertain);
+  const open=states.filter(row=>row?.hasPosition);
+  if(open.length)return Math.max(...open.map(row=>row.checkedAt));
+  if(!states.length || states.includes(null))throw Error(uncertain);
+  return 0;
+}
 
 // Explicit arming only. Quotes, startup recovery and polling never call arm.
-function createChunkAdmission({getAdapter,getGroups,getConfig,getSnapshot,orderCalculator,validateTrade,getQuantityLimit,log=()=>{}}) {
+function createChunkAdmission({getAdapter,readAccountOrders,getGroups,getConfig,getSnapshot,orderCalculator,validateTrade,getQuantityLimit,log=()=>{}}) {
   const inflight=new Map();
   async function arm(payload={}) {
     const id=String(payload.requestId || randomUUID());
@@ -22,11 +62,13 @@ function createChunkAdmission({getAdapter,getGroups,getConfig,getSnapshot,orderC
       const elapsed=since=>Number((performance.now()-since).toFixed(2));
       const dispatch=Date.now()-payload.clickAt;
       if(Number.isFinite(payload.clickAt) && dispatch>=0 && dispatch<=60000)preparation.ipcDispatchMs=dispatch;
+      let ticker='';
+      let positionEvidence;
       try {
         const action=String(payload.action || '').toUpperCase();
         const entryMode=payload.entryMode ?? 'breakout';
         const zone=entryMode==='side-zone';
-        const ticker=String(payload.ticker || '').trim().toUpperCase();
+        ticker=String(payload.ticker || '').trim().toUpperCase();
         if (!['breakout','side-zone'].includes(entryMode) || !(zone ? ['MB','MS'] : ['BS','SS']).includes(action)
           || payload.provider && payload.provider!=='mt5-vps' || !/^[A-Za-z0-9_.:-]{1,100}$/.test(id))
           throw Error('Условный вход требует MT5 VPS, выбранного режима и явной цены входа');
@@ -36,6 +78,27 @@ function createChunkAdmission({getAdapter,getGroups,getConfig,getSnapshot,orderC
         preparation.trackedValidationMs=elapsed(trackedStarted);
         if (!tracked.ok) throw Error(tracked.reason);
         const adapter=getAdapter();
+        if(payload.separateLt!==undefined && (payload.separateLt!==true || !zone))
+          throw Error('Отдельный уровень ЛТ требует БМЛ/СМЛ');
+        const known=[...(adapter.chunkLifecycleEntries?.values() || [])].filter(entry=>entry.symbol===adapter.brokerSymbol?.(ticker) && keepsLtLevel(entry));
+        if(payload.separateLt===true && known.some(entry=>Math.abs(entry.level-tracked.level)<1e-8))
+          throw Error('Этот уровень уже закреплён за сделкой. Выбери другой ЛТ.');
+        if(!payload.separateLt) {
+          const brokerSymbol=symbol=>adapter.brokerSymbol(symbol);
+          const symbol=indexSymbol(ticker);
+          const evidence=openIndexSymbols(adapter.managementStateView,brokerSymbol,adapter.managementStateAt,
+            [adapter.config?.account,...(adapter.remoteAccounts || [])]);
+          let openAt=evidence.positionTimes[symbol];
+          // Historical fills can trigger a read but cannot certify a live
+          // position. A normal management reply may omit a busy account.
+          if(!openAt && (known.some(entry=>hasEntryPosition(entry,evidence)) || evidence.uncertainSymbols.includes(symbol))) {
+            openAt=await verifyPositionPresence(adapter,readAccountOrders,evidence.accounts,brokerSymbol(symbol),preparation);
+          }
+          if(openAt) {
+            positionEvidence={symbol,checkedAt:openAt};
+            throw Error('Позиция открыта. Для нового входа нажми «Другой ЛТ».');
+          }
+        }
         const entrySettings=captureEntrySettings(adapter,ticker);
         const primaryAccount=entrySettings.account;
         const policy=primaryRisk(adapter.config);
@@ -48,6 +111,10 @@ function createChunkAdmission({getAdapter,getGroups,getConfig,getSnapshot,orderC
         const chunkPercent=zone ? resolveMarketChunkPercent(config,ticker) : Number(payload.chunkPercent ?? defaults.chunkPercent);
         const maxGap=zone ? undefined : Number(defaults.chunkMaxGap ?? 2);
         const quantityLimit=nativeRisk ? getQuantityLimit({instrumentType}) : undefined;
+        // Gold uses the order size in each account's MT5 specification. A zero
+        // quantity limit still disables entry, and an explicit Max lot still applies.
+        const useBrokerGoldVolume=nativeRisk && ticker==='XAUUSD' && adapter.capabilities.includes(GOLD_ENTRY_CAPABILITY)
+          && (quantityLimit==null || quantityLimit>0);
         const {riskUsd,balanceRisk}=policy.mode==='balance' && !nativeRisk
           ? await capturePrimaryRisk(adapter,payload.riskUsd) : {riskUsd:payload.riskUsd};
         const snapshotStarted=performance.now();let snapshot;
@@ -78,11 +145,12 @@ function createChunkAdmission({getAdapter,getGroups,getConfig,getSnapshot,orderC
           instrumentType},snapshot.quote,{deferMarketPrice:zone});
         if (!rule.ok) throw Error(rule.reason);
         const entryPlan={...plan,chunkPercent,chunkVolume,maxGap:zone ? plan.maxGap : maxGap,
+          ...(payload.separateLt===true ? {separateLt:true} : {}),
           ...(zone && Number(args.maxLot)>0 ? {maxLot:Number(args.maxLot)} : {}),
           ...(nativeRisk ? {primaryRiskRequest:{account:primaryAccount,percent:policy.percent,
             quantityStep:Number(args.minLot),minQty:Number(snapshot.metadata.minQty ?? args.minLot),
             maxQty:Number(snapshot.metadata.maxQty),pointValue:Number(args.lot),maxLot:Number(args.maxLot),
-            quantityLimit}} : {}),
+            ...(!useBrokerGoldVolume ? {quantityLimit} : {})}} : {}),
           ...(balanceRisk ? {balanceRisk} : {}),
           ...(plan.executionPolicy==='hybrid-market-limit-v1' ? {fillPriority:defaults.fillPriority} : {})};
         preparation.planValidationMs=elapsed(planStarted);
@@ -98,8 +166,9 @@ function createChunkAdmission({getAdapter,getGroups,getConfig,getSnapshot,orderC
         return result;
       } catch(error) {
         if(planStarted!==undefined && preparation.planValidationMs===undefined)preparation.planValidationMs=elapsed(planStarted);
-        const result={status:'rejected',reason:error.message,timings:{...preparation,admissionMs:elapsed(started)}};
-        log({kind:'chunk-entry-admission',reqId:id,result});return result;
+        const result={status:'rejected',reason:error.message,...(positionEvidence ? {positionEvidence} : {}),
+          timings:{...preparation,admissionMs:elapsed(started)}};
+        log({kind:'chunk-entry-admission',reqId:id,symbol:ticker,result});return result;
       }
     })();
     inflight.set(id,task);

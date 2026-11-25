@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "version": "0.4.2",
+  "version": "0.4.3",
   "kind": "iscc-bml-sml-integration-kit",
   "receiverVersion": 39,
   "executionPolicy": "hybrid-market-limit-v1",
@@ -21,6 +21,11 @@
   },
   "accountExecution": "independent-v5",
   "riskPolicy": "initial-sizing-fixed-target",
+  "optionalReceiverSettings": [
+    "entryMarketFirst",
+    "newYorkTradeLimits",
+    "entryAsyncClose"
+  ],
   "followerSizingModes": [
     "multiplier",
     "balance-risk-percent"

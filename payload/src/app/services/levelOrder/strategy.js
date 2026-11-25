@@ -66,7 +66,8 @@ function resolveLevelOrderDefaults(config = {}, ticker) {
     stopOffsetPts: finiteNumber(override?.stopOffsetPts, finiteNumber(defaults.stopOffsetPts, null)),
     stopMode: override?.stopMode ?? defaults.stopMode ?? 'level',
     fillPriority: override?.fillPriority ?? defaults.fillPriority,
-    takeProfitPts: finiteNumber(override?.takeProfitPts, finiteNumber(defaults.takeProfitPts, null)),
+    takeProfitPts: finiteNumber(override?.takeProfitPts,
+      normalizedTicker === 'XAUUSD' ? null : finiteNumber(defaults.takeProfitPts, null)),
     // Older fixed-lot chunkVolume settings do not define percentage sizing.
     chunkPercent: Number(override?.chunkPercent ?? defaults.chunkPercent ?? 20),
     chunkMaxGap: finiteNumber(override?.chunkMaxGap, finiteNumber(defaults.chunkMaxGap, 2)),

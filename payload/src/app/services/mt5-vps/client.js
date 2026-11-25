@@ -11,6 +11,7 @@ const { ExecutionAdapter } = require('../brokerage/comps/base');
 const {EXACT_CLOSE_CAPABILITY,EXACT_PROTECTION_CAPABILITY,PARENT_PARTIAL_CAPABILITY,accountIds,controlEntry}=require('./entryControlState');
 const {createQuoteFrameReader}=require('./quoteFrameReader');
 const {isIndependentEntryControl}=require('./commandJournal');
+const {normalizeTradingSymbol,isTradingSymbol,GOLD_ENTRY_CAPABILITY}=require('./tradingSymbols');
 
 const INDEX_SYMBOLS = new Set(['SPX', 'SPX500', 'USTEC']);
 const MAX_QUOTE_CAPTURE_AGE_MS = 1500;
@@ -42,9 +43,10 @@ function entryCloseContext(state,entry,symbol,config) {
 }
 
 class MT5VPSAdapter extends ExecutionAdapter {
-  constructor(config = {}) {
+  constructor(config = {}, readPoolOwner = null) {
     super();
     this.config = resolveSecureConfig(config);
+    this.readPoolOwner = readPoolOwner;
     this.provider = 'mt5-vps';
     this.commandJournal = null;
     this.inFlight = new Set();
@@ -77,9 +79,11 @@ class MT5VPSAdapter extends ExecutionAdapter {
     else this.events?.emit(name, value);
   }
   brokerSymbol(symbol) {
-    const name = String(symbol || '').toUpperCase().split(':').pop();
-    if (!INDEX_SYMBOLS.has(name)) throw Error('MT5 VPS принимает только SPX и USTEC');
-    return name === 'USTEC' ? this.config.ustecSymbol : this.config.spxSymbol;
+    const name = normalizeTradingSymbol(symbol);
+    if (name === 'USTEC') return this.config.ustecSymbol;
+    if (name === 'SPX500') return this.config.spxSymbol;
+    if (isTradingSymbol(name)) return name;
+    throw Error('Инструмент не поддерживается приёмником MT5 VPS');
   }
   candleSymbol(symbol) { return require('../tvListener/candle-mappings').brokerName(symbol); }
   async minuteBars(symbol) {
@@ -114,9 +118,10 @@ class MT5VPSAdapter extends ExecutionAdapter {
   }
   async getCandleSnapshot(symbol) {
     const name = this.candleSymbol(symbol);
-    // Reuse the existing stream for its two instruments, without changing it.
-    if (name === this.config.ustecSymbol || name === this.config.spxSymbol) {
-      const data = await this.snapshot(name === this.config.ustecSymbol ? 'USTEC' : 'SPX500');
+    const tradingName = name === this.config.ustecSymbol ? 'USTEC' : name === this.config.spxSymbol ? 'SPX500'
+      : name === 'XAUUSD' && this.capabilities.includes(GOLD_ENTRY_CAPABILITY) ? name : null;
+    if (tradingName) {
+      const data = await this.snapshot(tradingName);
       const cached = this.snapshots.get(name);
       return { ...data, symbol: name, provider: 'mt5-vps', quoteUpdatedAt: cached?.data === data ? cached.at : Date.now() };
     }
@@ -140,6 +145,18 @@ class MT5VPSAdapter extends ExecutionAdapter {
     }
     return this.candleSnapshotInflight.get(name);
   }
+  createLinkedAdapter(account) {
+    const id = String(account);
+    return new MT5VPSAdapter({...this.config, account:id, routePrefix:`/accounts/${id}`,
+      mirrorAccount:null, followers:[]}, this);
+  }
+  getAgents(tls) {
+    return this.agents ??= {
+      commands: new https.Agent({keepAlive:true, maxSockets:4, maxFreeSockets:4, ...tls}),
+      execution: new https.Agent({keepAlive:true, maxSockets:2, maxFreeSockets:2, scheduling:'fifo', ...tls}),
+      quotes: new https.Agent({keepAlive:true, maxSockets:1, maxFreeSockets:0, ...tls})
+    };
+  }
   request(route, payload, {execution = false, enrollment = false, readTimeoutMs} = {}) {
     if(readTimeoutMs!==undefined && (payload || !Number.isInteger(readTimeoutMs) || readTimeoutMs<2500 || readTimeoutMs>15000
       || !['/health','/management','/diagnostics','/entry-events','/entry-plans','/entry-plan','/entry-plan-stop','/minute-bars'].includes(route.split('?')[0])))
@@ -153,13 +170,12 @@ class MT5VPSAdapter extends ExecutionAdapter {
     url.pathname = (cfg.routePrefix || '') + pathname;
     url.search = query;
     const tls = tlsOptions(cfg);
-    if (!this.agents) this.agents = {
-      commands: new https.Agent({keepAlive:true, maxSockets:4, maxFreeSockets:2, ...tls}),
-      execution: new https.Agent({keepAlive:true, maxSockets:2, maxFreeSockets:2, scheduling:'fifo', ...tls}),
-      quotes: new https.Agent({keepAlive:true, maxSockets:1, maxFreeSockets:0, ...tls})
-    };
+    const agents = this.getAgents(tls);
     const body = payload ? Buffer.from(JSON.stringify(payload)) : null;
-    let agent=execution ? this.agents.execution : this.agents.commands;
+    // Share the coordinator's status sockets across linked-account reads.
+    // Each response must still match its own account and broker identity.
+    const readOwner = !body && !execution && this.readPoolOwner && !this.readPoolOwner.closed ? this.readPoolOwner : this;
+    let agent=execution ? agents.execution : readOwner.getAgents(tls).commands;
     if(!execution && ['/candle-levels','/chart-recorder','/tradehub-roles'].includes(pathname)){
       // Trading and its preparation never queue behind line synchronization.
       this.agents.levelSync ||= new https.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:1,...tls});
@@ -174,7 +190,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
       this.agents.entryEvents ||= new https.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:1,scheduling:'fifo',...tls});
       agent=this.agents.entryEvents;
     }
-    const priorityPool=execution && body && (['/place','/entry-plan','/entry-plan-admit'].includes(pathname) ? 'entryOpening'
+    const priorityPool=execution && body && (['/place','/place-followers','/entry-plan','/entry-plan-admit'].includes(pathname) ? 'entryOpening'
       : pathname==='/entry-plan-stop' ? 'entryStop' : pathname==='/entry-plan-continue' ? 'entryControl'
       : ['/entry-plan-close','/entry-plan-protection','/close','/modify','/cancel'].includes(pathname) ? 'entrySafety' : null);
     if(priorityPool && Object.values(agent.sockets || {}).reduce((count,rows)=>count+rows.length,0)>=agent.maxSockets) {
@@ -191,7 +207,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
     const transportProbe=execution && !body && pathname==='/entry-readiness';
     return new Promise((resolve, reject) => {
       let deadline,readTimer,request,readFinished=false,writeStarted=false;
-      const traceRead=!body && ['/health','/management','/snapshot','/orders','/diagnostics','/minute-bars'].includes(pathname);
+      const traceRead=!body && ['/health','/management','/snapshot','/orders','/position-presence','/diagnostics','/minute-bars'].includes(pathname);
       const managementView=pathname==='/management' ? {
         view:url.searchParams.get('view')==='active' ? 'active' : 'full',
         watch:url.searchParams.has('watch'),receipts:url.searchParams.has('receipts')
@@ -295,7 +311,6 @@ class MT5VPSAdapter extends ExecutionAdapter {
     if (Number(frame.account) !== Number(cfg.account) || frame.server !== cfg.server) throw Error('MT5 VPS: другой счёт или сервер');
     const allowed = new Set([cfg.spxSymbol,cfg.ustecSymbol]);
     const entries = Object.entries(frame.snapshots || {});
-    if (!entries.length) throw Error('MT5 VPS: пустой поток котировок');
     const unavailable=frame.unavailableSymbols===undefined ? [] : frame.unavailableSymbols;
     if(!Array.isArray(unavailable) || unavailable.length>allowed.size || new Set(unavailable).size!==unavailable.length
       || unavailable.some(symbol=>!allowed.has(symbol) || Object.hasOwn(frame.snapshots,symbol)))
@@ -306,6 +321,11 @@ class MT5VPSAdapter extends ExecutionAdapter {
         throw Error('MT5 VPS: некорректная котировка');
       }
     }
+    // Older receivers and clients can still share the original index frame.
+    const gold = frame.additionalSnapshots?.XAUUSD;
+    const goldAvailable = gold?.symbol === 'XAUUSD' && String(gold.account) === String(cfg.account)
+      && gold.server === cfg.server && validBidAsk(gold.quote);
+    if (!entries.length && !goldAvailable) throw Error('MT5 VPS: пустой поток котировок');
     const at = Date.now();
     // A queued old frame is never a usable quote. Keep reading the same
     // authenticated stream so a fresh frame behind it can restore prices.
@@ -314,16 +334,19 @@ class MT5VPSAdapter extends ExecutionAdapter {
       throw Error('MT5 VPS: поток котировок устарел');
     }
     require('./entryIntentClock').rememberServerClock(this,frame.capturedAt);
-    if(unavailable.length) {
+    const missing = !goldAvailable && (gold !== undefined || frame.unavailableAdditionalSymbols?.includes?.('XAUUSD'))
+      ? [...unavailable,'XAUUSD'] : unavailable;
+    if(missing.length) {
       this.unavailableQuotes ||= new Set();
       const changed=[];
-      for(const symbol of unavailable) {
+      for(const symbol of missing) {
         this.snapshots.delete(symbol);
         if(!this.unavailableQuotes.has(symbol))changed.push(symbol);
         this.unavailableQuotes.add(symbol);
       }
       if(changed.length)this.eventBus.emit('quote:stale',changed);
     }
+    if (goldAvailable) entries.push(['XAUUSD',gold]);
     for (const [symbol, data] of entries) {
       this.unavailableQuotes?.delete(symbol);
       this.snapshots.set(symbol,{data,at});
@@ -358,11 +381,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
       if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) return;
       url.pathname = '/quotes';
       const tls = tlsOptions(cfg);
-      if (!this.agents) this.agents = {
-        commands: new https.Agent({keepAlive:true,maxSockets:4,maxFreeSockets:2,...tls}),
-        execution: new https.Agent({keepAlive:true,maxSockets:2,maxFreeSockets:2,scheduling:'fifo',...tls}),
-        quotes: new https.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:0,...tls})
-      };
+      const {quotes} = this.getAgents(tls);
       this.streamDiagnostics.attempts++;
       let lastLoop=performance.now();
       loopTimer=setInterval(()=>{
@@ -370,7 +389,7 @@ class MT5VPSAdapter extends ExecutionAdapter {
         if(delay>=500)this.recordQuoteStream('local-delay','mac-event-loop',{delayMs:Number(delay.toFixed(2)),continuity:this.quoteContinuity.summary()});
       },250);
       loopTimer.unref?.();
-      request = https.request(url,{method:'GET',agent:this.agents.quotes,...tls,
+      request = https.request(url,{method:'GET',agent:quotes,...tls,
         headers:{authorization:`Bearer ${cfg.token}`}}, response => {
         if (response.statusCode !== 200) { response.resume(); fail('http-'+response.statusCode,Error('Quote stream unavailable')); return; }
         response.setEncoding('utf8');
@@ -599,9 +618,8 @@ class MT5VPSAdapter extends ExecutionAdapter {
       const result = await this.warmExecutionSockets();
       if (this.closed) return;
       if (this.config.mirrorAccount) {
-        const cfg = this.config;
         // Check the secondary connection without starting another quote stream.
-        this.linkedWarmConnection ||= new MT5VPSAdapter({...cfg,account:cfg.mirrorAccount,routePrefix:`/accounts/${cfg.mirrorAccount}`,mirrorAccount:null});
+        this.linkedWarmConnection ||= this.createLinkedAdapter(this.config.mirrorAccount);
         await this.linkedWarmConnection.request('/health');
       }
       if (this.quoteFast) await this.syncQuoteMode();
@@ -637,6 +655,22 @@ class MT5VPSAdapter extends ExecutionAdapter {
     if (!this.snapshotInflight.has(brokerSymbol)) {
       const task = this.request(`/snapshot?symbol=${encodeURIComponent(brokerSymbol)}`)
         .then(data => {
+          if (brokerSymbol === 'XAUUSD') {
+            const streamed = this.snapshots.get(brokerSymbol);
+            if (streamed && Date.now()-streamed.at < 500) return streamed.data;
+            const at = Date.now();
+            const {nativeCapturedAt, nativeAgeMs} = data.quote || {};
+            const captureAge = at - nativeCapturedAt;
+            if (String(data.account) !== String(this.config.account) || data.server !== this.config.server
+                || data.symbol !== brokerSymbol || !validBidAsk(data.quote)
+                || !Number.isFinite(captureAge) || Math.abs(captureAge) > MAX_QUOTE_CAPTURE_AGE_MS
+                || !Number.isFinite(nativeAgeMs) || nativeAgeMs < -250 || nativeAgeMs > 1000
+                || Math.max(0, captureAge) + nativeAgeMs > MAX_QUOTE_CAPTURE_AGE_MS)
+              throw Error('Нет подтверждённой свежей котировки XAUUSD');
+            this.snapshots.set(brokerSymbol, {data,at});
+            this.eventBus.emit('quote:updated',{symbol:brokerSymbol,quote:data.quote,metadata:data.metadata,at});
+            return data;
+          }
           this.retryQuoteStreamOnSnapshot(brokerSymbol, data);
           return data;
         })
@@ -684,6 +718,12 @@ class MT5VPSAdapter extends ExecutionAdapter {
       if (!['buy','sell'].includes(order.side) || !['market','limit','stop'].includes(order.type) || ![tick,entry,qty,sl].every(v => Number.isFinite(v) && v > 0)) return { status:'rejected',provider:this.provider,reason:'Неверные параметры MT5' };
       const direction = order.side === 'buy' ? 1 : -1;
       const copies=followers(this.config).filter(row=>row.enabled);
+      const excludePrimary=!this.config.routePrefix && this.config.primaryTradingEnabled===false;
+      if(excludePrimary) {
+        const {FOLLOWERS_ONLY_CAPABILITY,NO_TRADING_ACCOUNTS}=require('./entryAdmission');
+        if(!copies.length)throw Error(NO_TRADING_ACCOUNTS);
+        if(!this.capabilities.includes(FOLLOWERS_ONLY_CAPABILITY))throw Error('Для входа без основного счёта обнови VPS');
+      }
       if(copies.some(row=>row.riskPercent!=null))throw Error('Риск от баланса поддерживается в БМЛ/СМЛ');
       const request = {
         id: order.meta?.requestId || randomUUID(), symbol, side:order.side, type:order.type,
@@ -703,9 +743,12 @@ class MT5VPSAdapter extends ExecutionAdapter {
       }
       submitted = true;
       const macBeforeSendMs = Number.isFinite(order.meta?.clickAt) ? Math.max(0,Date.now()-order.meta.clickAt) : undefined;
-      const response = await this.request('/place', request, {execution:true});
+      const response = await this.request(excludePrimary ? '/place-followers' : '/place', request, {execution:true});
       const { result } = response;
       if (!result || !['ok','rejected','unknown'].includes(result.status)) throw Error('MT5 VPS: некорректное подтверждение');
+      if(excludePrimary && (result.accountResults || result.status==='ok')
+        && Object.keys(result.accountResults || {}).sort().join(',')!==copies.map(row=>row.account).sort().join(','))
+        throw Error('VPS не подтвердил выбранные торговые счета');
       return { ...result, provider:this.provider, timings:{...result.timings,server:response.serverTiming || result.timings?.server,
         transport:response.transportTiming,macBeforeSendMs,
         macClickToResultMs:Number.isFinite(order.meta?.clickAt) ? Math.max(0,Date.now()-order.meta.clickAt) : undefined} };

@@ -1,4 +1,4 @@
-const {ACCOUNT_CHUNK_CAPABILITY,ACCOUNT_ZONE_CAPABILITY}=require('./entryAdmission');
+const {ACCOUNT_CHUNK_CAPABILITY,ACCOUNT_ZONE_CAPABILITY,FOLLOWERS_ONLY_CAPABILITY}=require('./entryAdmission');
 const {MAX_NAME_LENGTH}=require('./accountNames');
 
 function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrumentSettings}={}) {
@@ -31,6 +31,12 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
     `;
     const status=make('p','Проверяю подключение…');status.setAttribute('role','status');
     const primaryRiskPanel=make('fieldset');const primaryTitle=make('legend','Основной счёт',primaryRiskPanel);
+    const primaryControls=make('div','',primaryRiskPanel);primaryControls.className='account-controls';
+    const primaryLabel=make('label','',primaryControls);
+    const primaryEnabled=make('input','',primaryLabel);primaryEnabled.type='checkbox';primaryEnabled.id='mt5-primary-trading-enabled';
+    primaryEnabled.checked=true;
+    make('span','Участвует в новых входах',primaryLabel);
+    const primaryAvailability=make('p','',primaryRiskPanel);
     const primaryMode=make('select','',primaryRiskPanel);
     primaryMode.id='mt5-primary-risk-mode';
     primaryMode.setAttribute('aria-label','Режим риска основного счёта');
@@ -42,7 +48,7 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
     primaryPercent.type='number';primaryPercent.min='0.001';primaryPercent.max='100';primaryPercent.step='any';
     primaryPercent.setAttribute('aria-label','Риск основного счёта, % баланса');
     primaryPercent.style.cssText='width:80px;margin-left:8px';primaryPercent.value='0.2';
-    const primarySave=make('button','Сохранить риск',primaryRiskPanel);
+    const primarySave=make('button','Сохранить',primaryRiskPanel);
     primarySave.id='mt5-save-primary-risk';
     primarySave.style.marginLeft='8px';
     const copies=make('fieldset');make('legend','Копирование новых сделок',copies);
@@ -109,7 +115,7 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
     const dismiss=make('button','Закрыть');dismiss.style.marginLeft='8px';dismiss.onclick=()=>dialog.close();
     let busy=false,loading=false,ready=false,readPromise=null,copiesDirty=false,exitDirty=false,primaryRiskDirty=false,account,capabilities=[],catalogBusy=false,catalogScanning=false;
     let accountIds=[],savedCopies=[],partsDirty=false,realAccounts=[],zoneDirty=false,namesDirty=false;
-    let recorder,recorderDraft;
+    let recorder,recorderDraft,savedPrimaryEnabled=true;
     function renderRecorder(next) {
       if(!next){recorder=undefined;recorderDraft=undefined;recorderStatus.textContent='Настройка уровней и снимков недоступна.';return;}
       if(recorder && recorder.revision!==next.revision)recorderDraft=undefined;
@@ -210,6 +216,9 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
       zoneSave.disabled=busy || !ready || !zoneDirty || zone.hidden;
       nameSave.disabled=busy || !ready || !namesDirty;
       primarySave.disabled=busy || !ready;
+      const canExclude=capabilities.includes(FOLLOWERS_ONLY_CAPABILITY);
+      primaryEnabled.disabled=busy || !ready || !canExclude && savedPrimaryEnabled;
+      primaryAvailability.textContent=ready && !canExclude && savedPrimaryEnabled ? 'Для отключения основного счёта обнови VPS.' : '';
       primaryPercent.hidden=primaryMode.value!=='balance';
       exitSave.disabled=busy || !ready || !capabilities.includes('time-exit');refresh.disabled=busy || loading;
       discover.disabled=busy || loading || catalogBusy || catalogScanning || !capabilities.includes('account-enrollment');
@@ -228,7 +237,9 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
         account=data.account;
         capabilities=data.capabilities || [];status.textContent='';
         primaryTitle.textContent=`Основной · ${data.account}`;
+        savedPrimaryEnabled=data.primaryTradingEnabled!==false;
         if (!primaryRiskDirty && !busy && !primaryRiskPanel.contains(document.activeElement)) {
+          primaryEnabled.checked=savedPrimaryEnabled;
           primaryMode.value=data.primaryRisk?.mode || 'usd';
           if (data.primaryRisk?.percent!=null) primaryPercent.value=String(data.primaryRisk.percent);
         }
@@ -323,6 +334,7 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
         if(kind==='time')exitDirty=false;
         else if(kind==='risk'){
           primaryRiskDirty=false;
+          savedPrimaryEnabled=result.primaryTradingEnabled!==false;primaryEnabled.checked=savedPrimaryEnabled;
           toolbar.dispatchEvent(new CustomEvent('mt5-primary-risk-changed',{detail:result.primaryRisk,bubbles:true}));
         } else if(kind==='parts'){
           partsDirty=false;
@@ -380,8 +392,10 @@ function mountTradeSettings(ipc,toolbar,{accounts=true,timeExit=true,openInstrum
       };
     }
     primaryMode.onchange=()=>{primaryRiskDirty=true;controls();};
+    primaryEnabled.onchange=()=>{primaryRiskDirty=true;controls();};
     primaryPercent.oninput=()=>{primaryRiskDirty=true;};
-    primarySave.onclick=()=>save('mt5-vps:save-primary-risk',{account,mode:primaryMode.value,percent:primaryPercent.value},'risk');
+    primarySave.onclick=()=>save('mt5-vps:save-primary-risk',{account,mode:primaryMode.value,percent:primaryPercent.value,
+      tradingEnabled:primaryEnabled.checked},'risk');
     partSave.onclick=()=>save('mt5-vps:save-account-chunk-percents',{account,
       percentages:Object.fromEntries([...partRows.querySelectorAll('input')].filter(input=>input.value!=='' || input.validity.badInput)
         .map(input=>[input.dataset.partAccount,input.valueAsNumber]))},'parts');

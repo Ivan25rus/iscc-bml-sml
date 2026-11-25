@@ -1,6 +1,8 @@
 """Exact parent close recovery using temporary journals and fake MT5."""
 import copy
 import json
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -93,6 +95,104 @@ class CloseReconciliationTests(unittest.TestCase):
         native.order_send, native.positions_get = close_with_stale_snapshot, positions_get
         return closes, stale_reads
 
+    def async_terminal_fixture(self, f, root):
+        from async_parent_close import terminal_folder
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        directory = temp.name
+        root.config['entryAsyncClose'] = True
+        workers = {}
+        for native, bridge in zip(f.natives, f.bridges):
+            bridge.config['entryAsyncClose'] = True
+            shard = root.chunk_entries.shards[str(native.account.login)]
+            shard.bridge.config['entryAsyncClose'] = True
+            native.terminal_info = lambda: SimpleNamespace(data_path=directory, connected=True)
+            folder = terminal_folder(directory, native.account.login)
+            folder.mkdir(parents=True)
+            (folder / 'ready').write_text(f'1\t{native.account.login}\t{native.account.server}\n')
+            os.utime(folder / 'ready', (f.now, f.now))
+            workers[native.account.login] = (native, bridge)
+        return workers
+
+    def test_durable_async_batches_dispatch_each_account_before_any_ticket_result(self):
+        from async_parent_close import publish
+
+        f, root = self.independent_parent()
+        workers = self.async_terminal_fixture(f, root)
+        command = f.close_command(id='async-parent-close')
+        submissions = {}
+
+        def terminal(folder, batch, account, server, expires, requests):
+            native, bridge = workers[account]
+            queued = [(req['position'], req['symbol'], req['volume']) for req in requests]
+            submissions[account] = queued
+            for ticket, _, volume in queued:
+                receipt = native_parent_close_id(root.chunk_entries._account_control_id(command['id'], str(account), 'close'),
+                                                 str(account), str(ticket))
+                saved = bridge._request_receipt(receipt)
+                self.assertEqual((saved['status'], saved['asyncBatch'], saved['requestedVolume']), ('unknown', batch, volume))
+            publish(folder,batch,account,server,expires,requests)
+            self.assertEqual(len((folder / (batch + '.send')).read_text().splitlines()), len(queued) + 1)
+            (folder / (batch + '.send')).unlink()
+            rows = ['1\t' + batch]
+            # Deliver results in reverse order. Every exact position must still
+            # match its own durable command and independent broker proof.
+            for index in reversed(range(len(requests))):
+                req = requests[index]
+                reply = native.order_send(req)
+                rows.append(f"{req['position']}\t1\t10009\t{reply.order}\t{reply.volume}\t{reply.price}\t{index * .4}")
+            (folder / (batch + '.reply')).write_text('\n'.join(rows) + '\n')
+
+        with patch('async_parent_close.publish', side_effect=terminal) as dispatched:
+            result = f.engine.close_position(command)['result']
+            self.assertEqual(result['status'], 'ok', result)
+            self.assertEqual(dispatched.call_count, 2)
+            for account, response in result['accountResults'].items():
+                self.assertEqual(len(response['positions']), len(submissions[int(account)]))
+                self.assertEqual(response['closeTiming']['batchDispatchSpreadMs'], .8)
+                self.assertNotIn('orderCommandMs', response['closeTiming'])
+            self.assertEqual(f.engine.close_position(command)['result'], result)
+            self.assertEqual(dispatched.call_count, 2)
+
+    def test_missing_async_batch_reply_is_never_resent_or_fallen_back_to_execute(self):
+        f, root = self.independent_parent()
+        self.async_terminal_fixture(f, root)
+        volumes = [len(native.positions) for native in f.natives]
+        command = f.close_command(id='lost-async-close-reply')
+        with patch('async_parent_close.wait_for_reply'), patch('async_parent_close.publish') as dispatched:
+            first = f.engine.close_position(command)['result']
+            replayed = f.engine.close_position(command)['result']
+        self.assertEqual(dispatched.call_count, 2)
+        self.assertEqual(first['status'], 'unknown')
+        self.assertEqual(replayed['status'], 'unknown')
+        self.assertEqual([len(native.positions) for native in f.natives], volumes)
+        self.assertTrue(all(len(row['positions']) == 3 for row in first['accountResults'].values()))
+
+    def test_two_symbols_can_publish_to_one_terminal_while_first_reply_is_pending(self):
+        from async_parent_close import terminal_folder
+        f, root = self.independent_parent()
+        self.async_terminal_fixture(f, root)
+        native, bridge = f.natives[0], f.bridges[0]
+        bridge.config['symbols'] = ['USTEC', 'SPX500']
+        captured = list(native.positions)[:2]
+        native.positions.extend(SimpleNamespace(**{**vars(row), 'ticket': row.ticket+500,
+                                                   'identifier': row.identifier+500, 'symbol': 'SPX500'})
+                                for row in captured)
+        account = str(native.account.login)
+        batches = []
+        for symbol in bridge.config['symbols']:
+            identifier = 'batch-'+symbol
+            requests = [dict(id=native_parent_close_id(identifier,account,str(row.ticket)),ticket=str(row.ticket),
+                             symbol=symbol,volume=row.volume,expectedVolume=row.volume,expiresAt=f.now*1000+2000)
+                        for row in native.positions if row.symbol==symbol][:2]
+            batches.append(bridge.entry_close_batch(identifier,requests))
+        folder = terminal_folder(native.terminal_info().data_path,account)
+        self.assertTrue(all(row['available'] for row in batches))
+        self.assertEqual(len(list(folder.glob('*.send'))),2)
+        self.assertTrue((folder/'wake').exists())
+        self.assertFalse(list(folder.glob('*.reply')))
+
     def test_three_done_closes_survive_multiple_stale_native_position_snapshots_without_resending(self):
         f, root = self.independent_parent()
         account = '900000001'
@@ -110,6 +210,11 @@ class CloseReconciliationTests(unittest.TestCase):
         self.assertEqual([call.kwargs.get('exact_exit',False) for call in view.call_args_list], [False,False,True,True,False])
         self.assertTrue(entry['positionsClosed'])
         self.assertNotIn('closurePending', entry['accounts'][account])
+        for outcome in result['accountResults'].values():
+            for stage in ('queueMs', 'accountMs'):
+                self.assertGreaterEqual(outcome['coordinatorTiming'][stage], 0)
+            for stage in ('orderCommandMs', 'mt5Ms', 'proofMs', 'finalProofMs'):
+                self.assertGreaterEqual(outcome['closeTiming'][stage], 0)
         counts = [len(native.sent) for native in f.natives]
         self.assertEqual(root.receipt(command['id'])['result'], result)
         self.assertEqual(f.engine.close_position(command)['result'], result)

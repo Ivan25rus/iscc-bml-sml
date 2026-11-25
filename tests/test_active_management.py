@@ -95,6 +95,36 @@ class ActiveManagementTests(unittest.TestCase):
         self.assertTrue(any(method=='management_snapshot' and args[-1] is True for method,args in seen))
         self.assertFalse(any(native.sent for native in f.natives))
 
+    def test_position_presence_reads_one_symbol_per_account_and_preserves_unknown(self):
+        case=fixtures.EntryCheckBatchTests()
+        self.addCleanup(case.doCleanups)
+        _,f,root=case.model()
+        self.assertIn('position-presence-v1', root._capabilities())
+        root.config['token']='offline-fixture-token'
+        native, peer = f.natives
+        native.positions = [type(native.tick)(symbol='USTEC', volume=.4)]
+        server=create_server(root,('127.0.0.1',0))
+        thread=threading.Thread(target=server.serve_forever,daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client=http.client.HTTPConnection('127.0.0.1',server.server_address[1],timeout=3)
+        self.addCleanup(client.close)
+        route='/position-presence?symbol=USTEC&accounts=900000002%2C900000001'
+        headers={'Authorization':'Bearer offline-fixture-token'}
+        with patch.object(native,'positions_get',wraps=native.positions_get) as positions, \
+                patch.object(peer,'positions_get',return_value=None) as unavailable, \
+                patch.object(native,'orders_get',side_effect=AssertionError('Pending orders were read')):
+            client.request('GET',route,headers=headers)
+            response=client.getresponse()
+            self.assertEqual(response.status,200)
+            evidence=json.loads(response.read())
+            self.assertTrue(evidence['positionStates']['900000002']['hasPosition'])
+            self.assertIsNone(evidence['positionStates']['900000001'])
+            positions.assert_called_once_with(symbol='USTEC')
+            unavailable.assert_called_once_with(symbol='USTEC')
+        self.assertFalse(any(mt5.sent for mt5 in f.natives))
+
     def test_quote_native_stages_are_measured_without_additional_reads(self):
         with patch.object(self.native,'account_info',wraps=self.native.account_info) as account,patch.object(self.native,'terminal_info',wraps=self.native.terminal_info) as terminal,\
              patch.object(self.native,'symbol_info_tick',wraps=self.native.symbol_info_tick) as tick:

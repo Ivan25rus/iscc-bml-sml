@@ -26,11 +26,11 @@ class IsolatedEngineTests(unittest.TestCase):
         for native in f.natives:native.info.volume_step=native.info.volume_min=.01
         return f
 
-    def until(self,f,predicate,timeout=None):
+    def until(self,f,predicate,timeout=None,entry_id=None):
         timeout=20 if sys.platform=='win32' else 6 if timeout is None else timeout
         end=time.monotonic()+timeout
         while time.monotonic()<end:
-            f.engine.tick();state=f.state()
+            f.engine.tick();state=f.state() if entry_id is None else f.engine.get(entry_id)
             if predicate(state):return state
             time.sleep(.002)
         self.fail(repr(state))
@@ -40,10 +40,98 @@ class IsolatedEngineTests(unittest.TestCase):
             f=self.make(side);f.engine.arm(f.payload)
             state=self.until(f,lambda s:s['phase']=='completed')
             self.assertEqual([x['filledVolume'] for x in state['accounts'].values()],[1,1])
+            fast = next(row for row in f.engine.list() if row['id'] == state['id'])
+            for details in fast['accounts'].values():
+                self.assertNotIn('entryTiming', details)
+                timeline = details['entryTimingSummary']
+                submission = timeline['orderSends']['market']['first']
+                self.assertLessEqual(submission['sentAtMs'], submission['returnedAtMs'])
+                self.assertLessEqual(submission['returnedAtMs'], timeline['fills']['firstConfirmedAtMs'])
+                self.assertLessEqual(timeline['fills']['targetConfirmedAtMs'], timeline['stopConfirmedAtMs'])
             self.assertEqual(len({x['id'] for x in state['children']}),len(state['children']))
             paths=[engine.bridge.db.execute('PRAGMA database_list').fetchone()[2] for engine in f.engine.shards.values()]
             self.assertEqual(len(set(paths)),2)
             self.assertTrue(all(engine._load(f.payload['id'])[1]['initialSizingOnly'] for engine in f.engine.shards.values()))
+
+    def test_followers_only_never_sends_to_the_primary_and_survives_control(self):
+        f = self.make()
+        with self.assertRaisesRegex(ValueError, 'at least one'):
+            f.engine.arm(dict(f.payload, excludePrimary=True, mirrorAccounts=[], mirrorAccount=None))
+        command = dict(f.payload, excludePrimary=True, mirrorAccounts=[dict(account='900000001',multiplier=.7)])
+        entry = f.engine.arm(command)
+        self.assertEqual(set(entry['accounts']), {'900000001'})
+        self.assertTrue(entry['excludePrimary'])
+        entry = self.until(f, lambda state: state['phase']=='completed')
+        self.assertAlmostEqual(entry['accounts']['900000001']['filledVolume'], .7)
+        self.assertFalse(f.natives[0].sent)
+        self.assertTrue(f.natives[1].sent)
+        self.assertEqual(set(f.engine.arm(command)['accounts']), {'900000001'})
+        stopped = f.engine.stop(dict(id='followers-only-stop',entryId=command['id'],expiresAt=f.now*1000+3000))
+        self.assertEqual(set(stopped['accounts']), {'900000001'})
+        self.assertFalse(f.natives[0].sent)
+
+    def test_separate_lt_captures_another_level_and_preserves_the_first_positions(self):
+        for partial in (False,True):
+            with self.subTest(partial=partial):
+                f=self.make()
+                if partial:
+                    for native in f.natives:
+                        native.after_market=lambda broker:f.quote(broker,25008.)
+                f.engine.arm(f.payload)
+                first=self.until(f,lambda state:state['phase']=='completed' or partial and all(
+                    row['filledVolume']>0 for row in state['accounts'].values())
+                    and sum(child['state']=='pending' for child in state['children'])==2)
+                self.assertEqual(first['phase']=='completed',not partial)
+                original=[{p.ticket:(p.volume,p.sl,p.tp) for p in native.positions} for native in f.natives]
+                with self.assertRaisesRegex(ValueError,'capture its own level'):
+                    f.engine.arm(dict(f.payload,id='invalid-separate-lt',separateLt=True,level=25008.))
+                second=dict(f.payload,id='second-lt',cid='second-lt',separateLt=True,level=25008.,trigger=25008.,sl=24992.)
+                for native in f.natives:
+                    native.after_market=None
+                    native.group_budgets['cid:second-lt']=(1.,16.)
+                    f.quote(native,25008.)
+                accepted=f.engine.arm(second)
+                self.assertEqual((accepted['level'],accepted['separateLt']),(25008.,True))
+                self.until(f,lambda state:state['phase']=='completed',entry_id=second['id'])
+                self.assertEqual(f.engine.get(first['id'])['level'],25000.)
+                for native,positions in zip(f.natives,original):
+                    self.assertTrue(positions)
+                    self.assertEqual({p.ticket:(p.volume,p.sl,p.tp) for p in native.positions if p.ticket in positions},positions)
+
+    def test_followers_only_with_own_balance_risk_never_needs_primary_admission(self):
+        f = self.make()
+        f.natives[1].account.balance=8000
+        payload=dict(f.payload, excludePrimary=True, accountStart='entry-account-start-v1',
+                     mirrorAccounts=[dict(account='900000001',multiplier=1,riskPercent=.2)],
+                     primaryRiskRequest=dict(account='900000002',percent=.2,pointValue=1,maxLot=0,
+                                             quantityStep=.01,minQty=.01,maxQty=100))
+        for field in ('volume','chunkVolume','riskUsd'):
+            payload.pop(field)
+        with patch.object(f.primary,'entry_admission',side_effect=AssertionError('Disabled primary admission')):
+            accepted=f.engine.arm(payload)
+            self.assertEqual(accepted['volume'],0)
+            self.assertEqual(set(accepted['accounts']),{'900000001'})
+            finished=self.until(f,lambda entry:entry['phase']=='completed')
+        self.assertEqual(finished['accounts']['900000001']['balanceRisk']['riskPercent'],.2)
+        self.assertNotIn('primaryRiskSizing',finished)
+        self.assertFalse(f.natives[0].sent)
+
+    def test_stopped_quote_wait_keeps_tick_and_read_timestamps_without_a_send(self):
+        f = self.make()
+        account, native = '900000001', f.natives[1]
+        native.tick.time = f.now - 2
+        native.tick.time_msc = int(native.tick.time * 1000)
+        f.engine.arm(f.payload)
+        self.until(f, lambda state: state['accounts'][account].get('entryStatus') == 'waiting-quote')
+        stopped = f.engine.stop(dict(id='stop-stale-quote', entryId=f.payload['id'], expiresAt=f.now*1000+3000))
+        self.assertEqual(stopped['lanePhases'][account], 'stopped')
+        timing = stopped['accounts'][account]['entryTimingSummary']
+        wait = next(row for row in timing['waitSummary']['waits'] if row['phase'] == 'waiting-quote')
+        self.assertGreater(wait['durationMs'], 0)
+        self.assertEqual(wait['firstStaleQuote']['tickUtcMs'], f.now*1000-2000)
+        self.assertEqual(wait['firstStaleQuote']['nativeCapturedAt'], f.now*1000)
+        self.assertNotIn('orderSends', timing)
+        self.assertFalse(native.sent)
 
     def test_frozen_return_limit_resumes_only_after_quote_returns_to_zone(self):
         f = self.make('sell')

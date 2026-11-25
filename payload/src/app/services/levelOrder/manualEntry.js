@@ -14,4 +14,10 @@ function validateTrackedEntry({groups = [], symbol, level, entryPrice}) {
   return {ok:true,level:selected,entryPrice:entry,maxOffset};
 }
 
-module.exports = {validateTrackedEntry};
+function availableLtLevels(groups, symbol, occupied=[]) {
+  return [...new Set(groups.filter(group=>group.enabled!==false && indexSymbol(group.ticker)===indexSymbol(symbol)
+    && Number.isFinite(Number(group.maxOffset)) && Number(group.maxOffset)>=0)
+    .flatMap(group=>Array.isArray(group.levels) ? group.levels.map(Number) : []))]
+    .filter(level=>Number.isFinite(level) && level>0 && !occupied.some(other=>Math.abs(other-level)<1e-8));
+}
+module.exports = {validateTrackedEntry,availableLtLevels};

@@ -10,6 +10,7 @@ test('Hybrid protection and complete close use the primary coordinator even when
   const config={enabled:true,account:900000002,server:'Example-MT5',followers:[{account:'900000001',multiplier:1,enabled:true}]};
   class Connection extends EventEmitter {
     constructor(config){super();this.config=config;this.inFlight=new Set();}
+    createLinkedAdapter(account){return new Connection({...this.config,account,routePrefix:'/accounts/'+account});}
     modifyEntryProtection(target,changes,options){calls.push({kind:'parent-protection',route:this.config.routePrefix,target,changes,options});return {status:'ok',entry:finalEntry};}
     closeEntryPosition(entry,options){calls.push({kind:'parent-close',route:this.config.routePrefix,entry,options});return {status:'ok',entry:finalEntry};}
     modifyOrder(target,changes){calls.push({kind:'ordinary-modify',route:this.config.routePrefix,target,changes});return {status:'ok'};}

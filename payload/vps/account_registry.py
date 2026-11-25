@@ -131,12 +131,12 @@ class AccountRegistry:
             paths = {path_key(bridge.config['terminalPath']), *(path_key(x.config['terminalPath']) for x in bridge.linked.values())}
             for row in stored['accounts']:
                 if not isinstance(row, dict) or set(row) != set(RECORD_FIELDS): raise ValueError('Invalid stored account fields')
-                self.validate(row)
+                self.validate(row, stored=True)
                 if row['account'] in seen or path_key(row['terminalPath']) in paths: raise ValueError('Duplicate registered terminal/account')
                 seen.add(row['account']); paths.add(path_key(row['terminalPath']))
                 self.records.append(row)
 
-    def validate(self, row):
+    def validate(self, row, *, stored=False):
         if not isinstance(row, dict) or row.get('platform') not in ('mt4', 'mt5'):
             raise ValueError('Unknown account platform')
         if not isinstance(row.get('account'), str) or not re.fullmatch(r'[1-9][0-9]{0,19}', row['account']):
@@ -150,8 +150,14 @@ class AccountRegistry:
             raise ValueError('Automatic MT5 enrollment currently requires the same broker server as the primary')
         specs = row.get('specifications', {})
         expected = set(self.bridge.config['symbols']) if row['platform']=='mt5' else {'SPX500','USTEC'}
-        if not isinstance(specs, dict) or set(specs) != expected:
-            raise ValueError('Both index symbols must match the configured broker symbols')
+        if not isinstance(specs, dict):
+            raise ValueError('Invalid instrument specifications')
+        names = set(specs)
+        # Existing account registrations predate gold. The worker checks the
+        # current broker specification at admission, as for every new order.
+        legacy = stored and 'XAUUSD' in expected and names == expected - {'XAUUSD'}
+        if names != expected and not legacy:
+            raise ValueError('Instrument specifications must match the configured broker symbols')
         for spec in specs.values():
             if not isinstance(spec, dict): raise ValueError('Invalid lot specifications')
             if set(spec)-{'quantityStep','minQty','maxQty','tickSize','contractSize','symbol'}:

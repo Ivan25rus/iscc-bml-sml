@@ -1,5 +1,12 @@
+const visibleEntryCards = require('./services/mt5-vps/closedEntryCards').loadClosedEntryCards(
+  path.join(app.getPath('userData'),'verified-closed-entry-cards.json'));
+
+  const entryMilestones=require('./services/mt5-vps/entryMilestones').createEntryMilestones({
+    log:row=>appendJsonl(EXEC_LOG,{t:nowTs(),...row})
+  });
   chunkAdmission=require('./services/levelOrder/chunkAdmission').createChunkAdmission({
     getAdapter:()=>servicesApi.mt5VPS.getAdapter(),
+    readAccountOrders:account=>servicesApi.mt5VPS.readAccountOrders(account),
     getGroups:()=>servicesApi.levelTrack?.snapshot?.().config.groups || [],
     getConfig:()=>require('./services/settings').readConfig('level-order')?.config || {},
     getSnapshot:(symbol,payload)=>payload.entryMode==='side-zone'
@@ -19,8 +26,12 @@
     try {
       if(preferredId!==undefined && (typeof preferredId!=='string' || !/^[A-Za-z0-9_.:-]{1,100}$/.test(preferredId)))
         throw Error('Некорректный номер набора');
-      const entries=await servicesApi.mt5VPS.getAdapter().listChunkEntries(visibleEntryCards,preferredId);
-      return {status:'ok',entries:entryMilestones.observeMany(visibleEntryCards(entries))};
+      const adapter=servicesApi.mt5VPS.getAdapter();
+      const entries=await adapter.listChunkEntries(visibleEntryCards,preferredId);
+      const indexPositions=require('./services/mt5-vps/cardIdentity').openIndexSymbols(
+        adapter.managementStateView,symbol=>adapter.brokerSymbol(symbol),adapter.managementStateAt,
+        [adapter.config.account,...(adapter.remoteAccounts || [])]);
+      return {status:'ok',entries:entryMilestones.observeMany(visibleEntryCards(entries)),indexPositions};
     }
     catch(error){return {status:'rejected',reason:error.message};}
   });
@@ -36,13 +47,6 @@
       const result=await servicesApi.mt5VPS.getAdapter().stopChunkEntry(payload.entryId,{cancelContinueIds:payload.cancelContinueIds});
       entryMilestones.result(payload.entryId,result?.entry ? result : null);
       appendJsonl(EXEC_LOG,{t:nowTs(),kind:'chunk-entry-stop',entryId:payload.entryId,result});
-      return result;
-    } catch(error){return {status:'rejected',reason:error.message};}
-  });
-  ipcMain.handle('level-order:continue-chunks',async(_event,payload={})=>{
-    try {
-      const result=await servicesApi.mt5VPS.getAdapter().continueChunkEntry(payload.entryId,payload.account,{requestId:payload.requestId});
-      appendJsonl(EXEC_LOG,{t:nowTs(),kind:'chunk-entry-continue',entryId:payload.entryId,account:payload.account,result});
       return result;
     } catch(error){return {status:'rejected',reason:error.message};}
   });

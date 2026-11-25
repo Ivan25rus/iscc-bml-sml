@@ -1053,6 +1053,11 @@ class HybridProtectionTests(unittest.TestCase):
         payload = self.command(sl=24990., tp=25040., mirrorAccounts=[dict(account='900000001')])
         status, applied = self.request_api('POST', '/entry-plan-protection', payload)
         self.assertEqual((status, applied['result']['status']), (200, 'ok'), applied)
+        self.assert_compact_control_entry(applied)
+        for outcome in applied['result']['accountResults'].values():
+            self.assertTrue(outcome['protectionProof']['positions'])
+            self.assertGreaterEqual(outcome['protectionTiming']['mt5Ms'], 0)
+            self.assertGreaterEqual(outcome['protectionTiming']['ledgerAfterMs'], 0)
         counts = [len(native.sent) for native in self.natives]
         status, receipt = self.request_api('GET', '/receipt?id=' + payload['id'])
         self.assertEqual(status, 200)
@@ -1061,12 +1066,25 @@ class HybridProtectionTests(unittest.TestCase):
         self.assertEqual([len(native.sent) for native in self.natives], counts)
         status, closed = self.request_api('POST', '/entry-plan-close', self.close_command())
         self.assertEqual((status, closed['result']['status']), (200, 'ok'), closed)
+        self.assert_compact_control_entry(closed)
+        for outcome in closed['result']['accountResults'].values():
+            self.assertTrue(outcome['positions'])
+            for stage in ('preflightMs', 'orderCommandMs', 'mt5Ms', 'ledgerBeforeMs', 'ledgerAfterMs', 'proofMs', 'finalProofMs'):
+                self.assertGreaterEqual(outcome['closeTiming'][stage], 0)
         self.assertIs(closed['entry']['positionsConfirmed'], True)
         self.assertIs(closed['entry']['hasOpenPositions'], False)
         self.assertEqual(closed['entry']['positionLifecycle'], 'closed')
         self.assertEqual([row.ticket for row in self.natives[0].positions], [999000001])
         self.assertEqual(self.natives[1].positions, [])
         self.assertEqual(self.request_api('GET', '/receipt?id=close-card-1')[1]['result'], closed['result'])
+
+    def assert_compact_control_entry(self, reply):
+        status, exact = self.request_api('GET', '/entry-plan?id=' + self.payload['id'])
+        self.assertEqual(status, 200)
+        for details in exact['entry']['accounts'].values():
+            self.assertIn('entryTiming', details)
+            del details['entryTiming']
+        self.assertEqual(reply['entry'], exact['entry'])
 
     def test_http_rejects_child_modify_linked_parent_route_and_binds_rejection_ids_without_native_send(self):
         self.make(accounts=2)

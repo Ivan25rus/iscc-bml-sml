@@ -150,6 +150,33 @@ class EntryCheckBatchTests(unittest.TestCase):
         self.assertGreaterEqual(history.call_count,1)
         self.assertEqual(view['openingStates']['999']['phase'],'unknown')
 
+    def test_batched_snapshot_matches_position_identifiers_and_checks_missing_history(self):
+        _, f, _ = self.model()
+        native = f.natives[0]
+        native.positions = [SimpleNamespace(ticket=100, identifier=101, symbol='USTEC', volume=1.,
+                                            price_open=25000., sl=24984., tp=0., type=0)]
+        watch = [dict(ticket=str(ticket), symbol='USTEC') for ticket in (100, 101, 999)]
+        with patch.object(native, 'history_orders_get', wraps=native.history_orders_get) as history:
+            proof = f.primary.entry_context('USTEC', watch)['proof']
+        self.assertEqual(proof['openingStates']['100'], dict(phase='opened', ticket='100'))
+        self.assertEqual(proof['openingStates']['101'], dict(phase='opened', ticket='100'))
+        self.assertEqual(proof['openingStates']['999']['phase'], 'unknown')
+        history.assert_called_once_with(ticket=999)
+        self.assertFalse(native.sent)
+
+    def test_single_pending_probe_reads_only_its_ticket_and_retains_unknown_behavior(self):
+        _, f, _ = self.model()
+        native = f.natives[0]
+        rows = (SimpleNamespace(ticket=100, symbol='USTEC', volume_current=.2),)
+        with patch.object(native, 'orders_get', return_value=rows) as orders:
+            result = f.primary.entry_context('USTEC', (), (('100', .4),))
+        orders.assert_called_once_with(ticket=100)
+        self.assertEqual(result['pendingLimitChanges'], ['100'])
+        with patch.object(native, 'orders_get', return_value=None):
+            result = f.primary.entry_context('USTEC', (), (('100', .4),))
+        self.assertEqual(result['pendingLimitChanges'], [])
+        self.assertFalse(native.sent)
+
     def test_absent_cancel_view_reads_same_order_history_once(self):
         case,f,root=self.model();native=f.natives[0]
         with patch.object(native,'history_orders_get',wraps=native.history_orders_get) as history:

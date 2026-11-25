@@ -110,6 +110,34 @@ def read_window(mt5, payload, offset):
     # minute candles above never change their timeframe to fill a history gap.
     if start % 3600 or end % 3600:
         raise ValueError('No exact native MT5 candle; minute windows are not replaced by adjacent bars')
+    if payload['symbol'] == 'XAUUSD' and payload['timeframe'] == 'W1':
+        # TradingView's gold week ends before the next broker week starts.
+        # Reconcile the full broker week to distinguish market closures from
+        # missing H1 candles, then take prices only inside the TV window.
+        weekly = read('W1', start - nominal + 1, start)
+        if weekly is None or len(weekly) != 1:
+            raise ValueError('Native MT5 gold week is unavailable')
+        week_start = int(weekly[0]['time'])
+        week_end = week_start + nominal
+        if week_start % 3600 or not week_start <= start < end <= week_end:
+            raise ValueError('TV gold window does not fit a single MT5 week')
+        hours = read('H1', week_start, week_end - 1)
+        if hours is None or not 0 < len(hours) <= nominal // 3600:
+            raise ValueError('MT5 gold week has no verifiable hourly history')
+        stamps = [int(row['time']) for row in hours]
+        if (stamps != sorted(set(stamps))
+                or any(stamp % 3600 or not week_start <= stamp < week_end for stamp in stamps)
+                or any(int(row['tick_volume']) <= 0 for row in hours)
+                or sum(int(row['tick_volume']) for row in hours) != int(weekly[0]['tick_volume'])
+                or prices(hours) != prices(weekly)
+                or float(hours[0]['open']) != float(weekly[0]['open'])
+                or float(hours[-1]['close']) != float(weekly[0]['close'])):
+            raise ValueError('MT5 hourly history does not reproduce the native gold week')
+        selected = [row for stamp, row in zip(stamps, hours) if start <= stamp < end]
+        if not selected:
+            raise ValueError('MT5 gold week has no traded hours inside the exact TV window')
+        high, low = prices(selected)
+        return dict(high=high, low=low, brokerTime=start, method='mt5-h1-week-window', coverageHours=len(selected))
     hours = read('H1', start, end - 1)
     if hours is None or not len(hours):
         raise ValueError('MT5 history for the exact TV window is unavailable')

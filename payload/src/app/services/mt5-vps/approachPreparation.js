@@ -1,9 +1,5 @@
 const {freshExecutionSnapshot} = require('./quoteSnapshot');
-
-function indexSymbol(value) {
-  const name = String(value || '').toUpperCase().split(':').pop();
-  return name === 'SPX' ? 'SPX500' : name;
-}
+const {normalizeTradingSymbol:indexSymbol,isTradingSymbol}=require('./tradingSymbols');
 
 // Preparation sends only a status request. Placement remains a separate click.
 function createApproachPreparation({getGroups, warm, onState, onApproach, onNear, clock = Date.now}) {
@@ -12,7 +8,7 @@ function createApproachPreparation({getGroups, warm, onState, onApproach, onNear
   let wasNear = false;
   function candidate(snapshot) {
     const ticker = indexSymbol(snapshot?.symbol);
-    if (!['USTEC','SPX500'].includes(ticker) || !freshExecutionSnapshot(snapshot,'mt5-vps',ticker,clock())) return null;
+    if (!isTradingSymbol(ticker) || !freshExecutionSnapshot(snapshot,'mt5-vps',ticker,clock())) return null;
     const price = (snapshot.quote.bid + snapshot.quote.ask) / 2;
     const nearest = (getGroups() || []).flatMap(group => {
       const offset = Number(group.maxOffset);
@@ -72,7 +68,7 @@ function createApproachPreparation({getGroups, warm, onState, onApproach, onNear
     update(snapshot) {
       if (closed || snapshot?.provider !== 'mt5-vps') return;
       const ticker = indexSymbol(snapshot.symbol);
-      if (!['USTEC','SPX500'].includes(ticker)) return;
+      if (!isTradingSymbol(ticker)) return;
       const record = records.get(ticker) || {ticker};
       record.snapshot = snapshot;
       records.set(ticker,record);

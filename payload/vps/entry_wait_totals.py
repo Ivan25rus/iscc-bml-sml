@@ -33,10 +33,63 @@ def record_common_stop_timing(timing, result, elapsed_ms, receipt_only=False):
     timing['commonStop'] = observed
 
 
+def record_entry_send(details, kind, result):
+    timing = result.get('timings')
+    server = timing.get('server') if isinstance(timing, dict) else None
+    if not isinstance(server, dict):
+        return
+    sent_at = server.get('mt5StartedAt')
+    if not _finite(sent_at) or sent_at <= 0:
+        return  # Preflight rejection is not a broker submission.
+    sends = details.setdefault('entryTiming', {}).setdefault('orderSends', {})
+    totals = sends.setdefault(kind, dict(count=0, totalNativeMs=0.))
+    sample = dict(sentAtMs=sent_at)
+    for source, key in (('mt5ReturnedAt', 'returnedAtMs'), ('mt5Ms', 'nativeMs')):
+        value = server.get(source)
+        if _finite(value) and value >= 0:
+            sample[key] = value
+    if type(result.get('retcode')) is int:
+        sample['retcode'] = result['retcode']
+    totals['count'] += 1
+    totals['totalNativeMs'] = round(totals['totalNativeMs'] + sample.get('nativeMs', 0.), 3)
+    totals.setdefault('first', sample)
+    totals['last'] = sample
+
+
+def record_entry_fill(details, previous_volume, confirmed_at_ms):
+    volume = details['filledVolume']
+    if volume <= previous_volume + 1e-8:
+        return
+    fills = details.setdefault('entryTiming', {}).setdefault('fills', {})
+    fills.setdefault('firstConfirmedAtMs', confirmed_at_ms)
+    fills['lastConfirmedAtMs'] = confirmed_at_ms
+    if volume >= details['targetVolume'] - 1e-8:
+        fills.setdefault('targetConfirmedAtMs', confirmed_at_ms)
+
+
+def record_broker_position_open(details, row):
+    opened_at = row.get('brokerOpenedAtMs')
+    if _finite(opened_at) and opened_at > 0:
+        fills = details.setdefault('entryTiming', {}).setdefault('fills', {})
+        first = 'firstBrokerPositionOpenedAtMs'
+        last = 'lastBrokerPositionOpenedAtMs'
+        fills[first] = min(opened_at, fills.get(first, opened_at))
+        fills[last] = max(opened_at, fills.get(last, opened_at))
+
+
+def entry_timing_summary(timing):
+    if not isinstance(timing, dict):
+        return None
+    fields = ('waitSummary', 'orderSends', 'fills', 'commonStop', 'stopConfirmedAtMs')
+    summary = {key: timing[key] for key in fields if key in timing}
+    if summary:
+        return dict(schema='entry-timing-summary-v1', **summary)
+
+
 class EntryWaitTotals:
     MAX_STAGES = 16
     MAX_REASONS = 8
-    TERMINAL = frozenset(('completed', 'stopped', 'rejected'))
+    TERMINAL = frozenset(('completed', 'stopped', 'rejected', 'unknown'))
 
     def __init__(self):
         self.data = dict(schema='entry-wait-totals-v1', observedMs=0., stages={}, waits=[])
@@ -62,7 +115,7 @@ class EntryWaitTotals:
                 self.data['waits'].append(row)
         return self.wait_rows[key]
 
-    def observe(self, phase, reason, now_ms, quote_age_ms=None):
+    def observe(self, phase, reason, now_ms, quote_age_ms=None, stale_quote=None):
         """Account actor owns this object. Publish data with its normal state.
 
         Completed/stopped idle time is excluded. Repeated observations accrue
@@ -95,4 +148,11 @@ class EntryWaitTotals:
             waiting['quoteSamples'] = waiting.get('quoteSamples', 0)+1
             waiting['minQuoteAgeMs'] = round(min(waiting.get('minQuoteAgeMs', quote_age_ms), quote_age_ms), 3)
             waiting['maxQuoteAgeMs'] = round(max(waiting.get('maxQuoteAgeMs', quote_age_ms), quote_age_ms), 3)
+        if waiting is not None and isinstance(stale_quote, dict):
+            sample = {key: round(stale_quote[key], 3) for key in (
+                'tickUtcMs', 'nativeCapturedAt', 'nativeAgeMs', 'checkedAtMs', 'ageMs')
+                if _finite(stale_quote.get(key))}
+            if 'tickUtcMs' in sample and 'checkedAtMs' in sample:
+                waiting.setdefault('firstStaleQuote', sample)
+                waiting['lastStaleQuote'] = sample
         self.current, self.at = (phase, reason), now_ms

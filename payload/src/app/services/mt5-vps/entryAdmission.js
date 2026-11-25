@@ -2,16 +2,23 @@
 // contract, real accounts and the captured plan before saving an opening intent.
 const CAPABILITY='atomic-entry-admission-v1';
 const PRIMARY_RISK_CAPABILITY='entry-primary-balance-risk-v1';
+const GOLD_PRIMARY_PER_ORDER_CAPABILITY='entry-gold-primary-per-order-v1';
 const ACCOUNT_CHUNK_CAPABILITY='entry-account-chunk-percent-v1';
 const ACCOUNT_ZONE_CAPABILITY='entry-account-zone-v1';
 const ACCOUNT_START_CAPABILITY='entry-account-start-v1';
+const FOLLOWERS_ONLY_CAPABILITY='entry-followers-only-v1';
+const SEPARATE_LT_CAPABILITY='entry-separate-lt-v1';
+const NO_TRADING_ACCOUNTS='Вход запрещён. В настройках MT5 выключены все торговые счета.';
 function requiredCapabilities(request) {
   const required=['chunked-breakout'];
   if(request.mirrorAccounts?.some(row=>row.riskPercent!=null))required.push('entry-balance-risk-v1');
   if(request.primaryRiskRequest)required.push(PRIMARY_RISK_CAPABILITY);
+  if(request.primaryRiskRequest?.perOrderQuantityLimit!=null)required.push(GOLD_PRIMARY_PER_ORDER_CAPABILITY);
   if(request.accountChunkPercents)required.push(ACCOUNT_CHUNK_CAPABILITY);
   if(request.accountZoneRadii)required.push(ACCOUNT_ZONE_CAPABILITY);
   if(request.accountStart)required.push(ACCOUNT_START_CAPABILITY);
+  if(request.excludePrimary)required.push(FOLLOWERS_ONLY_CAPABILITY);
+  if(request.separateLt)required.push(SEPARATE_LT_CAPABILITY);
   if(request.fillPriority!==undefined)required.push('entry-fill-priority-v1');
   if(['zone','boundary','side-zone'].includes(request.entryMode)) {
     required.push('market-zone-entry');
@@ -32,4 +39,5 @@ function validateHealth(health,operation,request) {
     || (operation==='arm' ? requiredCapabilities(request) : ['chunked-breakout']).some(value=>!health.capabilities?.includes(value)))
     throw Error('Обновите приёмник VPS для выбранного набора и проверьте подключение');
 }
-module.exports={CAPABILITY,PRIMARY_RISK_CAPABILITY,ACCOUNT_CHUNK_CAPABILITY,ACCOUNT_ZONE_CAPABILITY,ACCOUNT_START_CAPABILITY,requiredCapabilities,validateHealth};
+module.exports={CAPABILITY,PRIMARY_RISK_CAPABILITY,GOLD_PRIMARY_PER_ORDER_CAPABILITY,ACCOUNT_CHUNK_CAPABILITY,ACCOUNT_ZONE_CAPABILITY,ACCOUNT_START_CAPABILITY,
+  FOLLOWERS_ONLY_CAPABILITY,SEPARATE_LT_CAPABILITY,NO_TRADING_ACCOUNTS,requiredCapabilities,validateHealth};
